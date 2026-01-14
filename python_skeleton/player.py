@@ -82,35 +82,18 @@ class Player(Bot):
         '''
         legal_actions = round_state.legal_actions()  # the actions you are allowed to take
         # 0, 3, 4, or 5 representing pre-flop, flop, turn, or river respectively
-        street = round_state.street
-        my_cards = round_state.hands[active]  # your cards
-        board_cards = round_state.board  # the board cards
-        # the number of chips you have contributed to the pot this round of betting
-        my_pip = round_state.pips[active]
-        # the number of chips your opponent has contributed to the pot this round of betting
-        opp_pip = round_state.pips[1-active]
-        # the number of chips you have remaining
-        my_stack = round_state.stacks[active]
-        # the number of chips your opponent has remaining
-        opp_stack = round_state.stacks[1-active]
-        continue_cost = opp_pip - my_pip  # the number of chips needed to stay in the pot
-        # the number of chips you have contributed to the pot
-        my_contribution = STARTING_STACK - my_stack
-        # the number of chips your opponent has contributed to the pot
-        opp_contribution = STARTING_STACK - opp_stack
 
         # Only use DiscardAction if it's in legal_actions (which already checks street)
         # legal_actions() returns DiscardAction only when street is 2 or 3
         if DiscardAction in legal_actions:
-            # Always discards the first card in the bot's hand
-            return DiscardAction(0)
+            my_cards = round_state.hands[active]
+            lowest_card_index = min(range(len(my_cards)), key=lambda i: my_cards[i])
+            return DiscardAction(lowest_card_index)
+
         if RaiseAction in legal_actions:
-            # the smallest and largest numbers of chips for a legal bet/raise
             min_raise, max_raise = round_state.raise_bounds()
-            min_cost = min_raise - my_pip  # the cost of a minimum bet/raise
-            max_cost = max_raise - my_pip  # the cost of a maximum bet/raise
-            if random.random() < 0.5:
-                return RaiseAction(min_raise)
+            return RaiseAction(min_raise)
+
         if CheckAction in legal_actions:  # check-call
             return CheckAction()
         if random.random() < 0.25:
