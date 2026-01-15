@@ -167,7 +167,9 @@ class TossHoldemEnv:
             
             # --- Min Raise Logic ---
             # Player must raise at least `last_raise_amt` on top of the call
-            min_total = to_call + state.last_raise_amt
+
+            min_raise_increment = jnp.maximum(to_call, state.last_raise_amt)
+            min_total = to_call + min_raise_increment
             can_min_raise = cur_stack >= min_total
             mask_bits = mask_bits.at[ACT_RAISE_MIN].set(can_min_raise)
             
@@ -324,7 +326,7 @@ class TossHoldemEnv:
         both_acted = state.p0_acted_this_street & state.p1_acted_this_street
         is_all_in = (state.p0_stack == 0) | (state.p1_stack == 0)
         
-        street_over = (bets_equal & both_acted) | (bets_equal & is_all_in)
+        street_over = both_acted & (bets_equal | is_all_in)
         
         return jax.lax.cond(
             street_over,
