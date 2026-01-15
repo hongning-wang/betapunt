@@ -161,7 +161,12 @@ class TossHoldemEnv:
             cur_stack = jnp.where(is_p0, state.p0_stack, state.p1_stack)
             cur_bet = jnp.where(is_p0, state.p0_bet, state.p1_bet)
             opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet)
+            opp_stack = jnp.where(is_p0, state.p1_stack, state.p0_stack)
             to_call = opp_bet - cur_bet
+
+            # Engine-style "no side pots" cap:
+            # max_contribution = min(my_stack, opp_stack + to_call)
+            eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
             
             # Initialize Mask (13 actions)
             # 0=Fold, 1=Check, 2=Call, 3-8=Raises, 9=AllIn, 10-12=Discards
@@ -174,13 +179,17 @@ class TossHoldemEnv:
             mask_bits = mask_bits.at[ACT_CHECK].set(to_call == 0)
             mask_bits = mask_bits.at[ACT_CALL].set(to_call > 0)
             
-            # All-In always legal (assuming stack > 0, which is invariant until bust)
-            mask_bits = mask_bits.at[ACT_ALLIN].set(True)
+            # All-in is:
+            # - If facing a bet: a (possibly short) call is always meaningful
+            # - If not facing a bet: only legal if both players have chips (engine forbids betting when either is 0)
+            can_bet_when_checked = (to_call == 0) & (cur_stack > 0) & (opp_stack > 0)
+            can_all_in = (to_call > 0) | can_bet_when_checked
+            mask_bits = mask_bits.at[ACT_ALLIN].set(can_all_in)
             
             # --- Min Raise Logic ---
             min_raise_increment = jnp.maximum(to_call, state.last_raise_amt)
             min_total = to_call + min_raise_increment
-            can_min_raise = cur_stack >= min_total
+            can_min_raise = (eff_cap >= min_total) & (opp_stack > 0) & (cur_stack > to_call)
             mask_bits = mask_bits.at[ACT_RAISE_MIN].set(can_min_raise)
             
             # --- Fraction Raises Logic ---
@@ -195,8 +204,14 @@ class TossHoldemEnv:
             
             increments = jnp.array([inc_33, inc_50, inc_75, inc_125, inc_200])
             
-            # Valid if: Increment >= last_raise_amt AND Stack >= (to_call + increment)
-            valid_fracs = (increments >= state.last_raise_amt) & (cur_stack >= (to_call + increments))
+            # Valid if: Increment >= last_raise_amt AND (to_call + increment) <= eff_cap
+            # Also requires opponent has chips and we can cover the call (otherwise it's a call-all-in, not a raise).
+            valid_fracs = (
+                (increments >= state.last_raise_amt)
+                & (eff_cap >= (to_call + increments))
+                & (opp_stack > 0)
+                & (cur_stack > to_call)
+            )
             
             # Set indices 4,5,6,7,8 (which correspond to ACT_RAISE_33 through 200)
             # Note: ACT_RAISE_33 is index 4 now
@@ -244,6 +259,7 @@ class TossHoldemEnv:
         cur_stack = jnp.where(is_p0, state.p0_stack, state.p1_stack)
         cur_bet = jnp.where(is_p0, state.p0_bet, state.p1_bet)
         opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet)
+        opp_stack = jnp.where(is_p0, state.p1_stack, state.p0_stack)
         
         def _fold(s):
             return s.replace(done=True, winner=1 - s.current_player)
@@ -264,6 +280,7 @@ class TossHoldemEnv:
         def _raise(s, mode_idx):
             to_call = opp_bet - cur_bet
             pot_base = s.pot + s.p0_bet + s.p1_bet + to_call
+            eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
             
             # 0=Min, 1=1/3, 2=1/2, 3=3/4, 4=5/4, 5=2x
             amt_min = s.last_raise_amt
@@ -280,8 +297,9 @@ class TossHoldemEnv:
             
             total_needed = to_call + raise_amt
             
-            # Go all in if too broke
-            actual_total = jnp.minimum(total_needed, cur_stack)
+            # Engine-style cap (no side pots): can't contribute more than opponent can call.
+            # Still clamp to own stack via eff_cap definition.
+            actual_total = jnp.minimum(total_needed, eff_cap)
             
             new_bet_total = cur_bet + actual_total
             actual_inc = new_bet_total - opp_bet
@@ -300,21 +318,40 @@ class TossHoldemEnv:
             )
 
         def _all_in(s):
-            amt = cur_stack
-            new_bet = cur_bet + amt
-            actual_inc = new_bet - opp_bet
-            new_last_raise = jnp.maximum(s.last_raise_amt, actual_inc)
-            
-            return s.replace(
-                p0_stack=jnp.where(is_p0, 0, s.p0_stack),
-                p1_stack=jnp.where(~is_p0, 0, s.p1_stack),
-                p0_bet=jnp.where(is_p0, new_bet, s.p0_bet),
-                p1_bet=jnp.where(~is_p0, new_bet, s.p1_bet),
-                last_raise_amt=new_last_raise,
-                current_player=1 - s.current_player,
-                p0_acted_this_street=jnp.where(is_p0, True, False),
-                p1_acted_this_street=jnp.where(~is_p0, True, False)
-            )
+            to_call = opp_bet - cur_bet
+            eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
+
+            # If we can't cover the call (or can't raise beyond it), treat this as a call-all-in.
+            def _all_in_as_call(s2):
+                actual_call = jnp.minimum(to_call, cur_stack)
+                return self._check_street_end(s2.replace(
+                    p0_stack=jnp.where(is_p0, s2.p0_stack - actual_call, s2.p0_stack),
+                    p1_stack=jnp.where(~is_p0, s2.p1_stack - actual_call, s2.p1_stack),
+                    p0_bet=jnp.where(is_p0, s2.p0_bet + actual_call, s2.p0_bet),
+                    p1_bet=jnp.where(~is_p0, s2.p1_bet + actual_call, s2.p1_bet),
+                    p0_acted_this_street=jnp.where(is_p0, True, s2.p0_acted_this_street),
+                    p1_acted_this_street=jnp.where(~is_p0, True, s2.p1_acted_this_street)
+                ), key)
+
+            # Otherwise, contribute the maximum allowed (engine-style "all-in" to cap).
+            def _all_in_as_raise(s2):
+                actual_total = eff_cap
+                new_bet = cur_bet + actual_total
+                actual_inc = new_bet - opp_bet
+                new_last_raise = jnp.maximum(s2.last_raise_amt, actual_inc)
+
+                return s2.replace(
+                    p0_stack=jnp.where(is_p0, s2.p0_stack - actual_total, s2.p0_stack),
+                    p1_stack=jnp.where(~is_p0, s2.p1_stack - actual_total, s2.p1_stack),
+                    p0_bet=jnp.where(is_p0, new_bet, s2.p0_bet),
+                    p1_bet=jnp.where(~is_p0, new_bet, s2.p1_bet),
+                    last_raise_amt=new_last_raise,
+                    current_player=1 - s2.current_player,
+                    p0_acted_this_street=jnp.where(is_p0, True, False),
+                    p1_acted_this_street=jnp.where(~is_p0, True, False)
+                )
+
+            return jax.lax.cond(eff_cap <= to_call, _all_in_as_call, _all_in_as_raise, s)
 
         return jax.lax.switch(
             action,
