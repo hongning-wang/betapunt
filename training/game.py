@@ -19,19 +19,20 @@ PHASE_TURN = 4
 PHASE_RIVER = 5
 PHASE_SHOWDOWN = 6
 
-# Actions (12 Actions)
+# Actions (13 Actions - Split Check/Call)
 ACT_FOLD = 0
-ACT_CHECK_CALL = 1
-ACT_RAISE_MIN = 2   # Match last raise
-ACT_RAISE_33 = 3    # 1/3 Pot
-ACT_RAISE_50 = 4    # 1/2 Pot
-ACT_RAISE_75 = 5    # 3/4 Pot
-ACT_RAISE_125 = 6   # 5/4 Pot
-ACT_RAISE_200 = 7   # 2x Pot
-ACT_ALLIN = 8
-ACT_DISCARD_0 = 9
-ACT_DISCARD_1 = 10
-ACT_DISCARD_2 = 11
+ACT_CHECK = 1       # Explicit Check (valid only if to_call == 0)
+ACT_CALL = 2        # Explicit Call (valid only if to_call > 0)
+ACT_RAISE_MIN = 3   # Match last raise
+ACT_RAISE_33 = 4    # 1/3 Pot
+ACT_RAISE_50 = 5    # 1/2 Pot
+ACT_RAISE_75 = 6    # 3/4 Pot
+ACT_RAISE_125 = 7   # 5/4 Pot
+ACT_RAISE_200 = 8   # 2x Pot
+ACT_ALLIN = 9
+ACT_DISCARD_0 = 10
+ACT_DISCARD_1 = 11
+ACT_DISCARD_2 = 12
 
 @chex.dataclass(frozen=True)
 class State:
@@ -137,7 +138,7 @@ class TossHoldemEnv:
             pot=0,
             p0_stack=p0_stack, p1_stack=p1_stack,
             p0_bet=p0_bet, p1_bet=p1_bet,
-            last_raise_amt=BB, # Initialize last raise to BB size
+            last_raise_amt=BB, 
             current_player=curr_p,
             is_dealer_p0=is_dealer_p0,
             phase=PHASE_PREFLOP,
@@ -152,8 +153,8 @@ class TossHoldemEnv:
         def _discard_mask():
             is_p0 = state.current_player == 0
             mask = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)
-            # Actions 0-8 (Betting) masked out, 9-11 (Discard) based on active cards
-            return jnp.concatenate([jnp.zeros(9, dtype=bool), mask])
+            # Actions 0-9 (Betting) masked out, 10-12 (Discard) based on active cards
+            return jnp.concatenate([jnp.zeros(10, dtype=bool), mask])
 
         def _betting_mask():
             is_p0 = state.current_player == 0
@@ -162,12 +163,21 @@ class TossHoldemEnv:
             opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet)
             to_call = opp_bet - cur_bet
             
-            # Base: Fold, Check/Call, All-In always allowed (provided stack > 0 for all-in)
-            mask_bits = jnp.array([True, True, False, False, False, False, False, False, True, False, False, False])
+            # Initialize Mask (13 actions)
+            # 0=Fold, 1=Check, 2=Call, 3-8=Raises, 9=AllIn, 10-12=Discards
+            mask_bits = jnp.zeros(13, dtype=bool)
+            
+            # Fold always legal
+            mask_bits = mask_bits.at[ACT_FOLD].set(True)
+            
+            # Check vs Call Logic
+            mask_bits = mask_bits.at[ACT_CHECK].set(to_call == 0)
+            mask_bits = mask_bits.at[ACT_CALL].set(to_call > 0)
+            
+            # All-In always legal (assuming stack > 0, which is invariant until bust)
+            mask_bits = mask_bits.at[ACT_ALLIN].set(True)
             
             # --- Min Raise Logic ---
-            # Player must raise at least `last_raise_amt` on top of the call
-
             min_raise_increment = jnp.maximum(to_call, state.last_raise_amt)
             min_total = to_call + min_raise_increment
             can_min_raise = cur_stack >= min_total
@@ -188,8 +198,9 @@ class TossHoldemEnv:
             # Valid if: Increment >= last_raise_amt AND Stack >= (to_call + increment)
             valid_fracs = (increments >= state.last_raise_amt) & (cur_stack >= (to_call + increments))
             
-            # Set indices 3,4,5,6,7
-            mask_bits = mask_bits.at[3:8].set(valid_fracs)
+            # Set indices 4,5,6,7,8 (which correspond to ACT_RAISE_33 through 200)
+            # Note: ACT_RAISE_33 is index 4 now
+            mask_bits = mask_bits.at[4:9].set(valid_fracs)
             
             return mask_bits
 
@@ -205,7 +216,9 @@ class TossHoldemEnv:
         )
 
     def _step_discard(self, state: State, action: int, key) -> State:
-        idx = action - ACT_DISCARD_0
+        # Adjustment: Discard actions are now 10, 11, 12. 
+        # Subtract ACT_DISCARD_0 (10) to get 0, 1, 2.
+        idx = action - ACT_DISCARD_0 
         is_p0 = state.current_player == 0
         
         hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)
@@ -236,6 +249,7 @@ class TossHoldemEnv:
             return s.replace(done=True, winner=1 - s.current_player)
 
         def _check_call(s):
+            # This works for both Check and Call. The legality is handled by masks.
             to_call = opp_bet - cur_bet
             actual_call = jnp.minimum(to_call, cur_stack)
             return self._check_street_end(s.replace(
@@ -272,7 +286,6 @@ class TossHoldemEnv:
             new_bet_total = cur_bet + actual_total
             actual_inc = new_bet_total - opp_bet
             
-            # FIX: Update last_raise_amt only if the raise was "complete"
             new_last_raise = jnp.where(actual_inc >= s.last_raise_amt, actual_inc, s.last_raise_amt)
 
             return s.replace(
@@ -280,7 +293,7 @@ class TossHoldemEnv:
                 p1_stack=jnp.where(~is_p0, s.p1_stack - actual_total, s.p1_stack),
                 p0_bet=jnp.where(is_p0, new_bet_total, s.p0_bet),
                 p1_bet=jnp.where(~is_p0, new_bet_total, s.p1_bet),
-                last_raise_amt=new_last_raise, # UPDATED
+                last_raise_amt=new_last_raise,
                 current_player=1 - s.current_player,
                 p0_acted_this_street=jnp.where(is_p0, True, False),
                 p1_acted_this_street=jnp.where(~is_p0, True, False)
@@ -290,7 +303,6 @@ class TossHoldemEnv:
             amt = cur_stack
             new_bet = cur_bet + amt
             actual_inc = new_bet - opp_bet
-            # If All-In is a raise > current last_raise, we update it.
             new_last_raise = jnp.maximum(s.last_raise_amt, actual_inc)
             
             return s.replace(
@@ -307,16 +319,19 @@ class TossHoldemEnv:
         return jax.lax.switch(
             action,
             [
-                lambda s: _fold(s),       # 0
-                lambda s: _check_call(s), # 1
-                lambda s: _raise(s, 0),   # 2 Min
-                lambda s: _raise(s, 1),   # 3 1/3
-                lambda s: _raise(s, 2),   # 4 1/2
-                lambda s: _raise(s, 3),   # 5 3/4
-                lambda s: _raise(s, 4),   # 6 5/4
-                lambda s: _raise(s, 5),   # 7 2x
-                lambda s: _all_in(s),     # 8
-                lambda s: s, lambda s: s, lambda s: s # 9,10,11 (Discards)
+                lambda s: _fold(s),       # 0: Fold
+                lambda s: _check_call(s), # 1: Check
+                lambda s: _check_call(s), # 2: Call
+                lambda s: _raise(s, 0),   # 3: Min
+                lambda s: _raise(s, 1),   # 4: 1/3
+                lambda s: _raise(s, 2),   # 5: 1/2
+                lambda s: _raise(s, 3),   # 6: 3/4
+                lambda s: _raise(s, 4),   # 7: 5/4
+                lambda s: _raise(s, 5),   # 8: 2x
+                lambda s: _all_in(s),     # 9: All-In
+                lambda s: s,              # 10: Discard 0 (noop here, handled in _step_discard)
+                lambda s: s,              # 11: Discard 1
+                lambda s: s               # 12: Discard 2
             ],
             state
         )
@@ -347,7 +362,7 @@ class TossHoldemEnv:
                 deck_ptr=s.deck_ptr + deck_inc,
                 board=new_board,
                 p0_bet=0, p1_bet=0,
-                last_raise_amt=BB, # Reset for new street to Big Blind
+                last_raise_amt=BB,
                 p0_acted_this_street=False,
                 p1_acted_this_street=False
             )
