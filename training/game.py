@@ -247,9 +247,15 @@ class TossHoldemEnv:
         
         def _fold(s):
             return s.replace(done=True, winner=1 - s.current_player)
+        
+        def _check(s):
+            # Explicitly commits 0 chips
+            return self._check_street_end(s.replace(
+                p0_acted_this_street=jnp.where(is_p0, True, s.p0_acted_this_street),
+                p1_acted_this_street=jnp.where(~is_p0, True, s.p1_acted_this_street)
+            ), key)
 
-        def _check_call(s):
-            # This works for both Check and Call. The legality is handled by masks.
+        def _call(s):
             to_call = opp_bet - cur_bet
             actual_call = jnp.minimum(to_call, cur_stack)
             return self._check_street_end(s.replace(
@@ -320,8 +326,8 @@ class TossHoldemEnv:
             action,
             [
                 lambda s: _fold(s),       # 0: Fold
-                lambda s: _check_call(s), # 1: Check
-                lambda s: _check_call(s), # 2: Call
+                lambda s: _check(s),      # 1: Check
+                lambda s: _call(s),       # 2: Call
                 lambda s: _raise(s, 0),   # 3: Min
                 lambda s: _raise(s, 1),   # 4: 1/3
                 lambda s: _raise(s, 2),   # 5: 1/2
