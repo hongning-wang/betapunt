@@ -77,8 +77,8 @@ def score_5_hand(hand):
     sr = jnp.sort(r)[::-1]
     flush = jnp.min(s) == jnp.max(s)
     strt = jnp.all(sr[:-1] - sr[1:] == 1)
-    wheel = jnp.all(sr == WHEEL_PATTERN)
-    strt = strt | wheel
+    has_wheel = jnp.all(sr == WHEEL_PATTERN)
+    strt = strt | has_wheel
     rc = jnp.bincount(r, minlength=13)
     mc = jnp.max(rc)
     pc = jnp.sum(rc == 2)
@@ -86,7 +86,21 @@ def score_5_hand(hand):
         [strt & flush, mc == 4, (mc == 3) & (pc >= 1), flush, strt, mc == 3, pc >= 2, pc == 1],
         [TIER_SF, TIER_QA, TIER_FH, TIER_FL, TIER_ST, TIER_TR, TIER_2P, TIER_1P], TIER_HC
     )
-    return (tier << 20) | (sr[0] << 16) | (sr[1] << 12) | (sr[2] << 8) | (sr[3] << 4) | sr[4]
+
+    # Count-based ordering for paired/set/fullhouse/quad hands
+    rank_indices = jnp.arange(13)
+    sort_keys = rc * 16 + rank_indices
+    ordered_ranks = jnp.argsort(sort_keys)[::-1][:5]
+
+    # Wheel-adjusted sorted ranks for straights/flushes/high cards
+    unpaired_ranks = jnp.where(has_wheel, jnp.array([3, 2, 1, 0, 12]), sr)    
+
+    # Use count-based ordering only for paired hands (not flush, straight, high card, straight flush)
+    use_count_order = (mc >= 2) & ~flush & ~strt
+
+    final_ranks = jnp.where(use_count_order, ordered_ranks, unpaired_ranks)
+
+    return (tier << 20) | (final_ranks[0] << 16) | (final_ranks[1] << 12) | (final_ranks[2] << 8) | (final_ranks[3] << 4) | final_ranks[4]
 
 COMBINATIONS_8_5 = jnp.array(list(itertools.combinations(range(8), 5)), dtype=jnp.int32)
 
