@@ -9,6 +9,7 @@ STACK_SIZE = 400
 SB = 1
 BB = 2
 MAX_ROUNDS = 1000
+WHEEL_PATTERN = jnp.array([12, 3, 2, 1, 0])
 
 # Phases
 PHASE_PREFLOP = 0
@@ -76,7 +77,7 @@ def score_5_hand(hand):
     sr = jnp.sort(r)[::-1]
     flush = jnp.min(s) == jnp.max(s)
     strt = jnp.all(sr[:-1] - sr[1:] == 1)
-    wheel = jnp.array_equal(sr, jnp.array([12, 3, 2, 1, 0]))
+    wheel = jnp.all(sr == WHEEL_PATTERN)
     strt = strt | wheel
     rc = jnp.bincount(r, minlength=13)
     mc = jnp.max(rc)
@@ -288,15 +289,17 @@ class TossHoldemEnv:
             pot_base = s.pot + s.p0_bet + s.p1_bet + to_call
             eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
             
-            # 0=Min, 1=1/3, 2=1/2, 3=3/4, 4=5/4, 5=2x
-            amt_min = s.last_raise_amt
-            amt_33  = pot_base // 3
-            amt_50  = pot_base // 2
-            amt_75  = (pot_base * 3) // 4
-            amt_125 = (pot_base * 5) // 4
-            amt_200 = pot_base * 2
-            
-            target_inc = jnp.array([amt_min, amt_33, amt_50, amt_75, amt_125, amt_200])[mode_idx]
+            target_inc = jax.lax.switch(
+                mode_idx,
+                [
+                    lambda: s.last_raise_amt,
+                    lambda: pot_base // 3,
+                    lambda: pot_base // 2,
+                    lambda: (pot_base * 3) // 4,
+                    lambda: (pot_base * 5) // 4,
+                    lambda: pot_base * 2
+                ]
+            )
             
             # Clamp to min raise
             raise_amt = jnp.maximum(target_inc, s.last_raise_amt)
@@ -429,15 +432,20 @@ class TossHoldemEnv:
             result = get_showdown_result(s.replace(pot=new_pot))
             winner_idx = jnp.select([result == 1.0, result == -1.0], [0, 1], default=2)
             return s.replace(pot=new_pot, phase=PHASE_SHOWDOWN, done=True, winner=winner_idx)
+        
+        def _goto_noop(s):
+            return s
 
-        return jax.lax.cond(
-            state.phase == PHASE_PREFLOP, _goto_discard,
-            lambda s: jax.lax.cond(
-                state.phase == PHASE_FLOP, _goto_turn,
-                lambda s2: jax.lax.cond(
-                    state.phase == PHASE_TURN, _goto_river,
-                    _goto_showdown,
-                    s2
-                ), s
-            ), state
+        return jax.lax.switch(
+            state.phase,
+            [
+                _goto_discard,      # Preflop
+                _goto_noop,         # Discard OOP
+                _goto_noop,         # Discard DLR
+                _goto_turn,         # Flop
+                _goto_river,        # Turn
+                _goto_showdown,     # River
+                _goto_noop,         # Showdown
+            ],
+            state
         )
