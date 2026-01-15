@@ -5,29 +5,28 @@ import numpy as np
 import optax
 import distrax
 import chex
-from flax.linen.initializers import constant, orthogonal, kaiming_normal
-from typing import Sequence, NamedTuple, Tuple
 from flax.training.train_state import TrainState
+from typing import NamedTuple
 
 # Import the user's game environment
-from game import TossHoldemEnv, State, NUM_CARDS, PHASE_PREFLOP, PHASE_DISCARD_OOP, PHASE_DISCARD_DLR, PHASE_FLOP, PHASE_TURN, PHASE_RIVER, STACK_SIZE
+# Ensure your 'game.py' is in the same directory and has these members
+from game import TossHoldemEnv, State, STACK_SIZE
 
 # --- 1. CONFIGURATION ---
 CONFIG = {
     "LR": 3e-4,
-    "NUM_ENVS": 128,          #
-    "NUM_STEPS": 128,         #
-    "TOTAL_TIMESTEPS": 1e7,   # Adjusted for demo
+    "NUM_ENVS": 128,
+    "NUM_STEPS": 128,
+    "TOTAL_TIMESTEPS": 1e7,
     "UPDATE_EPOCHS": 4,
     "NUM_MINIBATCHES": 4,
-    "GAMMA": 0.999,           #
-    "GAE_LAMBDA": 0.95,       #
+    "GAMMA": 0.999,
+    "GAE_LAMBDA": 0.95,
     "CLIP_EPS": 0.2,
     "ENT_COEF": 0.01,
     "MAX_GRAD_NORM": 0.5,
-    "TRINAL_DELTA1": 3.0,     #
+    "TRINAL_DELTA1": 3.0,     # Trinal-Clip Parameter
     "DEBUG": False,
-    "ENV_NAME": "TossHoldem",
 }
 
 # --- 2. OBSERVATION & ENCODING LOGIC ---
@@ -93,11 +92,11 @@ def get_card_tensor(state: State, player_id: int):
 def get_action_tensor(env_state: EnvState, state: State, legal_mask: chex.Array, observer_id: int):
     """
     Constructs the 24-channel action tensor.
-    Shape: (24, 4, 13)
+    Shape: (24, 4, 12)
     Dims: 0: Self Act, 1: Opp Act, 2: Sum, 3: Legal
     """
     # Create grid (Time, Feature_Rows, Actions)
-    tensor = jnp.zeros((24, 4, 13), dtype=jnp.float32)
+    tensor = jnp.zeros((24, 4, 12), dtype=jnp.float32)
     
     # Fill history
     # action_history contains (player_idx, action_idx)
@@ -131,7 +130,6 @@ class AlphaHoldemWrapper:
 
     def reset(self, key):
         state = self.env.reset(key)
-        
         env_state = EnvState(
             game_state=state,
             action_history=jnp.zeros((24, 2), dtype=jnp.int32),
@@ -141,18 +139,30 @@ class AlphaHoldemWrapper:
         return self._get_obs(env_state, state), env_state
 
     def step(self, key, env_state, action):
+        # 1. Step the physics
         state = env_state.game_state
         current_p = state.current_player
-        
-        # Step the environment
         next_state = self.env.step(state, key, action)
         
-        # Update history
+        # 2. Update History (Observation Logic)
         new_hist = env_state.action_history.at[env_state.history_ptr].set(
             jnp.array([current_p, action], dtype=jnp.int32)
         )
         new_ptr = jnp.minimum(env_state.history_ptr + 1, 23)
         
+        # 3. Compute Reward (Episodic & Zero-Sum)
+        # We only emit reward if the game is done.
+        # The reward is the profit relative to the player who just acted (current_p).
+        
+        p0_profit = next_state.p0_stack - STACK_SIZE
+        # In zero-sum head-to-head, P1 profit is usually -P0 profit (minus rake if applicable)
+        # But we use the explicit stack values to be safe.
+        p1_profit = next_state.p1_stack - STACK_SIZE
+        
+        step_profit = jnp.where(current_p == 0, p0_profit, p1_profit)
+        reward = jnp.where(next_state.done, step_profit, 0.0)
+        
+        # 4. Prepare Next State (Intermediate)
         next_env_state = EnvState(
             game_state=next_state,
             action_history=new_hist,
@@ -160,53 +170,33 @@ class AlphaHoldemWrapper:
             time=env_state.time + 1
         )
         
+        # Note: We return next_state (potentially terminal) here. 
+        # The Auto-Reset logic happens in the vmapped roll-out loop.
         obs = self._get_obs(next_env_state, next_state)
         
-        # --- NAIVE SELF-PLAY REWARD LOGIC ---
-        # Reward must be relative to the player who just acted (current_p).
-        # We calculate the total profit/loss for the episode (Stack - Initial 400).
-        # We use STACK_SIZE (400) as the baseline.
-        
-        p0_profit = next_state.p0_stack - STACK_SIZE
-        p1_profit = next_state.p1_stack - STACK_SIZE
-        
-        # If I am P0, I want p0_profit. If I am P1, I want p1_profit.
-        # This ensures P1 learns to beat P0, not help P0.
-        step_reward = jnp.where(current_p == 0, p0_profit, p1_profit)
-        
-        # Reward is only non-zero at the end of the game
-        reward = jnp.where(next_state.done, step_reward, 0.0)
-        
-        return obs, next_env_state, reward, next_state.done, {}
+        return obs, next_env_state, reward, next_state.done
 
     def _get_obs(self, env_state, state):
-        # Current player ID acts as the observer
         pid = state.current_player
-        
-        # 1. Card Features (6, 4, 13) - Already handles P0/P1 flipping internally
         card_feat = get_card_tensor(state, pid)
-        
-        # 2. Action Features (24, 4, 13)
         legal = self.env.get_legal_actions(state)
-        # Pass pid to ensure history rows are relative (0=Me, 1=Opp)
         act_feat = get_action_tensor(env_state, state, legal, observer_id=pid)
-        
         return (card_feat, act_feat, legal)
 
     def action_space_n(self):
-        return 13
+        return 12
 
-# --- 3. NETWORK ARCHITECTURE (AlphaHoldem) ---
+# --- 3. NETWORK ARCHITECTURE ---
 
 class ResBlock(nn.Module):
     features: int
-    
+
     @nn.compact
     def __call__(self, x):
         residual = x
-        x = nn.Conv(self.features, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.Conv(features=self.features, kernel_size=(3, 3), padding="SAME")(x)
         x = nn.relu(x)
-        x = nn.Conv(self.features, kernel_size=(3, 3), padding="SAME")(x)
+        x = nn.Conv(features=self.features, kernel_size=(3, 3), padding="SAME")(x)
         return nn.relu(x + residual)
 
 class AlphaHoldemNetwork(nn.Module):
@@ -214,57 +204,83 @@ class AlphaHoldemNetwork(nn.Module):
 
     @nn.compact
     def __call__(self, inputs):
-        card_x, act_x, mask = inputs
-        
-        # --- Card Branch ---
-        # Input: (Batch, 6, 4, 13) -> NHWC is standard in Flax Conv usually, 
-        # but we need to check data layout. We'll transpose to (B, 4, 13, 6) for Conv.
-        card_x = jnp.transpose(card_x, (0, 2, 3, 1)) 
-        
-        # Conv1
-        card_h = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(card_x) #
+        # Unpack inputs:
+        # card_obs: (Batch, 6, 4, 13)
+        # act_obs:  (Batch, 24, 4, 12)
+        # mask:     (Batch, 12)
+        card_obs, act_obs, mask = inputs
+
+        # --- 1. CARD BRANCH ---
+        # Input shape is (B, C, H, W) = (B, 6, 4, 13)
+        # Flax Conv expects (B, H, W, C).
+        # We transpose to (B, 4, 13, 6)
+        card_x = jnp.transpose(card_obs, (0, 2, 3, 1))
+
+        # Initial Conv
+        card_h = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(card_x)
         card_h = nn.relu(card_h)
-        # ResBlocks (Paper doesn't specify count, assuming 2-3 standard for light nets)
+
+        # Residual Tower (3 Blocks)
         card_h = ResBlock(64)(card_h)
         card_h = ResBlock(64)(card_h)
         card_h = ResBlock(64)(card_h)
+
+        # Flatten
         card_flat = card_h.reshape((card_h.shape[0], -1))
 
-        # --- Action Branch ---
-        # Input: (Batch, 24, 4, 13) -> Transpose to (B, 24, 13, 4)
-        act_x = jnp.transpose(act_x, (0, 1, 3, 2))
-        
+        # --- 2. ACTION BRANCH ---
+        # Input shape is (B, Time, Rows, Cols) = (B, 24, 4, 12)
+        # We treat this as an image where Time=Height, Action=Width, Rows=Channels.
+        # Transpose to (B, 24, 12, 4)
+        act_x = jnp.transpose(act_obs, (0, 1, 3, 2))
+
+        # Initial Conv
         act_h = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(act_x)
         act_h = nn.relu(act_h)
+
+        # Residual Tower (3 Blocks)
         act_h = ResBlock(64)(act_h)
         act_h = ResBlock(64)(act_h)
         act_h = ResBlock(64)(act_h)
+
+        # Flatten
         act_flat = act_h.reshape((act_h.shape[0], -1))
 
-        # --- Fusion ---
-        # Concatenate flattened features (Though paper proposes fusion *network*, often FC)
+        # --- 3. FUSION & DENSE LAYERS ---
+        # Concatenate the flattened representations
         fused = jnp.concatenate([card_flat, act_flat], axis=-1)
-        
-        # Fully Connected Layers (6.8M params range)
-        x = nn.Dense(1024)(fused)
-        x = nn.relu(x)
-        x = nn.Dense(512)(x)
+
+        # Dense Block 1
+        x = nn.Dense(features=1024)(fused)
         x = nn.relu(x)
 
-        # Heads
-        actor_logits = nn.Dense(self.action_dim)(x)
+        # Dense Block 2
+        x = nn.Dense(features=512)(x)
+        x = nn.relu(x)
+
+        # --- 4. OUTPUT HEADS ---
         
-        # Apply Mask: Set logits of illegal actions to -1e9
+        # ACTOR HEAD
+        # Output logits for each action
+        actor_logits = nn.Dense(features=self.action_dim)(x)
+
+        # MASKING:
+        # We set the logits of illegal actions to a very large negative number
+        # so the probabilities become 0 after softmax.
         min_logit = -1e9
         actor_logits = jnp.where(mask, actor_logits, min_logit)
-        
-        pi = distrax.Categorical(logits=actor_logits)
-        
-        critic = nn.Dense(1)(x)
-        
-        return pi, jnp.squeeze(critic, axis=-1)
 
-# --- 4. TRINAL-CLIP PPO LOSS ---
+        # Create distribution
+        pi = distrax.Categorical(logits=actor_logits)
+
+        # CRITIC HEAD
+        # Output scalar value
+        critic_val = nn.Dense(features=1)(x)
+        critic_val = jnp.squeeze(critic_val, axis=-1)
+
+        return pi, critic_val
+
+# --- 4. TRAIN LOGIC ---
 
 class Transition(NamedTuple):
     done: jnp.ndarray
@@ -272,108 +288,110 @@ class Transition(NamedTuple):
     value: jnp.ndarray
     reward: jnp.ndarray
     log_prob: jnp.ndarray
-    # Inputs for network
     obs_card: jnp.ndarray
     obs_act: jnp.ndarray
     obs_mask: jnp.ndarray
-    # Extra for Trinal Clip
     chips_player: jnp.ndarray
     chips_opponent: jnp.ndarray
     player_id: jnp.ndarray
-    
+
 def make_train(config):
     env_wrapper = AlphaHoldemWrapper()
-    
-    # Calculate schedules
-    config["NUM_UPDATES"] = config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"]
-
-    def linear_schedule(count):
-        frac = 1.0 - (count // (config["NUM_MINIBATCHES"] * config["UPDATE_EPOCHS"])) / config["NUM_UPDATES"]
-        return config["LR"] * frac
+    config["NUM_UPDATES"] = int(config["TOTAL_TIMESTEPS"] // config["NUM_STEPS"] // config["NUM_ENVS"])
 
     def train(rng):
         # Init Env
         rng, rng_reset = jax.random.split(rng)
         reset_rngs = jax.random.split(rng_reset, config["NUM_ENVS"])
-        
-        # Vectorized Reset
         obsv, env_states = jax.vmap(env_wrapper.reset)(reset_rngs)
         
         # Init Network
         network = AlphaHoldemNetwork(action_dim=env_wrapper.action_space_n())
-        
-        # Dummy init pass to get shapes
         rng, rng_init = jax.random.split(rng)
-        # obs structure is ((B,6,4,13), (B,24,4,13), (B,13))
-        dummy_obs = (
-            jnp.zeros((1, 6, 4, 13)),
-            jnp.zeros((1, 24, 4, 13)),
-            jnp.ones((1, 13), dtype=bool)
-        )
+        dummy_obs = (jnp.zeros((1, 6, 4, 13)), jnp.zeros((1, 24, 4, 12)), jnp.ones((1, 12), dtype=bool))
         network_params = network.init(rng_init, dummy_obs)
         
         tx = optax.chain(
             optax.clip_by_global_norm(config["MAX_GRAD_NORM"]),
-            optax.adam(learning_rate=linear_schedule, eps=1e-5)
+            optax.adam(learning_rate=config["LR"], eps=1e-5)
         )
         
-        train_state = TrainState.create(
-            apply_fn=network.apply,
-            params=network_params,
-            tx=tx,
-        )
+        train_state = TrainState.create(apply_fn=network.apply, params=network_params, tx=tx)
 
-        # --- WRAPPER FOR THE UPDATE STEP ---
+        # --- ENV STEP WITH AUTO-RESET ---
+        def step_env_auto_reset(rng, env_state, action):
+            # 1. Step the environment
+            obs, next_env_state, reward, done = env_wrapper.step(rng, env_state, action)
+            
+            # 2. Auto-Reset if Done
+            # We must generate a fresh reset state if done, to allow the scan loop to continue.
+            rng_reset = jax.random.fold_in(rng, 0) # Simple deterministic fold for reset inside step
+            reset_obs, reset_state = env_wrapper.reset(rng_reset)
+            
+            # Select between continued state or reset state
+            final_env_state = jax.tree_map(
+                lambda x, y: jnp.where(done, x, y), 
+                reset_state, next_env_state
+            )
+            
+            final_obs = jax.tree_map(
+                lambda x, y: jnp.where(done, x, y), # Broadcast done for obs structure
+                reset_obs, obs
+            )
+            
+            # Note: We return the reward from the *terminal* step, but the observation from the *fresh* step.
+            return final_obs, final_env_state, reward, done
+
         def _update_step(runner_state, unused):
             
-            # 1. ROLLOUT LOOP
-            def _env_step(runner_state, unused):
+            # --- 1. ROLLOUT PHASE ---
+            def _env_rollout(runner_state, unused):
                 train_state, env_state, last_obs, rng = runner_state
                 (card_obs, act_obs, mask_obs) = last_obs
 
-                # Get game state and current player
+                # Metadata for Trinal Clip / GAE
                 gs = env_state.game_state
-                pid = gs.current_player  # <--- Capture current player ID
-                
-                # Get Chips info for Trinal Clip
-                chips_p0 = STACK_SIZE - gs.p0_stack
-                chips_p1 = STACK_SIZE - gs.p1_stack
-                
-                is_p0 = gs.current_player == 0
-                chips_player = jnp.where(is_p0, chips_p0, chips_p1)
-                chips_opponent = jnp.where(is_p0, chips_p1, chips_p0)
+                pid = gs.current_player
+                is_p0 = pid == 0
+                chips_player = jnp.where(is_p0, STACK_SIZE - gs.p0_stack, STACK_SIZE - gs.p1_stack)
+                chips_opponent = jnp.where(is_p0, STACK_SIZE - gs.p1_stack, STACK_SIZE - gs.p0_stack)
 
-                # Select Action
+                # Action Selection
                 rng, rng_act = jax.random.split(rng)
                 pi, value = network.apply(train_state.params, last_obs)
                 action = pi.sample(seed=rng_act)
                 log_prob = pi.log_prob(action)
 
-                # Step Env
+                # Step with Auto-Reset (Vectorized)
                 rng, rng_step = jax.random.split(rng)
                 rng_step = jax.random.split(rng_step, config["NUM_ENVS"])
                 
-                step_fn = jax.vmap(env_wrapper.step, in_axes=(0, 0, 0))
-                next_obs, next_env_state, reward, done, _ = step_fn(rng_step, env_state, action)
-                
+                step_fn = jax.vmap(step_env_auto_reset, in_axes=(0, 0, 0))
+                next_obs, next_env_state, reward, done = step_fn(rng_step, env_state, action)
+
                 transition = Transition(
                     done, action, value, reward, log_prob, 
                     card_obs, act_obs, mask_obs,
-                    chips_player, chips_opponent,
-                    pid  # <--- Store player_id
+                    chips_player, chips_opponent, pid
                 )
                 
+                # Update runner state for next step
                 return (train_state, next_env_state, next_obs, rng), transition
 
-            # Execute Rollout
+            # Run the rollout scan
+            # runner_state here is: (train_state, env_state, current_obs, rng)
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, runner_state, None, config["NUM_STEPS"]
+                _env_rollout, runner_state, None, config["NUM_STEPS"]
             )
 
-            # 2. GAE CALCULATION
-            _, next_env_state, last_obs, _ = runner_state
-            _, last_val = network.apply(train_state.params, last_obs)
-            last_pid = next_env_state.game_state.current_player
+            # --- 2. GAE CALCULATION ---
+            # Unpack the runner state from the end of the rollout
+            # This gives us the state/obs for the *start* of the next rollout (bootstrap value)
+            train_state, next_env_state, next_obs, rng = runner_state
+            
+            # Calculate Bootstrap Value (Next Value)
+            _, last_val = network.apply(train_state.params, next_obs)
+            last_pid = next_env_state.game_state.current_player 
 
             def _calculate_gae(traj_batch, last_val, last_pid):
                 def _get_advantages(carry, transition):
@@ -381,7 +399,8 @@ def make_train(config):
                     done, value, reward = transition.done, transition.value, transition.reward
                     curr_pid = transition.player_id
                     
-                    # Zero-Sum Value Flip
+                    # Zero-Sum Value Flip logic
+                    # If the player changed between steps, the value function perspective flips.
                     is_switch = next_pid != curr_pid
                     correct_next_val = jnp.where(is_switch, -next_value, next_value)
                     
@@ -401,84 +420,52 @@ def make_train(config):
 
             advantages, targets = _calculate_gae(traj_batch, last_val, last_pid)
 
-            # 3. UPDATE PHASE
+            # --- 3. PPO UPDATE EPOCHS ---
             def _update_epoch(update_state, unused):
                 def _update_minibatch(train_state, batch_info):
                     traj_batch, advantages, targets = batch_info
                     
                     def _loss_fn(params, traj_batch, gae, targets):
-    # 1. Forward Pass
-    #    We allow batch_obs to be a tuple for the Flax model
                         batch_obs = (traj_batch.obs_card, traj_batch.obs_act, traj_batch.obs_mask)
                         pi, value = network.apply(params, batch_obs)
-    
-    #    Flatten value to match target shape (B,)
-                        value = value.squeeze()
-    
-    # 2. Calculate Probability Ratio
-    #    ratio = exp(log_prob_new - log_prob_old)
                         log_prob = pi.log_prob(traj_batch.action)
+                        
+                        # --- CORRECTED TRINAL-CLIP ACTOR LOSS ---
                         ratio = jnp.exp(log_prob - traj_batch.log_prob)
-    
-    # 3. Trinal-Clip PPO Actor Loss (The "Hard Clamp")
-    #    This formula unifies the logic for Positive and Negative Advantages:
-    #    - Positive Advantage: Behaves like PPO (clips at 1+eps).
-    #    - Negative Advantage: 
-    #         a) Stops penalties if ratio drops below 1-eps (via r_clip).
-    #         b) Caps penalties if ratio spikes above delta1 (via r_tcp).
-    
-                        clip_eps = config["CLIP_EPS"]         # e.g., 0.2
-                        delta1 = config["TRINAL_DELTA1"]      # e.g., 3.0
-    
-    # Step A: Standard PPO inner clip [0.8, 1.2]
-                        r_clip = jnp.clip(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-    
-    # Step B: Trinal Logic
-    #    - jnp.maximum(ratio, r_clip): Enforces lower bound (1-eps).
-    #                                  If ratio < 0.8, force it to 0.8.
-    #    - jnp.minimum(..., delta1):   Enforces upper bound (delta1).
-    #                                  If ratio > 3.0, force it to 3.0.
-                        r_tcp = jnp.minimum(jnp.maximum(ratio, r_clip), delta1)
-    
-                        loss_actor = -(r_tcp * gae).mean()
-    
-    # 4. Dynamic Value Loss Clipping (Trinal Delta 2 & 3)
-    #    The paper clips the value target based on chips currently in play.
-                        delta2 = traj_batch.chips_player     # Stack invested by hero
-                        delta3 = traj_batch.chips_opponent   # Stack invested by opponent
-    
-    #    Clip targets to range [-Chips_Hero, +Chips_Opponent]
+                        epsilon = config["CLIP_EPS"]
+                        delta1 = config["TRINAL_DELTA1"]
+                        
+                        surr1 = ratio * gae
+                        
+                        # Trinal Clip Logic
+                        lower_bound = 1.0 - epsilon
+                        upper_bound = jnp.where(gae < 0, delta1, 1.0 + epsilon)
+                        
+                        ratio_clipped = jnp.clip(ratio, lower_bound, upper_bound)
+                        surr2 = ratio_clipped * gae
+                        
+                        loss_actor = -jnp.minimum(surr1, surr2).mean()
+                        
+                        # --- CRITIC LOSS ---
+                        delta2 = traj_batch.chips_player
+                        delta3 = traj_batch.chips_opponent
                         targets_clipped = jnp.clip(targets, -delta2, delta3)
-    
                         loss_critic = jnp.square(targets_clipped - value).mean()
-    
-    # 5. Entropy & Total Loss
+                        
                         entropy = pi.entropy().mean()
-    
                         total_loss = loss_actor + 0.5 * loss_critic - config["ENT_COEF"] * entropy
-    
                         return total_loss, (loss_actor, loss_critic, entropy)
+
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    (loss, (l_a, l_c, ent)), grads = grad_fn(
-                        train_state.params, 
-                        traj_batch, 
-                        advantages, 
-                        targets
-                    )
-                    
-                    # Apply Updates
-                    new_train_state = train_state.apply_gradients(grads=grads)
-                    
-                    # Return new state and metrics
-                    return new_train_state, (loss, l_a, l_c, ent)
-                # Batching logic
+                    (loss, (l_a, l_c, ent)), grads = grad_fn(train_state.params, traj_batch, advantages, targets)
+                    train_state = train_state.apply_gradients(grads=grads)
+                    return train_state, (loss, l_a, l_c, ent)
+
+                # Batch Handling (Flatten & Shuffle)
                 batch_size = config["NUM_ENVS"] * config["NUM_STEPS"]
                 permutation = jax.random.permutation(update_state[1], batch_size)
                 
-                def flatten_traj(t):
-                    return jnp.reshape(t, (batch_size, *t.shape[2:]))
-                
-                traj_flat = jax.tree_map(flatten_traj, traj_batch)
+                traj_flat = jax.tree_map(lambda x: x.reshape((batch_size, *x.shape[2:])), traj_batch)
                 adv_flat = advantages.reshape((batch_size,))
                 tgt_flat = targets.reshape((batch_size,))
                 
@@ -492,9 +479,7 @@ def make_train(config):
                     idx_start = i * minibatch_size
                     idx_end = idx_start + minibatch_size
                     slice_fn = lambda x: x[idx_start:idx_end]
-                    batch = (jax.tree_map(slice_fn, shuffled_traj), 
-                             slice_fn(shuffled_adv), 
-                             slice_fn(shuffled_tgt))
+                    batch = (jax.tree_map(slice_fn, shuffled_traj), slice_fn(shuffled_adv), slice_fn(shuffled_tgt))
                     return _update_minibatch(train_state, batch)
 
                 train_state, metrics = jax.lax.scan(
@@ -502,18 +487,15 @@ def make_train(config):
                 )
                 return (train_state, update_state[1]), metrics
 
-            # Run updates
-            rng = runner_state[3]
             rng, _rng = jax.random.split(rng)
             (train_state, _), metrics = jax.lax.scan(
-                _update_epoch, (runner_state[0], _rng), None, config["UPDATE_EPOCHS"]
+                _update_epoch, (train_state, _rng), None, config["UPDATE_EPOCHS"]
             )
             
-            # Update runner state with new train_state and rng
-            new_runner_state = (train_state, next_env_state, last_obs, rng)
-            return new_runner_state, metrics
+            # Re-pack the runner state for the next outer loop iteration
+            # We must pass 'next_obs' so the next iteration starts from where we left off
+            return (train_state, next_env_state, next_obs, rng), metrics
 
-        # --- MAIN TRAIN LOOP ---
         runner_state = (train_state, env_states, obsv, rng)
         runner_state, metrics = jax.lax.scan(
             _update_step, runner_state, None, config["NUM_UPDATES"]
@@ -523,8 +505,8 @@ def make_train(config):
     return train
 
 if __name__ == "__main__":
+    print("Initializing Training...")
     train_fn = make_train(CONFIG)
     rng = jax.random.PRNGKey(42)
-    print("Starting training...")
-    out = jax.jit(train_fn)(rng)
-    print("Training complete.")
+    output = train_fn(rng)
+    print("Training Complete.")
