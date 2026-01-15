@@ -93,11 +93,11 @@ def get_card_tensor(state: State, player_id: int):
 def get_action_tensor(env_state: EnvState, state: State, legal_mask: chex.Array, observer_id: int):
     """
     Constructs the 24-channel action tensor.
-    Shape: (24, 4, 12)
+    Shape: (24, 4, 13)
     Dims: 0: Self Act, 1: Opp Act, 2: Sum, 3: Legal
     """
     # Create grid (Time, Feature_Rows, Actions)
-    tensor = jnp.zeros((24, 4, 12), dtype=jnp.float32)
+    tensor = jnp.zeros((24, 4, 13), dtype=jnp.float32)
     
     # Fill history
     # action_history contains (player_idx, action_idx)
@@ -186,7 +186,7 @@ class AlphaHoldemWrapper:
         # 1. Card Features (6, 4, 13) - Already handles P0/P1 flipping internally
         card_feat = get_card_tensor(state, pid)
         
-        # 2. Action Features (24, 4, 12)
+        # 2. Action Features (24, 4, 13)
         legal = self.env.get_legal_actions(state)
         # Pass pid to ensure history rows are relative (0=Me, 1=Opp)
         act_feat = get_action_tensor(env_state, state, legal, observer_id=pid)
@@ -194,7 +194,7 @@ class AlphaHoldemWrapper:
         return (card_feat, act_feat, legal)
 
     def action_space_n(self):
-        return 12
+        return 13
 
 # --- 3. NETWORK ARCHITECTURE (AlphaHoldem) ---
 
@@ -231,7 +231,7 @@ class AlphaHoldemNetwork(nn.Module):
         card_flat = card_h.reshape((card_h.shape[0], -1))
 
         # --- Action Branch ---
-        # Input: (Batch, 24, 4, 12) -> Transpose to (B, 24, 12, 4)
+        # Input: (Batch, 24, 4, 13) -> Transpose to (B, 24, 13, 4)
         act_x = jnp.transpose(act_x, (0, 1, 3, 2))
         
         act_h = nn.Conv(features=64, kernel_size=(3, 3), padding="SAME")(act_x)
@@ -304,11 +304,11 @@ def make_train(config):
         
         # Dummy init pass to get shapes
         rng, rng_init = jax.random.split(rng)
-        # obs structure is ((B,6,4,13), (B,24,4,12), (B,12))
+        # obs structure is ((B,6,4,13), (B,24,4,13), (B,13))
         dummy_obs = (
             jnp.zeros((1, 6, 4, 13)),
-            jnp.zeros((1, 24, 4, 12)),
-            jnp.ones((1, 12), dtype=bool)
+            jnp.zeros((1, 24, 4, 13)),
+            jnp.ones((1, 13), dtype=bool)
         )
         network_params = network.init(rng_init, dummy_obs)
         
