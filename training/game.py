@@ -68,48 +68,128 @@ class State:
     winner: int               # 0=P0, 1=P1, 2=Tie, -1=None
 
 # --- 2. HAND EVALUATOR ---
-TIER_SF, TIER_QA, TIER_FH, TIER_FL = 8, 7, 6, 5
-TIER_ST, TIER_TR, TIER_2P, TIER_1P, TIER_HC = 4, 3, 2, 1, 0
+STRAIGHT_MASKS = jnp.array([
+    0b11111 << i for i in range(9)
+] + [0b1000000001111], dtype=jnp.uint16)
 
-@jax.jit
-def score_5_hand(hand):
-    r, s = hand % 13, hand // 13
-    sr = jnp.sort(r)[::-1]
-    flush = jnp.min(s) == jnp.max(s)
-    strt = jnp.all(sr[:-1] - sr[1:] == 1)
-    has_wheel = jnp.all(sr == WHEEL_PATTERN)
-    strt = strt | has_wheel
-    rc = jnp.bincount(r, minlength=13)
-    mc = jnp.max(rc)
-    pc = jnp.sum(rc == 2)
-    tier = jnp.select(
-        [strt & flush, mc == 4, (mc == 3) & (pc >= 1), flush, strt, mc == 3, pc >= 2, pc == 1],
-        [TIER_SF, TIER_QA, TIER_FH, TIER_FL, TIER_ST, TIER_TR, TIER_2P, TIER_1P], TIER_HC
-    )
+# All 56 5-card subsets of 8 cards
+COMB_8_5 = jnp.array(list(itertools.combinations(range(8), 5)), dtype=jnp.int8)
 
-    # Count-based ordering for paired/set/fullhouse/quad hands
-    rank_indices = jnp.arange(13)
-    sort_keys = rc * 16 + rank_indices
-    ordered_ranks = jnp.argsort(sort_keys)[::-1][:5]
-
-    # Wheel-adjusted sorted ranks for straights/flushes/high cards
-    unpaired_ranks = jnp.where(has_wheel, jnp.array([3, 2, 1, 0, 12]), sr)    
-
-    # Use count-based ordering only for paired hands (not flush, straight, high card, straight flush)
-    use_count_order = (mc >= 2) & ~flush & ~strt
-
-    final_ranks = jnp.where(use_count_order, ordered_ranks, unpaired_ranks)
-
-    return (tier << 20) | (final_ranks[0] << 16) | (final_ranks[1] << 12) | (final_ranks[2] << 8) | (final_ranks[3] << 4) | final_ranks[4]
-
-COMBINATIONS_8_5 = jnp.array(list(itertools.combinations(range(8), 5)), dtype=jnp.int32)
+# Tier values
+TIER_HC = 0
+TIER_1P = 1
+TIER_2P = 2
+TIER_TR = 3
+TIER_ST = 4
+TIER_FL = 5
+TIER_FH = 6
+TIER_QA = 7
+TIER_SF = 8
 
 @jax.jit
 def evaluate_best_hand(hole_cards, board_cards):
-    pool = jnp.concatenate([hole_cards, board_cards])
-    candidate_hands = pool[COMBINATIONS_8_5]
-    scores = jax.vmap(score_5_hand)(candidate_hands)
-    return jnp.max(scores)
+    # hand8: shape (8,), values 0..51
+    hand8 = jnp.concatenate([hole_cards, board_cards])
+    ranks = hand8 % 13
+    suits = hand8 // 13
+
+    # build rank bitmasks per suit
+    suit_masks = jnp.zeros(4, dtype=jnp.uint16)
+    suit_masks = suit_masks.at[suits].set(
+        suit_masks[suits] | (1 << ranks)
+    )
+
+    # full rank mask
+    rank_mask = jnp.bitwise_or.reduce(suit_masks)
+
+    # rank histogram (13 bins, fits in uint16)
+    rank_counts = jnp.zeros(13, dtype=jnp.uint8)
+    rank_counts = rank_counts.at[ranks].add(1)
+
+    best = jnp.uint32(0)
+
+    # check straight flushes and flushes
+    def eval_flush(i, best):
+        sm = suit_masks[i]
+        pop = jnp.bit_count(sm)
+        best_sf = best
+
+        def check_sf(j, best_sf):
+            mask = STRAIGHT_MASKS[j]
+            hit = (sm & mask) == mask
+            high = jnp.where(j == 9, 12, j + 4)
+            score = (TIER_SF << 24) | (high << 20)
+            best_sf = jnp.maximum(best_sf, jnp.where(hit, score, best_sf))
+            return best_sf
+
+        best_sf = jax.lax.fori_loop(0, 10, check_sf, best_sf)
+
+        # flush but not straight flush
+        def flush_score():
+            ranks = jnp.argsort(jnp.where((sm >> jnp.arange(13)) & 1, jnp.arange(13), -1))[::-1][:5]
+            return (TIER_FL << 24) | (ranks[0]<<20)|(ranks[1]<<16)|(ranks[2]<<12)|(ranks[3]<<8)|(ranks[4]<<4)
+
+        best_flush = jnp.where(pop >= 5, jnp.maximum(best_sf, flush_score()), best_sf)
+        return best_flush
+
+    best = jax.lax.fori_loop(0, 4, eval_flush, best)
+
+    # straight (non-flush)
+    def check_straight(j, best):
+        mask = STRAIGHT_MASKS[j]
+        hit = (rank_mask & mask) == mask
+        high = jnp.where(j == 9, 12, j + 4)
+        score = (TIER_ST << 24) | (high << 20)
+        return jnp.maximum(best, jnp.where(hit, score, best))
+
+    best = jax.lax.fori_loop(0, 10, check_straight, best)
+
+    # quads, full house, trips, pairs
+    counts = rank_counts
+
+    # sorted ranks by (count, rank)
+    order = jnp.argsort(jnp.stack([counts, jnp.arange(13)], axis=1), axis=0)[::-1][:,0]
+
+    # build ordered kickers
+    ordered = jnp.repeat(order, counts[order])
+
+    # detect groups
+    c_sorted = jnp.sort(counts)[::-1]
+    mc = c_sorted[0]
+    pc = jnp.sum(counts == 2)
+
+    # quads
+    best = jnp.where(mc == 4,
+        jnp.maximum(best, (TIER_QA<<24)|(ordered[0]<<20)|(ordered[4]<<16)),
+        best)
+
+    # full house
+    best = jnp.where((mc == 3) & (pc >= 1),
+        jnp.maximum(best, (TIER_FH<<24)|(ordered[0]<<20)|(ordered[3]<<16)),
+        best)
+
+    # trips
+    best = jnp.where(mc == 3,
+        jnp.maximum(best, (TIER_TR<<24)|(ordered[0]<<20)|(ordered[3]<<16)|(ordered[4]<<12)),
+        best)
+
+    # two pair
+    best = jnp.where(pc >= 2,
+        jnp.maximum(best, (TIER_2P<<24)|(ordered[0]<<20)|(ordered[2]<<16)|(ordered[4]<<12)),
+        best)
+
+    # one pair
+    best = jnp.where(pc == 1,
+        jnp.maximum(best, (TIER_1P<<24)|(ordered[0]<<20)|(ordered[2]<<16)|(ordered[3]<<12)|(ordered[4]<<8)),
+        best)
+
+    # high card
+    best = jnp.maximum(best,
+        (TIER_HC<<24)|(ordered[0]<<20)|(ordered[1]<<16)|(ordered[2]<<12)|(ordered[3]<<8)|(ordered[4]<<4)
+    )
+
+    return best
+
 
 @jax.jit
 def get_showdown_result(state):
