@@ -34,7 +34,7 @@ CONFIG = {
 }
 
 ACTION_DIM = 13
-HIST_T = 24
+HIST_T = 26
 
 # -------------------------
 # 2) OBS ENCODING
@@ -43,6 +43,7 @@ HIST_T = 24
 class EnvState:
     game_state: State
     action_history: chex.Array  # (24, 2): (player, action)
+    legal_history: chex.Array   # (24, 13): legal mask at each step
     history_ptr: int
     time: int
 
@@ -55,48 +56,58 @@ def _scatter_ones_1d(base: jnp.ndarray, idx: jnp.ndarray) -> jnp.ndarray:
 
 def get_card_tensor(state: State, player_id: int) -> jnp.ndarray:
     """
-    6-channel (4x13) card tensor.
+    8-channel (4x13) card tensor.
     Channels:
-      0 hole
-      1 flop+discards (treated as extended flop for this variant)
-      2 turn
-      3 river
-      4 all public
-      5 all known (hole+public)
-    Shape: (6, 4, 13)
+      0 active hole cards (masked)
+      1 flop
+      2 hero discard
+      3 villain discard
+      4 turn
+      5 river
+      6 all public
+      7 all known (active hole + public)
+    Shape: (8, 4, 13)
     """
     hole = jnp.where(player_id == 0, state.p0_hole, state.p1_hole)
+    active_mask = jnp.where(player_id == 0, state.p0_active_mask, state.p1_active_mask)
+    hole_masked = jnp.where(active_mask, hole, -1)
+    
     board = state.board  # length 6, -1 for unknown
 
     flop = board[0:2]
-    disc = board[2:4]
+    oop_discard = board[2:3]
+    dlr_discard = board[3:4]
     turn = board[4:5]
     river = board[5:6]
+    
+    # Determine hero/villain discards based on position
+    is_dealer = jnp.where(player_id == 0, state.is_dealer_p0, ~state.is_dealer_p0)
+    hero_discard = jnp.where(is_dealer, dlr_discard, oop_discard)
+    villain_discard = jnp.where(is_dealer, oop_discard, dlr_discard)
 
-    t = jnp.zeros((6, 52), dtype=jnp.float32)
+    t = jnp.zeros((8, 52), dtype=jnp.float32)
 
-    # hole
     t = t.at[0].set(_scatter_ones_1d(t[0], hole))
-    # flop+discards
-    t = t.at[1].set(_scatter_ones_1d(t[1], jnp.concatenate([flop, disc])))
-    # turn
-    t = t.at[2].set(_scatter_ones_1d(t[2], turn))
-    # river
-    t = t.at[3].set(_scatter_ones_1d(t[3], river))
-    # all public
-    t = t.at[4].set(_scatter_ones_1d(t[4], board))
-    # all known
-    t = t.at[5].set(_scatter_ones_1d(t[5], jnp.concatenate([hole, board])))
+    t = t.at[1].set(_scatter_ones_1d(t[1], flop))
+    t = t.at[2].set(_scatter_ones_1d(t[2], hero_discard))
+    t = t.at[3].set(_scatter_ones_1d(t[3], villain_discard))
+    t = t.at[4].set(_scatter_ones_1d(t[4], turn))
+    t = t.at[5].set(_scatter_ones_1d(t[5], river))
+    t = t.at[6].set(_scatter_ones_1d(t[6], board))
+    t = t.at[7].set(_scatter_ones_1d(t[7], jnp.concatenate([hole_masked, board])))
 
-    return t.reshape((6, 4, 13))
+    return t.reshape((8, 4, 13))
 
+!!!
+# Wasteeful iteration: get_action_tensor populations action_tensor from timestep 0 while get_action_tensor is called
+# whenever a new state appears
 def get_action_tensor(env_state: EnvState, legal_mask: jnp.ndarray, observer_id: int) -> jnp.ndarray:
     """
-    24-step action tensor: (24, 4, 13)
+    26-step action tensor: (26, 4, 13)
       row 0: self
       row 1: opp
       row 2: sum
-      row 3: legal actions at the CURRENT decision index (history_ptr)
+      row 3: legal actions (historical for past, current for decision point)
     """
     t = jnp.zeros((HIST_T, 4, ACTION_DIM), dtype=jnp.float32)
 
@@ -107,18 +118,20 @@ def get_action_tensor(env_state: EnvState, legal_mask: jnp.ndarray, observer_id:
         is_self = p == observer_id
         row = jnp.where(is_self, 0, 1)
 
-        # only set if valid
         acc = acc.at[i, row, a].set(jnp.where(valid, 1.0, 0.0))
         acc = acc.at[i, 2, a].set(jnp.where(valid, 1.0, 0.0))
 
-        # legal actions shown at the current pointer
+        # Use historical legal mask for past, current legal mask for decision point
         is_current = i == env_state.history_ptr
-        acc = acc.at[i, 3, :].set(jnp.where(is_current, legal_mask.astype(jnp.float32), 0.0))
+        legal_to_use = jnp.where(is_current, legal_mask, env_state.legal_history[i])
+        acc = acc.at[i, 3, :].set(jnp.where(valid | is_current, legal_to_use.astype(jnp.float32), 0.0))
         return acc
 
     t = jax.lax.fori_loop(0, HIST_T, fill_step, t)
     return t
 
+!!!
+# Potentially switch to bool? But also, we may need to convert it back to int32 when combingin CNNs
 class AlphaHoldemWrapper:
     def __init__(self):
         self.env = TossHoldemEnv()
