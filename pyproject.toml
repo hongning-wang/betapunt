@@ -1,5 +1,5 @@
 [project]
-name = "engine-2026"
+name = "beta-punters"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -11,3 +11,14 @@ dependencies = [
     "jax>=0.4.13",
     "pkrbot>=1.1.0",
 ]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"

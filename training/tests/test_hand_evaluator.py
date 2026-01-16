@@ -6,7 +6,7 @@ from typing import List, Tuple
 import jax.numpy as jnp
 import pkrbot
 
-from game import evaluate_best_hand
+from training.game import evaluate_best_hand
 
 
 _RANKS = "23456789TJQKA"
