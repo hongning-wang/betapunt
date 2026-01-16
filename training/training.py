@@ -42,8 +42,7 @@ HIST_T = 26
 @chex.dataclass(frozen=True)
 class EnvState:
     game_state: State
-    action_history: chex.Array  # (24, 2): (player, action)
-    legal_history: chex.Array   # (24, 13): legal mask at each step
+    aaction_tensor: chex.Array   # (HIST_T, 4, ACTION_DIM): action history tensor
     history_ptr: int
     time: int
 
@@ -98,74 +97,71 @@ def get_card_tensor(state: State, player_id: int) -> jnp.ndarray:
 
     return t.reshape((8, 4, 13))
 
-!!!
-# Wasteeful iteration: get_action_tensor populations action_tensor from timestep 0 while get_action_tensor is called
-# whenever a new state appears
-def get_action_tensor(env_state: EnvState, legal_mask: jnp.ndarray, observer_id: int) -> jnp.ndarray:
+def get_action_tensor(env_state: EnvState, observer_id: int) -> jnp.ndarray:
     """
-    26-step action tensor: (26, 4, 13)
-      row 0: self
-      row 1: opp
-      row 2: sum
-      row 3: legal actions (historical for past, current for decision point)
+    Returns action tensor with rows reordered for observer perspective.
+    Row 0: hero (observer's actions)
+    Row 1: villain (opponent's actions)
+    Row 2: pot size (before action)
+    Row 3: legal
     """
-    t = jnp.zeros((HIST_T, 4, ACTION_DIM), dtype=jnp.float32)
+    t = env_state.action_tensor
+    row_order = jnp.where(observer_id == 0,
+                          jnp.array([0, 1, 2, 3]),
+                          jnp.array([1, 0, 2, 3]))
+    return t[:, row_order, :]
 
-    def fill_step(i, acc):
-        p, a = env_state.action_history[i]
-        valid = i < env_state.history_ptr
-
-        is_self = p == observer_id
-        row = jnp.where(is_self, 0, 1)
-
-        acc = acc.at[i, row, a].set(jnp.where(valid, 1.0, 0.0))
-        acc = acc.at[i, 2, a].set(jnp.where(valid, 1.0, 0.0))
-
-        # Use historical legal mask for past, current legal mask for decision point
-        is_current = i == env_state.history_ptr
-        legal_to_use = jnp.where(is_current, legal_mask, env_state.legal_history[i])
-        acc = acc.at[i, 3, :].set(jnp.where(valid | is_current, legal_to_use.astype(jnp.float32), 0.0))
-        return acc
-
-    t = jax.lax.fori_loop(0, HIST_T, fill_step, t)
-    return t
-
-!!!
-# Potentially switch to bool? But also, we may need to convert it back to int32 when combingin CNNs
 class AlphaHoldemWrapper:
     def __init__(self):
         self.env = TossHoldemEnv()
 
     def reset(self, key):
         gs = self.env.reset(key)
+        
+        # Get initial legal mask
+        initial_legal = self.env.get_legal_actions(gs)
+        
+        # Initialize action tensor with first legal mask
+        action_tensor = jnp.zeros((HIST_T, 4, ACTION_DIM), dtype=jnp.float32)
+        action_tensor = action_tensor.at[0, 3, :].set(initial_legal.astype(jnp.float32))
+        
         env_state = EnvState(
             game_state=gs,
-            action_history=jnp.zeros((HIST_T, 2), dtype=jnp.int32),
+            action_tensor=action_tensor,
             history_ptr=0,
             time=0,
         )
         obs = self._get_obs(env_state, gs)
         return obs, env_state
-
+    
     def step(self, key, env_state: EnvState, action: jnp.ndarray):
         gs = env_state.game_state
         acting_pid = gs.current_player
+        ptr = env_state.history_ptr
 
+        # Update action tensor at current slot
+        new_action_tensor = env_state.action_tensor
+        new_action_tensor = new_action_tensor.at[ptr, acting_pid, action].set(1.0)
+        new_action_tensor = new_action_tensor.at[ptr, 2, action].set(gs.pot)
+
+        # Take action
         next_gs = self.env.step(gs, key, action)
+        
+        # Update history
+        new_ptr = jnp.minimum(ptr + 1, HIST_T - 1)
 
-        new_hist = env_state.action_history.at[env_state.history_ptr].set(
-            jnp.array([acting_pid, action], dtype=jnp.int32)
-        )
-        new_ptr = jnp.minimum(env_state.history_ptr + 1, HIST_T - 1)
+        # Set legal mask for next decision point
+        next_legal = self.env.get_legal_actions(next_gs)
+        new_action_tensor = new_action_tensor.at[new_ptr, 3, :].set(next_legal.astype(jnp.float32))
 
         next_env_state = EnvState(
             game_state=next_gs,
-            action_history=new_hist,
+            action_tensor=new_action_tensor,
             history_ptr=new_ptr,
             time=env_state.time + 1,
         )
 
-        # Reward convention: terminal reward in P0 coordinates (profit).
+        # Reward convention: terminal reward in P0 coordinates (profit)
         reward_p0 = next_gs.p0_stack - STACK_SIZE
         reward_p0 = jnp.where(next_gs.done, reward_p0, 0.0)
 
@@ -176,8 +172,8 @@ class AlphaHoldemWrapper:
     def _get_obs(self, env_state: EnvState, gs: State):
         pid = gs.current_player
         card_feat = get_card_tensor(gs, pid)
-        legal = self.env.get_legal_actions(gs)  # bool[13]
-        act_feat = get_action_tensor(env_state, legal, observer_id=pid)
+        legal = self.env.get_legal_actions(gs)
+        act_feat = get_action_tensor(env_state, observer_id=pid)
         return (card_feat, act_feat, legal)
 
     def action_space_n(self):
