@@ -307,6 +307,24 @@ class TestLegalActions:
         assert legal[ACT_DISCARD_1]
         assert legal[ACT_DISCARD_2]
 
+    def test_cannot_fold_when_checked_to(self):
+        """Cannot fold when there's nothing to call (standard poker rules)."""
+        env = TossHoldemEnv()
+        key = jax.random.PRNGKey(42)
+        state = env.reset(key)
+        
+        # BB after SB limps
+        state = state.replace(
+            is_dealer_p0=True, current_player=1,
+            p0_bet=BB, p1_bet=BB,
+            p0_stack=STACK_SIZE - BB, p1_stack=STACK_SIZE - BB,
+            p0_acted_this_street=True, p1_acted_this_street=False
+        )
+        
+        legal = env.get_legal_actions(state)
+        
+        assert not legal[ACT_FOLD], "Fold should NOT be legal when checked to"
+        assert legal[ACT_CHECK], "Check should be legal"
 
 # ============================================================================
 # Test: Raise Bounds (Engine comparison)

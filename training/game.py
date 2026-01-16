@@ -211,7 +211,7 @@ class TossHoldemEnv:
             mask_bits = jnp.zeros(13, dtype=bool)
             
             # Fold always legal
-            mask_bits = mask_bits.at[ACT_FOLD].set(True)
+            mask_bits = mask_bits.at[ACT_FOLD].set(to_call > 0)
             
             # Check vs Call Logic
             mask_bits = mask_bits.at[ACT_CHECK].set(to_call == 0)
