@@ -70,7 +70,7 @@ class Config:
 
     # Mild staleness control (keeps off-policy flavor but avoids extreme drift)
     # If 0, sample uniformly from all buffer.
-    recent_window: int = 200_000
+    recent_window: int = 0
 
     # K-Best self-play
     k_best: int = 5
@@ -157,8 +157,8 @@ def _cards_to_plane(cards: chex.Array) -> chex.Array:
 class AuxState:
     """Extra per-env state to build AlphaHoldem tensors."""
 
-    # Action history tensor: (ACT_CHANS, 4, NB_ACTIONS)
-    # rows: [p0, p1, sum, legal] (absolute semantics)
+    # Action history tensor in TPU-friendly NHWC layout: (4, NB_ACTIONS, ACT_CHANS)
+    # Height=4 rows: [p0, p1, sum, legal] (absolute semantics)
     action_tensor: chex.Array
     round_idx: chex.Array
     slot_idx: chex.Array
@@ -167,7 +167,7 @@ class AuxState:
 @jax.jit
 def aux_reset() -> AuxState:
     return AuxState(
-        action_tensor=jnp.zeros((ACT_CHANS, 4, NB_ACTIONS), dtype=jnp.float32),
+        action_tensor=jnp.zeros((4, NB_ACTIONS, ACT_CHANS), dtype=jnp.float32),
         round_idx=jnp.int32(0),
         slot_idx=jnp.int32(0),
     )
@@ -201,11 +201,11 @@ def aux_record_action(
     base = aux.round_idx * 6
     chan = base + jnp.minimum(aux.slot_idx, jnp.int32(5))
 
-    def _shift_and_write(tensor):
-        # NOTE: base is dynamic under JIT; use lax.dynamic_slice/update_slice.
-        seg = jax.lax.dynamic_slice(tensor, (base, 0, 0), (6, 4, NB_ACTIONS))
-        seg = jnp.concatenate([seg[1:], seg[-1:]], axis=0)
-        return jax.lax.dynamic_update_slice(tensor, seg, (base, 0, 0))
+    def _shift_and_write(tensor_hwk):
+        # Shift the 6-slot segment inside the round along the channel axis (last dim).
+        seg = jax.lax.dynamic_slice(tensor_hwk, (0, 0, base), (4, NB_ACTIONS, 6))
+        seg = jnp.concatenate([seg[:, :, 1:], seg[:, :, -1:]], axis=2)
+        return jax.lax.dynamic_update_slice(tensor_hwk, seg, (0, 0, base))
 
     action_tensor = jax.lax.cond(aux.slot_idx >= 6, _shift_and_write, lambda t: t, aux.action_tensor)
 
@@ -216,8 +216,8 @@ def aux_record_action(
     row_p1 = jnp.where(player_id == 1, a_oh, jnp.zeros_like(a_oh))
     row_sum = row_p0 + row_p1
 
-    chan_mat = jnp.stack([row_p0, row_p1, row_sum, legal_f], axis=0)
-    action_tensor = action_tensor.at[chan].set(chan_mat)
+    chan_mat = jnp.stack([row_p0, row_p1, row_sum, legal_f], axis=0)  # (4, NB_ACTIONS)
+    action_tensor = action_tensor.at[:, :, chan].set(chan_mat)
 
     return aux.replace(action_tensor=action_tensor, slot_idx=aux.slot_idx + 1)
 
@@ -227,8 +227,8 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
     """Build AlphaHoldem card/action tensors + legal mask from a state.
 
     Returns:
-      card_tensor: (CARD_CHANS,4,13)
-      action_tensor: (ACT_CHANS,4,NB_ACTIONS)
+      card_tensor: (4,13,CARD_CHANS)  (NHWC)
+      action_tensor: (4,NB_ACTIONS,ACT_CHANS)  (NHWC)
       legal_mask: (NB_ACTIONS,) bool
 
     Card channels (variant-aware):
@@ -262,8 +262,13 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
     ch5_public = _cards_to_plane(public_cards)
     ch6_all = _cards_to_plane(jnp.concatenate([hole_active, public_cards], axis=0))
 
-    card_tensor = jnp.stack([ch0_hole, ch1_flop, ch2_turn, ch3_river, ch4_disc, ch5_public, ch6_all], axis=0)
+    # Build card tensor directly in NHWC (4,13,C).
+    card_tensor = jnp.stack(
+        [ch0_hole, ch1_flop, ch2_turn, ch3_river, ch4_disc, ch5_public, ch6_all],
+        axis=-1,
+    )
 
+    # Action tensor already stored in NHWC (4,13,K) where K=ACT_CHANS.
     action_tensor = aux.action_tensor
     legal = ENV.get_legal_actions(state)
     return card_tensor, action_tensor, legal
@@ -279,29 +284,54 @@ class ResidualBlock(nn.Module):
 
     @nn.compact
     def __call__(self, x: chex.Array) -> chex.Array:
-        y = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME", use_bias=True)(x)
+        y = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            use_bias=True,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
+        )(x)
         y = nn.relu(y)
-        y = nn.Conv(self.channels, kernel_size=(3, 3), padding="SAME", use_bias=True)(y)
+        y = nn.Conv(
+            self.channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            use_bias=True,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
+        )(y)
         return nn.relu(x + y)
 
 
 class AlphaHoldemNet(nn.Module):
     """Conv-ResNet trunk + large FC head (paper-style)."""
 
-    trunk_channels: int = 64
+    # TPU MXU-friendly widths (multiples of 128 where it matters).
+    trunk_channels: int = 128
     num_blocks: int = 6
-    fc_dim: int = 2048
+    fc_dim: int = 2048  # already multiple-of-128
 
     @nn.compact
     def __call__(
         self,
-        card_tensor: chex.Array,  # (B,7,4,13)
-        action_tensor: chex.Array,  # (B,ACT_CHANS,4,13)
+        card_tensor: chex.Array,  # (B,4,13,7)   NHWC
+        action_tensor: chex.Array,  # (B,4,13,ACT_CHANS) NHWC
     ) -> Tuple[chex.Array, chex.Array]:
-        x = jnp.concatenate([card_tensor, action_tensor], axis=1)  # (B,6+ACT,4,13)
-        x = jnp.transpose(x, (0, 2, 3, 1))  # (B,4,13,C)
+        # Concatenate along channel axis (last dim) to keep NHWC.
+        x = jnp.concatenate([card_tensor, action_tensor], axis=-1)  # (B,4,13,C)
 
-        x = nn.Conv(self.trunk_channels, kernel_size=(3, 3), padding="SAME", use_bias=True)(x)
+        # Mixed precision: activations in bfloat16, params in float32.
+        x = jax.lax.convert_element_type(x, jnp.bfloat16)
+
+        x = nn.Conv(
+            self.trunk_channels,
+            kernel_size=(3, 3),
+            padding="SAME",
+            use_bias=True,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.float32,
+        )(x)
         x = nn.relu(x)
 
         for _ in range(self.num_blocks):
@@ -309,13 +339,17 @@ class AlphaHoldemNet(nn.Module):
 
         x = x.reshape((x.shape[0], -1))
 
-        x = nn.Dense(self.fc_dim)(x)
+        x = nn.Dense(self.fc_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = nn.relu(x)
-        x = nn.Dense(self.fc_dim)(x)
+        x = nn.Dense(self.fc_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = nn.relu(x)
 
-        logits = nn.Dense(NB_ACTIONS)(x)  # (B,13)
-        value = nn.Dense(1)(x)[:, 0]  # (B,)
+        logits = nn.Dense(NB_ACTIONS, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)  # (B,13)
+        value = nn.Dense(1, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)[:, 0]  # (B,)
+
+        # Loss computations should happen in float32.
+        logits = logits.astype(jnp.float32)
+        value = value.astype(jnp.float32)
         return logits, value
 
 
@@ -332,11 +366,12 @@ def masked_categorical(logits: chex.Array, legal: chex.Array) -> distrax.Categor
 
 @chex.dataclass(frozen=True)
 class Transition:
-    card: chex.Array  # (B?,6,4,13) float32
-    act: chex.Array  # (B?,ACT,4,13) float32
+    # TPU-friendly NHWC tensors
+    card: chex.Array  # (B?,4,13,CARD_CHANS) float32
+    act: chex.Array  # (B?,4,13,ACT_CHANS) float32
     # Critic-view encoding (learner perspective on every timestep)
-    card_v: chex.Array  # (B?,6,4,13) float32
-    act_v: chex.Array  # (B?,ACT,4,13) float32
+    card_v: chex.Array  # (B?,4,13,CARD_CHANS) float32
+    act_v: chex.Array  # (B?,4,13,ACT_CHANS) float32
     legal: chex.Array  # (B?,13) bool
     action: chex.Array  # (B?) int32
     logp_old: chex.Array  # (B?) float32
@@ -352,11 +387,11 @@ class Transition:
 @chex.dataclass(frozen=True)
 class ReplayBuffer:
     # Store sparse/binary tensors as uint8 for memory.
-    card_u8: chex.Array  # (cap,6,4,13) uint8
-    act_u8: chex.Array  # (cap,ACT,4,13) uint8
+    card_u8: chex.Array  # (cap,4,13,CARD_CHANS) uint8
+    act_u8: chex.Array  # (cap,4,13,ACT_CHANS) uint8
     # Critic-view encoding (learner perspective)
-    card_v_u8: chex.Array  # (cap,6,4,13) uint8
-    act_v_u8: chex.Array  # (cap,ACT,4,13) uint8
+    card_v_u8: chex.Array  # (cap,4,13,CARD_CHANS) uint8
+    act_v_u8: chex.Array  # (cap,4,13,ACT_CHANS) uint8
     legal: chex.Array  # (cap,13) bool
     action: chex.Array
     logp_old: chex.Array
@@ -373,10 +408,11 @@ class ReplayBuffer:
 
 def replay_init(capacity: int) -> ReplayBuffer:
     return ReplayBuffer(
-        card_u8=jnp.zeros((capacity, CARD_CHANS, SUITS, RANKS), dtype=jnp.uint8),
-        act_u8=jnp.zeros((capacity, ACT_CHANS, 4, NB_ACTIONS), dtype=jnp.uint8),
-        card_v_u8=jnp.zeros((capacity, CARD_CHANS, SUITS, RANKS), dtype=jnp.uint8),
-        act_v_u8=jnp.zeros((capacity, ACT_CHANS, 4, NB_ACTIONS), dtype=jnp.uint8),
+        # NHWC: (4,13,C)
+        card_u8=jnp.zeros((capacity, SUITS, RANKS, CARD_CHANS), dtype=jnp.uint8),
+        act_u8=jnp.zeros((capacity, 4, NB_ACTIONS, ACT_CHANS), dtype=jnp.uint8),
+        card_v_u8=jnp.zeros((capacity, SUITS, RANKS, CARD_CHANS), dtype=jnp.uint8),
+        act_v_u8=jnp.zeros((capacity, 4, NB_ACTIONS, ACT_CHANS), dtype=jnp.uint8),
         legal=jnp.zeros((capacity, NB_ACTIONS), dtype=jnp.bool_),
         action=jnp.zeros((capacity,), dtype=jnp.int32),
         logp_old=jnp.zeros((capacity,), dtype=jnp.float32),
@@ -1182,6 +1218,12 @@ def make_update_step():
 
 def main() -> None:
     print(f"JAX Devices: {jax.devices()}")
+
+    # TPU efficiency guards (MXU prefers multiples of 128).
+    assert CFG.num_envs % 128 == 0, "num_envs should be a multiple of 128 for TPU MXU efficiency"
+    assert CFG.rollout_len % 128 == 0, "rollout_len should be a multiple of 128 for TPU MXU efficiency"
+    assert CFG.batch_size % 128 == 0, "batch_size should be a multiple of 128 for TPU MXU efficiency"
+    assert (CFG.batch_size // CFG.num_minibatches) % 128 == 0, "minibatch size should be a multiple of 128"
     
     # 1. Initialization
     key = jax.random.PRNGKey(CFG.seed)
@@ -1257,5 +1299,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
