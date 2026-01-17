@@ -49,7 +49,7 @@ from game import (
 @dataclass(frozen=True)
 class Config:
     # Parallel sampling
-    num_envs: int = 8192
+    num_envs: int = 16_384
     rollout_len: int = 128
 
     # PPO/GAE
@@ -65,11 +65,11 @@ class Config:
     max_grad_norm: float = 1.0
 
     # Off-policy replay + updates
-    replay_capacity: int = 5_000_000
-    batch_size: int = 131_072
+    replay_capacity: int = 10_000_000
+    batch_size: int = 262_144
     num_minibatches: int = 8
     update_epochs: int = 4
-    warmup_steps: int = 5_000_000
+    warmup_steps: int = 10_000_000
 
     # Mild staleness control (keeps off-policy flavor but avoids extreme drift)
     # If 0, sample uniformly from all buffer.
@@ -77,14 +77,14 @@ class Config:
 
     # K-Best self-play
     k_best: int = 5
-    pool_max: int = 64
+    pool_max: int = 100
     eval_hands: int = 500
-    add_to_pool_every_updates: int = 200
+    add_to_pool_every_updates: int = 50
     elo_k: float = 32.0
 
     # Runtime
     seed: int = 0
-    total_updates: int = 50_000
+    total_updates: int = 5_000
 
 
 CFG = Config()
