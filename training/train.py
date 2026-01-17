@@ -276,12 +276,12 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
 
     # Action tensor already stored in NHWC (4,13,K) where K=ACT_CHANS.
     action_tensor = aux.action_tensor
+    
     def make_ego_relative(tensor, player_id):
-        return jnp.where(
-            player_id == 0,
-            tensor,
-            tensor.at[[0, 1]].set(tensor[[1, 0]])
-        )
+        SWAP01 = jnp.array([1, 0, 2, 3], dtype=jnp.int32)
+        swapped = jnp.take(tensor, SWAP01, axis=0)
+
+        return jnp.where(player_id == 0, tensor, swapped)
     action_tensor = make_ego_relative(action_tensor, player_id)
     legal = ENV.get_legal_actions(state)
     return card_tensor, action_tensor, legal
@@ -737,7 +737,9 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
     policy_loss = -jnp.sum(obj * valid_f) / denom
     # Train the critic on *all* states (including opponent-turn states), since the
     # rollout/GAE uses V(s) at every timestep.
-    value_loss = jnp.mean(v_loss)
+    denom = jnp.sum(valid_f) + 1e-8                     # valid_f is 0/1 float mask
+    valid_frac = denom / valid_f.size  
+    value_loss = jnp.mean(v_loss) * valid_frac
 
     entropy = jnp.sum(ent * valid_f) / denom
 
