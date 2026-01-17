@@ -13,6 +13,7 @@ Key components:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, Tuple
 
 import chex
@@ -201,9 +202,10 @@ def aux_record_action(
     chan = base + jnp.minimum(aux.slot_idx, jnp.int32(5))
 
     def _shift_and_write(tensor):
-        seg = tensor[base : base + 6]
+        # NOTE: base is dynamic under JIT; use lax.dynamic_slice/update_slice.
+        seg = jax.lax.dynamic_slice(tensor, (base, 0, 0), (6, 4, NB_ACTIONS))
         seg = jnp.concatenate([seg[1:], seg[-1:]], axis=0)
-        return tensor.at[base : base + 6].set(seg)
+        return jax.lax.dynamic_update_slice(tensor, seg, (base, 0, 0))
 
     action_tensor = jax.lax.cond(aux.slot_idx >= 6, _shift_and_write, lambda t: t, aux.action_tensor)
 
@@ -458,7 +460,7 @@ def replay_add(buf: ReplayBuffer, tr: Transition) -> ReplayBuffer:
     return buf
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=(2,))
 def replay_sample(buf: ReplayBuffer, key: chex.PRNGKey, batch_size: int) -> Tuple[Transition, chex.PRNGKey]:
     """Sample a batch (optionally with a recent-window bias to reduce staleness)."""
 
@@ -546,10 +548,11 @@ def elo_update(ra: chex.Array, rb: chex.Array, score_a: chex.Array, k: float) ->
 def pool_select_opponent(pool: AgentPool, key: chex.PRNGKey) -> Tuple[Any, chex.PRNGKey]:
     key, sub = jax.random.split(key)
     size = pool.size
-    k = jnp.minimum(CFG.k_best, size)
     valid_elo = jnp.where(jnp.arange(CFG.pool_max) < size, pool.elo, -1e9)
-    topk_idx = jnp.argsort(valid_elo)[::-1][:k]
-    pick = jax.random.randint(sub, (), 0, jnp.maximum(k, 1))
+    # Use a fixed-K top_k to keep slice sizes static under JIT.
+    _, topk_idx = jax.lax.top_k(valid_elo, k=CFG.k_best)
+    k_eff = jnp.minimum(size, jnp.int32(CFG.k_best))
+    pick = jax.random.randint(sub, (), 0, jnp.maximum(k_eff, 1))
     idx = topk_idx[pick]
     opp_params = jax.tree_util.tree_map(lambda p: p[idx], pool.params)
     return opp_params, key
@@ -689,7 +692,10 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
 
 @jax.jit
 def train_step(state: TrainState, batch: Transition) -> Tuple[TrainState, Dict[str, chex.Array]]:
-    (loss, metrics), grads = jax.value_and_grad(ppo_loss_and_metrics, has_aux=True)(state, batch)
+    def _loss_and_metrics(params, batch_):
+        return ppo_loss_and_metrics(state.replace(params=params), batch_)
+
+    (loss, metrics), grads = jax.value_and_grad(_loss_and_metrics, has_aux=True)(state.params, batch)
     new_state = state.apply_gradients(grads=grads)
     metrics = dict(metrics)
     metrics["loss"] = loss
@@ -750,7 +756,6 @@ def policy_act(
 
 @jax.jit
 def env_step_and_optional_reset(
-    env: TossHoldemEnv,
     s: State,
     key: chex.PRNGKey,
     action: chex.Array,
@@ -758,9 +763,9 @@ def env_step_and_optional_reset(
     """Step one env and then (optionally) reset after producing terminal transition."""
 
     key, k_step, k_reset = jax.random.split(key, 3)
-    s_next = env.step(s, k_step, action)
+    s_next = ENV.step(s, k_step, action)
     done = s_next.done
-    s_reset = env.reset(k_reset)
+    s_reset = ENV.reset(k_reset)
     s_cont = jax.tree_util.tree_map(lambda a, b: jnp.where(done, a, b), s_reset, s_next)
     return s_next, s_cont, done, key
 
@@ -864,11 +869,11 @@ def collect_rollout(
         action, logp_old, ks2 = jax.vmap(_act_one)(s, aux, ks, is_learner_turn)
 
         # Legal actions depend only on the current state (current_player), so compute once.
-        legal = jax.vmap(env.get_legal_actions)(s)
+        legal = jax.vmap(ENV.get_legal_actions)(s)
         aux2 = jax.vmap(aux_record_action)(aux, s.current_player.astype(jnp.int32), action, legal)
 
         def _step_one(si, ki, ai):
-            return env_step_and_optional_reset(env, si, ki, ai)
+            return env_step_and_optional_reset(si, ki, ai)
 
         s_next, s_cont, done, ks3 = jax.vmap(_step_one)(s, ks2, action)
 
@@ -1142,7 +1147,7 @@ def make_update_step():
             
             def _minibatch_step(ts_local, i):
                 # Slice the batch using the permutation
-                idxs = perm[i * mb_size : (i + 1) * mb_size]
+                idxs = jax.lax.dynamic_slice(perm, (i * mb_size,), (mb_size,))
                 
                 # Helper to slice the Transition object
                 b_mini = jax.tree_util.tree_map(lambda x: x[idxs], batch)
@@ -1253,5 +1258,4 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
-if __name__ == "__main__":
-    main()
+

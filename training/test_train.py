@@ -5,14 +5,26 @@ learns, only that core plumbing (encoding, stepping, rollout collection, replay,
 loss/update) runs without shape / JIT / RNG / reset bugs.
 
 Run:
-  python -m pytest -q
+  python test_train.py
 """
 
 import importlib
 import math
+import sys
 
 import jax
 import jax.numpy as jnp
+
+
+def run_test(test_func, test_name):
+    """Run a single test function and report results."""
+    try:
+        test_func()
+        print(f"✓ {test_name} PASSED")
+        return True
+    except Exception as e:
+        print(f"✗ {test_name} FAILED: {e}")
+        return False
 
 
 def _fresh_train_module():
@@ -56,11 +68,16 @@ def test_encode_obs_shapes_and_legal_mask():
 
     for pid in [jnp.int32(0), jnp.int32(1)]:
         card, act, legal = tr.encode_obs(s, aux, pid)
-        assert card.shape == (tr.CARD_CHANS, tr.SUITS, tr.RANKS)
-        assert act.shape == (tr.ACT_CHANS, 4, tr.NB_ACTIONS)
-        assert legal.shape == (tr.NB_ACTIONS,)
-        assert legal.dtype == jnp.bool_
-        assert bool(jnp.any(legal)), "At least one action should be legal"
+        if card.shape != (tr.CARD_CHANS, tr.SUITS, tr.RANKS):
+            raise AssertionError(f"Card shape mismatch: expected {(tr.CARD_CHANS, tr.SUITS, tr.RANKS)}, got {card.shape}")
+        if act.shape != (tr.ACT_CHANS, 4, tr.NB_ACTIONS):
+            raise AssertionError(f"Action shape mismatch: expected {(tr.ACT_CHANS, 4, tr.NB_ACTIONS)}, got {act.shape}")
+        if legal.shape != (tr.NB_ACTIONS,):
+            raise AssertionError(f"Legal shape mismatch: expected {(tr.NB_ACTIONS,)}, got {legal.shape}")
+        if legal.dtype != jnp.bool_:
+            raise AssertionError(f"Legal dtype mismatch: expected {jnp.bool_}, got {legal.dtype}")
+        if not bool(jnp.any(legal)):
+            raise AssertionError("At least one action should be legal")
 
 
 def test_env_step_and_optional_reset_semantics():
@@ -73,16 +90,21 @@ def test_env_step_and_optional_reset_semantics():
     # Take one legal action.
     legal = env.get_legal_actions(s)
     a = int(jnp.argmax(legal))
-    s_next, s_cont, done, key = tr.env_step_and_optional_reset(env, s, key, jnp.int32(a))
+    s_next, s_cont, done, key = tr.env_step_and_optional_reset(s, key, jnp.int32(a))
 
-    assert s_next is not None
-    assert s_cont is not None
-    assert done.shape == ()
+    if s_next is None:
+        raise AssertionError("s_next should not be None")
+    if s_cont is None:
+        raise AssertionError("s_cont should not be None")
+    if done.shape != ():
+        raise AssertionError(f"Done shape mismatch: expected (), got {done.shape}")
 
     # If the step ended the hand, s_cont must be a freshly reset non-terminal.
     if bool(done):
-        assert bool(s_next.done)
-        assert not bool(s_cont.done)
+        if not bool(s_next.done):
+            raise AssertionError("s_next.done should be True when done is True")
+        if bool(s_cont.done):
+            raise AssertionError("s_cont.done should be False when done is True")
 
 
 def test_terminal_rewards_zero_sum_on_sampled_terminals():
@@ -127,10 +149,13 @@ def test_terminal_rewards_zero_sum_on_sampled_terminals():
     for i in range(30):
         key, sub = jax.random.split(key)
         sT, r0, r1 = play_random_hand(sub)
-        assert bool(sT.done)
-        assert math.isfinite(r0) and math.isfinite(r1)
+        if not bool(sT.done):
+            raise AssertionError(f"Hand {i}: expected terminal state, but done is False")
+        if not (math.isfinite(r0) and math.isfinite(r1)):
+            raise AssertionError(f"Hand {i}: rewards should be finite, got r0={r0}, r1={r1}")
         # Zero-sum chip deltas (allow tiny fp noise)
-        assert abs((r0 + r1)) < 1e-4
+        if abs((r0 + r1)) >= 1e-4:
+            raise AssertionError(f"Hand {i}: rewards should sum to ~0, got r0={r0}, r1={r1}, sum={r0 + r1}")
 
 
 def test_replay_add_batch_and_sample_smoke():
@@ -172,14 +197,20 @@ def test_replay_add_batch_and_sample_smoke():
     )
 
     buf = tr.replay_add_batch(buf, tr_batch)
-    assert int(buf.size) == B
+    if int(buf.size) != B:
+        raise AssertionError(f"Buffer size mismatch: expected {B}, got {int(buf.size)}")
 
     samp, key2 = tr.replay_sample(buf, key, 32)
-    assert samp.card.shape[0] == 32
-    assert samp.card_v.shape[0] == 32
-    assert samp.act.shape[0] == 32
-    assert samp.act_v.shape[0] == 32
-    assert key2.shape == key.shape
+    if samp.card.shape[0] != 32:
+        raise AssertionError(f"Sample card shape[0] mismatch: expected 32, got {samp.card.shape[0]}")
+    if samp.card_v.shape[0] != 32:
+        raise AssertionError(f"Sample card_v shape[0] mismatch: expected 32, got {samp.card_v.shape[0]}")
+    if samp.act.shape[0] != 32:
+        raise AssertionError(f"Sample act shape[0] mismatch: expected 32, got {samp.act.shape[0]}")
+    if samp.act_v.shape[0] != 32:
+        raise AssertionError(f"Sample act_v shape[0] mismatch: expected 32, got {samp.act_v.shape[0]}")
+    if key2.shape != key.shape:
+        raise AssertionError(f"Key shape mismatch: expected {key.shape}, got {key2.shape}")
 
 
 def test_collect_rollout_and_update_smoke():
@@ -200,10 +231,12 @@ def test_collect_rollout_and_update_smoke():
     # Collect one rollout.
     buf, vec, key = tr.collect_rollout(ts.params, pool, buf, vec, key)
     expected = tr.CFG.num_envs * tr.CFG.rollout_len
-    assert int(buf.size) == expected
+    if int(buf.size) != expected:
+        raise AssertionError(f"Buffer size after rollout mismatch: expected {expected}, got {int(buf.size)}")
 
     # Ensure aux indices are in sane range.
-    assert int(jnp.max(vec.aux.slot_idx)) <= 6
+    if int(jnp.max(vec.aux.slot_idx)) > 6:
+        raise AssertionError(f"Aux slot_idx out of range: max {int(jnp.max(vec.aux.slot_idx))} > 6")
 
     # Run one update epoch (your make_update_step wraps the full minibatch loop).
     do_update = tr.make_update_step()
@@ -212,4 +245,40 @@ def test_collect_rollout_and_update_smoke():
     m = jax.device_get(metrics)
     # Basic sanity: finite scalars.
     for k in ["loss", "policy_loss", "value_loss", "entropy"]:
-        assert math.isfinite(float(m[k]))
+        if not math.isfinite(float(m[k])):
+            raise AssertionError(f"Metric '{k}' should be finite, got {float(m[k])}")
+
+
+def main():
+    """Run all tests and report results."""
+    print("Running smoke + invariants tests for train.py / game.py")
+    print("=" * 60)
+
+    tests = [
+        (test_encode_obs_shapes_and_legal_mask, "test_encode_obs_shapes_and_legal_mask"),
+        (test_env_step_and_optional_reset_semantics, "test_env_step_and_optional_reset_semantics"),
+        (test_terminal_rewards_zero_sum_on_sampled_terminals, "test_terminal_rewards_zero_sum_on_sampled_terminals"),
+        (test_replay_add_batch_and_sample_smoke, "test_replay_add_batch_and_sample_smoke"),
+        (test_collect_rollout_and_update_smoke, "test_collect_rollout_and_update_smoke"),
+    ]
+
+    passed = 0
+    total = len(tests)
+
+    for test_func, test_name in tests:
+        if run_test(test_func, test_name):
+            passed += 1
+
+    print("=" * 60)
+    print(f"Results: {passed}/{total} tests passed")
+
+    if passed == total:
+        print("✓ All tests passed!")
+        return 0
+    else:
+        print("✗ Some tests failed!")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
