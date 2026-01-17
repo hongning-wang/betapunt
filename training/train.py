@@ -49,7 +49,7 @@ from game import (
 @dataclass(frozen=True)
 class Config:
     # Parallel sampling
-    num_envs: int = 16_384
+    num_envs: int = 8_192
     rollout_len: int = 128
 
     # PPO/GAE
@@ -58,33 +58,33 @@ class Config:
     clip_eps: float = 0.2
     delta1: float = 3.0  # Trinal-Clip upper bound for rt
     ent_coef: float = 0.01
-    vf_coef: float = 1.0
+    vf_coef: float = 0.9
 
     # Optimization
-    lr: float = 3e-4
+    lr: float = 5e-4
     max_grad_norm: float = 1.0
 
     # Off-policy replay + updates
-    replay_capacity: int = 10_000_000
-    batch_size: int = 262_144
-    num_minibatches: int = 8
-    update_epochs: int = 4
-    warmup_steps: int = 10_000_000
+    replay_capacity: int = 2_000_000
+    batch_size: int = 65_536
+    num_minibatches: int = 4
+    update_epochs: int = 8
+    warmup_steps: int = 2_000_000
 
     # Mild staleness control (keeps off-policy flavor but avoids extreme drift)
     # If 0, sample uniformly from all buffer.
-    recent_window: int = 0
+    recent_window: int = 200_000
 
     # K-Best self-play
     k_best: int = 5
-    pool_max: int = 100
+    pool_max: int = 32
     eval_hands: int = 500
     add_to_pool_every_updates: int = 50
     elo_k: float = 32.0
 
     # Runtime
     seed: int = 0
-    total_updates: int = 5_000
+    total_updates: int = 10_000
 
 
 CFG = Config()
@@ -273,6 +273,13 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
 
     # Action tensor already stored in NHWC (4,13,K) where K=ACT_CHANS.
     action_tensor = aux.action_tensor
+    def make_ego_relative(tensor, player_id):
+        return jnp.where(
+            player_id == 0,
+            tensor,
+            tensor.at[[0, 1]].set(tensor[[1, 0]])
+        )
+    action_tensor = make_ego_relative(action_tensor, player_id)
     legal = ENV.get_legal_actions(state)
     return card_tensor, action_tensor, legal
 
@@ -321,8 +328,11 @@ class AlphaHoldemNet(nn.Module):
         card_tensor: chex.Array,  # (B,4,13,7)   NHWC
         action_tensor: chex.Array,  # (B,4,13,ACT_CHANS) NHWC
     ) -> Tuple[chex.Array, chex.Array]:
-        # Concatenate along channel axis (last dim) to keep NHWC.
-        x = jnp.concatenate([card_tensor, action_tensor], axis=-1)  # (B,4,13,C)
+        # Fuse embeddings
+        card_emb = nn.Dense(128, param_dtype=jnp.float32)(card_tensor)
+        action_emb = nn.Dense(128, param_dtype=jnp.float32)(action_tensor)
+
+        x = card_emb + action_emb
 
         # Mixed precision: activations in bfloat16, params in float32.
         x = jax.lax.convert_element_type(x, jnp.bfloat16)
@@ -501,18 +511,33 @@ def replay_add(buf: ReplayBuffer, tr: Transition) -> ReplayBuffer:
 
 @partial(jax.jit, static_argnums=(2,))
 def replay_sample(buf: ReplayBuffer, key: chex.PRNGKey, batch_size: int) -> Tuple[Transition, chex.PRNGKey]:
-    """Sample a batch (optionally with a recent-window bias to reduce staleness)."""
-
     key, sub = jax.random.split(key)
+    
+    cap = buf.card_u8.shape[0]
+    
+    # 1. Determine the effective window size
+    # If recent_window > 0, we cap the lookback. 
+    # Otherwise (0), we look back at the entire buffer size.
+    limit = jnp.where(
+        CFG.recent_window > 0, 
+        jnp.int32(CFG.recent_window), 
+        cap
+    )
+    
+    # We can't look back further than the number of items actually in the buffer
+    available = jnp.minimum(buf.size, limit)
+    
+    # 2. Generate random offsets relative to the 'head' (buf.ptr)
+    # We want indices: [ptr-1, ptr-2, ..., ptr-available]
+    offsets = jax.random.randint(sub, (batch_size,), 0, available)
+    
+    # 3. Calculate circular indices
+    # (ptr - 1) is the index of the most recently inserted item.
+    # We subtract the random offset.
+    # Modulo cap handles the wraparound (Python/JAX % operator handles negatives correctly: -1 % 10 = 9)
+    idx = (buf.ptr - 1 - offsets) % cap
 
-    size = buf.size
-    if CFG.recent_window > 0:
-        win = jnp.minimum(size, jnp.int32(CFG.recent_window))
-        start = jnp.maximum(jnp.int32(0), size - win)
-        idx = jax.random.randint(sub, (batch_size,), start, size)
-    else:
-        idx = jax.random.randint(sub, (batch_size,), 0, size)
-
+    # De-quantize
     tr = Transition(
         card=buf.card_u8[idx].astype(jnp.float32),
         act=buf.act_u8[idx].astype(jnp.float32),
@@ -685,7 +710,12 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
 
     dist = masked_categorical(logits, batch.legal)
     logp = dist.log_prob(batch.action)
-    rt = jnp.exp(logp - batch.logp_old)
+    log_ratio = logp - batch.logp_old
+    rt = jnp.where(
+    batch.valid,
+    jnp.exp(log_ratio),
+    1.0,   # neutral ratio for invalid samples
+    )
 
     obj = trinal_clip_policy_objective(rt, batch.adv, CFG.clip_eps, CFG.delta1)
 
@@ -701,13 +731,11 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
     # We still train the critic on all states, but scale its average so the
     # critic doesn't implicitly get a larger weight just because it sees more
     # samples than the actor.
-    total_elems = jnp.asarray(batch.ret.size, dtype=jnp.float32)
-
     policy_loss = -jnp.sum(obj * valid_f) / denom
     # Train the critic on *all* states (including opponent-turn states), since the
     # rollout/GAE uses V(s) at every timestep.
-    scale = jnp.maximum(0.5, denom / total_elems)
-    value_loss = jnp.mean(v_loss) * scale
+    value_loss = jnp.mean(v_loss)
+
     entropy = jnp.sum(ent * valid_f) / denom
 
     total = policy_loss + CFG.vf_coef * value_loss - CFG.ent_coef * entropy
@@ -1081,18 +1109,24 @@ def play_one_hand(
     return score, key
 
 
-@jax.jit
-def eval_and_update_pool(pool: AgentPool, main_state: TrainState, key: chex.PRNGKey) -> Tuple[AgentPool, chex.PRNGKey]:
+def eval_and_update_pool(
+    pool: AgentPool,
+    main_state: TrainState,
+    main_elo: jnp.ndarray,
+    key: chex.PRNGKey,
+) -> Tuple[AgentPool, jnp.ndarray, chex.PRNGKey]:
     """Evaluate main against each pool agent and update ELO; then keep K-best."""
 
     size = pool.size
 
     def _empty_case(_):
-        return pool_add(pool, main_state.params, jnp.float32(0.0)), key
+        pool2 = pool_add(pool, main_state.params, jnp.float32(0.0))
+        return pool2, main_elo, key
 
     def _non_empty_case(_):
+
         def match_one(i, carry):
-            pool, key = carry
+            pool, main_elo, key = carry
 
             def do_play(_):
                 key2, sub = jax.random.split(key)
@@ -1106,39 +1140,74 @@ def eval_and_update_pool(pool: AgentPool, main_state: TrainState, key: chex.PRNG
                 )
                 score = jnp.mean(scores)
 
-                ra = jnp.float32(0.0)
+                # ----- JAX-safe ELO update -----
+                ra = main_elo
                 rb = pool.elo[i]
-                _, rb2 = elo_update(ra, rb, score, CFG.elo_k)
+
+                ea = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
+                eb = 1.0 - ea
+
+                ra2 = ra + CFG.elo_k * (score - ea)
+                rb2 = rb + CFG.elo_k * ((1.0 - score) - eb)
+
                 pool2 = pool.replace(elo=pool.elo.at[i].set(rb2))
-                return pool2, key2
+                return pool2, ra2, key2
 
-            return jax.lax.cond(i < size, do_play, lambda _: (pool, key), operand=None)
+            return jax.lax.cond(i < size, do_play, lambda _: (pool, main_elo, key), operand=None)
 
-        pool2, key2 = jax.lax.fori_loop(0, CFG.pool_max, match_one, (pool, key))
+        pool2, main_elo2, key2 = jax.lax.fori_loop(
+            0, CFG.pool_max, match_one, (pool, main_elo, key)
+        )
 
+        k = CFG.k_best  # must be a Python int (static)
+
+        # ---- choose top-k from existing pool (fixed k, mask invalid) ----
         valid_elo = jnp.where(jnp.arange(CFG.pool_max) < pool2.size, pool2.elo, -1e9)
-        topk = jnp.argsort(valid_elo)[::-1][: jnp.minimum(CFG.k_best, pool2.size)]
-        init_elo = jnp.where(pool2.size > 0, jnp.mean(pool2.elo[topk]), 0.0)
+        _, topk_idx = jax.lax.top_k(valid_elo, k)  # (k,)
+        topk_n = jnp.minimum(pool2.size, jnp.int32(k))  # dynamic count in [0,k]
+
+        topk_mask_f = (jnp.arange(k) < topk_n).astype(jnp.float32)  # (k,)
+        topk_elos = pool2.elo[topk_idx]  # (k,)
+        # mean over only valid entries; safe denom
+        denom = jnp.maximum(topk_n.astype(jnp.float32), 1.0)
+        init_elo = jnp.where(pool2.size > 0, jnp.sum(topk_elos * topk_mask_f) / denom, 0.0)
+
         pool3 = pool_add(pool2, main_state.params, init_elo)
 
+        # ---- keep only top-k after adding (fixed k, masked) ----
         size3 = pool3.size
         valid_elo3 = jnp.where(jnp.arange(CFG.pool_max) < size3, pool3.elo, -1e9)
-        keep = jnp.argsort(valid_elo3)[::-1][: jnp.minimum(CFG.k_best, size3)]
+        _, keep_idx = jax.lax.top_k(valid_elo3, k)  # (k,)
+        keep_n = jnp.minimum(size3, jnp.int32(k))  # dynamic count in [0,k]
+
+        def _mask_first_k(x):
+            # x: (k, ...)
+            m = (jnp.arange(k) < keep_n).astype(x.dtype)
+            m = m.reshape((k,) + (1,) * (x.ndim - 1))
+            return x * m
 
         def _gather_leaf(p):
-            gathered = p[keep]
-            pad = jnp.zeros((CFG.pool_max - gathered.shape[0],) + gathered.shape[1:], dtype=p.dtype)
-            return jnp.concatenate([gathered, pad], axis=0)
+            gathered_k = p[keep_idx]                 # (k, ...)
+            gathered_k = _mask_first_k(gathered_k)   # zero out invalid rows beyond keep_n
+            pad = jnp.zeros((CFG.pool_max - k,) + gathered_k.shape[1:], dtype=p.dtype)
+            return jnp.concatenate([gathered_k, pad], axis=0)
 
         new_params = jax.tree_util.tree_map(_gather_leaf, pool3.params)
+
+        gathered_elo_k = pool3.elo[keep_idx]  # (k,)
+        gathered_elo_k = gathered_elo_k * (jnp.arange(k) < keep_n).astype(jnp.float32)
         new_elo = jnp.concatenate(
-            [pool3.elo[keep], jnp.zeros((CFG.pool_max - keep.shape[0],), dtype=jnp.float32)],
+            [gathered_elo_k, jnp.zeros((CFG.pool_max - k,), dtype=jnp.float32)],
             axis=0,
         )
-        new_size = keep.shape[0].astype(jnp.int32)
-        return pool3.replace(params=new_params, elo=new_elo, size=new_size), key2
+
+        new_size = keep_n.astype(jnp.int32)
+
+        pool4 = pool3.replace(params=new_params, elo=new_elo, size=new_size)
+        return pool4, main_elo2, key2
 
     return jax.lax.cond(size == 0, _empty_case, _non_empty_case, operand=None)
+
 
 
 # -------------------------
@@ -1242,7 +1311,7 @@ def main() -> None:
     # Initialize Pool
     pool = pool_init(ts.params)
     pool = pool_add(pool, ts.params, jnp.float32(0.0))
-
+    main_elo = jnp.float32(0.0)
     # Initialize Environment
     # Note: ENV is global in the original script, which works for single-device JIT.
     key, k_reset = jax.random.split(key)
@@ -1281,7 +1350,8 @@ def main() -> None:
 
         # C. Periodic Pool Maintenance (Runs on TPU)
         if (upd + 1) % CFG.add_to_pool_every_updates == 0:
-            pool, key = eval_and_update_pool(pool, ts, key)
+            pool, main_elo, key = eval_and_update_pool(pool, ts, main_elo, key)
+
 
         # D. Logging (Runs on CPU, minimal overhead)
         if (upd + 1) % 50 == 0:
