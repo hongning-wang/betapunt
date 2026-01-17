@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
+import os
 from typing import Any, Dict, Tuple
 
 import chex
@@ -23,6 +24,8 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
+import orbax.checkpoint
+from flax.training import orbax_utils
 
 # --- Environment ---
 from game import (
@@ -1231,6 +1234,12 @@ def main() -> None:
     
     ts = make_train_state(k_init)
     buf = replay_init(CFG.replay_capacity)
+
+    # Initialize checkpointing for the training state.
+    ckpt_dir = os.path.abspath("./checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpter = orbax.checkpoint.PyTreeCheckpointer()
+    save_args = orbax_utils.save_args_from_target(ts)
     
     # Initialize Pool
     pool = pool_init(ts.params)
@@ -1296,6 +1305,12 @@ def main() -> None:
                 f"Ent: {m['entropy']:.4f} | "
                 f"Clip: {m['clip_frac']:.3f}"
             )
+
+        # SAVE CHECKPOINT every 1000 updates
+        if (upd + 1) % 1000 == 0:
+            save_path = f"{ckpt_dir}/step_{upd+1}"
+            ckpter.save(save_path, ts, save_args=save_args)
+            print(f"Saved checkpoint to {save_path}")
 
 if __name__ == "__main__":
     main()
