@@ -49,14 +49,15 @@ from game import (
 @dataclass(frozen=True)
 class Config:
     # Parallel sampling
-    num_envs: int = 8_192
+    # CHANGED: Reduced from 8192 to speed up collection phase significantly
+    num_envs: int = 2_048 
     rollout_len: int = 128
 
     # PPO/GAE
     gamma: float = 0.999
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    delta1: float = 3.0  # Trinal-Clip upper bound for rt
+    delta1: float = 3.0
     ent_coef: float = 0.01
     vf_coef: float = 0.9
 
@@ -66,19 +67,21 @@ class Config:
 
     # Off-policy replay + updates
     replay_capacity: int = 2_000_000
-    batch_size: int = 65_536
+    # CHANGED: Reduced to 32k to maintain speed/throughput balance with smaller num_envs
+    batch_size: int = 32_768 
     num_minibatches: int = 4
-    update_epochs: int = 8
+    # CHANGED: Reduced from 8 to 4 to prevent overfitting on smaller throughput
+    update_epochs: int = 4 
     warmup_steps: int = 2_000_000
 
-    # Mild staleness control (keeps off-policy flavor but avoids extreme drift)
-    # If 0, sample uniformly from all buffer.
-    recent_window: int = 200_000
+    # Mild staleness control
+    # CHANGED: Increased to > (num_envs * rollout_len) to ensure full batch is sampled
+    recent_window: int = 300_000 
 
     # K-Best self-play
     k_best: int = 5
-    pool_max: int = 32
-    eval_hands: int = 500
+    pool_max: int = 16
+    eval_hands: int = 512
     add_to_pool_every_updates: int = 50
     elo_k: float = 32.0
 
@@ -1109,104 +1112,119 @@ def play_one_hand(
     return score, key
 
 
+@jax.jit
 def eval_and_update_pool(
     pool: AgentPool,
     main_state: TrainState,
     main_elo: jnp.ndarray,
     key: chex.PRNGKey,
 ) -> Tuple[AgentPool, jnp.ndarray, chex.PRNGKey]:
-    """Evaluate main against each pool agent and update ELO; then keep K-best."""
+    """Vectorized pool eval + *similar-behavior* ELO update (stable magnitude)."""
+    
+    # Capture config constants to avoid recompilation if passed as args
+    pool_max = CFG.pool_max
+    eval_hands = CFG.eval_hands
+    k_best = CFG.k_best
+    elo_k = CFG.elo_k
 
-    size = pool.size
+    # --- 1) Generate keys for (pool_max, eval_hands) ---
+    key, sub = jax.random.split(key)
+    # Shape: (pool_max, eval_hands, 2)
+    keys_grid = jax.random.split(sub, pool_max * eval_hands).reshape((pool_max, eval_hands, -1)) 
 
-    def _empty_case(_):
-        pool2 = pool_add(pool, main_state.params, jnp.float32(0.0))
-        return pool2, main_elo, key
+    # Valid opponents are [0, pool.size)
+    valid_mask = jnp.arange(pool_max) < pool.size
+    valid_f = valid_mask.astype(jnp.float32)
+    # Avoid div by zero if pool is empty
+    n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
 
-    def _non_empty_case(_):
-
-        def match_one(i, carry):
-            pool, main_elo, key = carry
-
-            def do_play(_):
-                key2, sub = jax.random.split(key)
-                opp_params = jax.tree_util.tree_map(lambda p: p[i], pool.params)
-
-                keys = jax.random.split(sub, CFG.eval_hands)
-                scores, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
-                    main_state.params,
-                    opp_params,
-                    keys,
-                )
-                score = jnp.mean(scores)
-
-                # ----- JAX-safe ELO update -----
-                ra = main_elo
-                rb = pool.elo[i]
-
-                ea = 1.0 / (1.0 + 10.0 ** ((rb - ra) / 400.0))
-                eb = 1.0 - ea
-
-                ra2 = ra + CFG.elo_k * (score - ea)
-                rb2 = rb + CFG.elo_k * ((1.0 - score) - eb)
-
-                pool2 = pool.replace(elo=pool.elo.at[i].set(rb2))
-                return pool2, ra2, key2
-
-            return jax.lax.cond(i < size, do_play, lambda _: (pool, main_elo, key), operand=None)
-
-        pool2, main_elo2, key2 = jax.lax.fori_loop(
-            0, CFG.pool_max, match_one, (pool, main_elo, key)
+    # --- 2) Play matches in parallel: main vs each pool opponent ---
+    def play_vs_one_opp(opp_params, keys_n):
+        # Play 'eval_hands' matches against ONE opponent
+        # vmap over the 'hands' dimension
+        scores, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
+            main_state.params, opp_params, keys_n
         )
+        return jnp.mean(scores)
 
-        k = CFG.k_best  # must be a Python int (static)
+    # vmap over the 'pool' dimension
+    # scores_pool: (pool_max,)
+    scores_pool = jax.vmap(play_vs_one_opp, in_axes=(0, 0))(pool.params, keys_grid)
 
-        # ---- choose top-k from existing pool (fixed k, mask invalid) ----
-        valid_elo = jnp.where(jnp.arange(CFG.pool_max) < pool2.size, pool2.elo, -1e9)
-        _, topk_idx = jax.lax.top_k(valid_elo, k)  # (k,)
-        topk_n = jnp.minimum(pool2.size, jnp.int32(k))  # dynamic count in [0,k]
+    # Mask out invalid slots (force score 0.0 so they don't impact logic, though masked later anyway)
+    scores_pool = jnp.where(valid_mask, scores_pool, 0.0)
 
-        topk_mask_f = (jnp.arange(k) < topk_n).astype(jnp.float32)  # (k,)
-        topk_elos = pool2.elo[topk_idx]  # (k,)
-        # mean over only valid entries; safe denom
-        denom = jnp.maximum(topk_n.astype(jnp.float32), 1.0)
-        init_elo = jnp.where(pool2.size > 0, jnp.sum(topk_elos * topk_mask_f) / denom, 0.0)
+    # --- 3) Batch ELO update using *frozen* pre-update ELOs ---
+    # Calculate Expected Scores
+    ea_pool = elo_expected(main_elo, pool.elo)       # Main's expected vs each opp
+    eb_pool = 1.0 - ea_pool
 
-        pool3 = pool_add(pool2, main_state.params, init_elo)
+    # Calculate Deltas
+    delta_main = elo_k * (scores_pool - ea_pool)
+    delta_opp  = elo_k * ((1.0 - scores_pool) - eb_pool)
 
-        # ---- keep only top-k after adding (fixed k, masked) ----
-        size3 = pool3.size
-        valid_elo3 = jnp.where(jnp.arange(CFG.pool_max) < size3, pool3.elo, -1e9)
-        _, keep_idx = jax.lax.top_k(valid_elo3, k)  # (k,)
-        keep_n = jnp.minimum(size3, jnp.int32(k))  # dynamic count in [0,k]
+    # Apply Updates
+    # Main: Average the deltas to keep magnitude stable regardless of pool size
+    main_change = jnp.sum(delta_main * valid_f) / n_valid
+    main_elo_next = main_elo + main_change
 
-        def _mask_first_k(x):
-            # x: (k, ...)
-            m = (jnp.arange(k) < keep_n).astype(x.dtype)
-            m = m.reshape((k,) + (1,) * (x.ndim - 1))
-            return x * m
+    # Pool: Update individual opponents (masked)
+    pool_elo_next = pool.elo + jnp.where(valid_mask, delta_opp, 0.0)
+    pool = pool.replace(elo=pool_elo_next)
 
-        def _gather_leaf(p):
-            gathered_k = p[keep_idx]                 # (k, ...)
-            gathered_k = _mask_first_k(gathered_k)   # zero out invalid rows beyond keep_n
-            pad = jnp.zeros((CFG.pool_max - k,) + gathered_k.shape[1:], dtype=p.dtype)
-            return jnp.concatenate([gathered_k, pad], axis=0)
+    # --- 4) Add main to pool with entry ELO ---
+    # Entry ELO = mean(top-k valid ELOs) (or 0 if empty)
+    valid_elos = jnp.where(valid_mask, pool.elo, -1e9)
+    _, topk_idx = jax.lax.top_k(valid_elos, k=k_best)
 
-        new_params = jax.tree_util.tree_map(_gather_leaf, pool3.params)
+    # Calculate how many valid agents we actually have for the mean
+    k_eff = jnp.minimum(pool.size, jnp.int32(k_best))
+    topk_mask = (jnp.arange(k_best) < k_eff).astype(jnp.float32)
 
-        gathered_elo_k = pool3.elo[keep_idx]  # (k,)
-        gathered_elo_k = gathered_elo_k * (jnp.arange(k) < keep_n).astype(jnp.float32)
-        new_elo = jnp.concatenate(
-            [gathered_elo_k, jnp.zeros((CFG.pool_max - k,), dtype=jnp.float32)],
-            axis=0,
-        )
+    topk_vals = pool.elo[topk_idx]
+    denom = jnp.maximum(1.0, jnp.sum(topk_mask))
+    avg_top_elo = jnp.sum(topk_vals * topk_mask) / denom
 
-        new_size = keep_n.astype(jnp.int32)
+    entry_elo = jnp.where(pool.size > 0, avg_top_elo, 0.0)
+    
+    # Add new agent (increments pool.size)
+    pool = pool_add(pool, main_state.params, entry_elo)
 
-        pool4 = pool3.replace(params=new_params, elo=new_elo, size=new_size)
-        return pool4, main_elo2, key2
+    # --- 5) Trim to K-best (Elite Pool) ---
+    # We now have (size+1) agents. We strictly keep the top k_best.
+    size_curr = pool.size
+    # Validity mask for the post-add pool
+    valid_mask_final = jnp.arange(pool_max) < size_curr
+    valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)
 
-    return jax.lax.cond(size == 0, _empty_case, _non_empty_case, operand=None)
+    # Find top K indices
+    _, keep_idx = jax.lax.top_k(valid_elos_final, k=k_best)
+    n_keep = jnp.minimum(size_curr, jnp.int32(k_best))
+
+    # Helper to gather params and pad back to pool_max
+    def _gather_pad(x):
+        # Take top-k_best
+        picked = x[keep_idx]  # shape: (k_best, ...)
+        # Mask out entries if we have fewer than k_best valid
+        mask = (jnp.arange(k_best) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
+        picked = picked * mask.astype(picked.dtype)
+        # Pad back to pool_max to keep shapes static
+        pad_len = pool_max - k_best
+        pad = jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype)
+        return jnp.concatenate([picked, pad], axis=0)
+
+    new_params = jax.tree_util.tree_map(_gather_pad, pool.params)
+
+    # Gather ELOs similarly
+    picked_elo = pool.elo[keep_idx]
+    # Zero out ELOs that are "padding" (beyond n_keep)
+    picked_elo = picked_elo * (jnp.arange(k_best) < n_keep).astype(jnp.float32)
+    new_elo = jnp.concatenate([picked_elo, jnp.zeros(pool_max - k_best, dtype=pool.elo.dtype)], axis=0)
+
+    # Return trimmed pool
+    pool_final = pool.replace(params=new_params, elo=new_elo, size=n_keep)
+    
+    return pool_final, main_elo_next, key
 
 
 
