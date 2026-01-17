@@ -49,8 +49,7 @@ from game import (
 @dataclass(frozen=True)
 class Config:
     # Parallel sampling
-    # CHANGED: Reduced from 8192 to speed up collection phase significantly
-    num_envs: int = 2_048 
+    num_envs: int = 1_024
     rollout_len: int = 128
 
     # PPO/GAE
@@ -59,35 +58,32 @@ class Config:
     clip_eps: float = 0.2
     delta1: float = 3.0
     ent_coef: float = 0.01
-    vf_coef: float = 0.9
+    vf_coef: float = 0.5
 
     # Optimization
     lr: float = 5e-4
     max_grad_norm: float = 1.0
 
     # Off-policy replay + updates
-    replay_capacity: int = 2_000_000
-    # CHANGED: Reduced to 32k to maintain speed/throughput balance with smaller num_envs
-    batch_size: int = 32_768 
+    replay_capacity: int = 1_000_000
+    batch_size: int = 32_768
     num_minibatches: int = 4
-    # CHANGED: Reduced from 8 to 4 to prevent overfitting on smaller throughput
-    update_epochs: int = 4 
-    warmup_steps: int = 2_000_000
+    update_epochs: int = 8
+    warmup_steps: int = 400_000
 
     # Mild staleness control
-    # CHANGED: Increased to > (num_envs * rollout_len) to ensure full batch is sampled
-    recent_window: int = 300_000 
+    recent_window: int = 200_000 
 
     # K-Best self-play
     k_best: int = 5
-    pool_max: int = 16
+    pool_max: int = 8
     eval_hands: int = 512
     add_to_pool_every_updates: int = 50
     elo_k: float = 32.0
 
     # Runtime
     seed: int = 0
-    total_updates: int = 10_000
+    total_updates: int = 20_000
 
 
 CFG = Config()
@@ -332,12 +328,13 @@ class AlphaHoldemNet(nn.Module):
         action_tensor: chex.Array,  # (B,4,13,ACT_CHANS) NHWC
     ) -> Tuple[chex.Array, chex.Array]:
         # Fuse embeddings
-        card_emb = nn.Dense(128, param_dtype=jnp.float32)(card_tensor)
-        action_emb = nn.Dense(128, param_dtype=jnp.float32)(action_tensor)
+        # Mixed precision: keep params in fp32, run matmuls in bf16 on TPU.
+        card_emb = nn.Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.float32)(card_tensor)
+        action_emb = nn.Dense(128, dtype=jnp.bfloat16, param_dtype=jnp.float32)(action_tensor)
 
         x = card_emb + action_emb
 
-        # Mixed precision: activations in bfloat16, params in float32.
+        # Ensure downstream ops stay in bf16.
         x = jax.lax.convert_element_type(x, jnp.bfloat16)
 
         x = nn.Conv(
@@ -738,8 +735,7 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
     # Train the critic on *all* states (including opponent-turn states), since the
     # rollout/GAE uses V(s) at every timestep.
     denom = jnp.sum(valid_f) + 1e-8                     # valid_f is 0/1 float mask
-    valid_frac = denom / valid_f.size  
-    value_loss = jnp.mean(v_loss) * valid_frac
+    value_loss = jnp.mean(v_loss)
 
     entropy = jnp.sum(ent * valid_f) / denom
 
@@ -783,6 +779,8 @@ class VecEnvState:
     aux: AuxState
     # If True, main agent plays as player0; else it plays as player1.
     main_is_p0: chex.Array
+    # Per-env PRNG keys (avoid splitting a single global key each step).
+    rng: chex.Array
 
 
 def vec_reset(env: TossHoldemEnv, key: chex.PRNGKey, n: int) -> Tuple[VecEnvState, chex.PRNGKey]:
@@ -794,7 +792,7 @@ def vec_reset(env: TossHoldemEnv, key: chex.PRNGKey, n: int) -> Tuple[VecEnvStat
     s = jax.vmap(env.reset)(ks)
     aux = jax.vmap(lambda _: aux_reset())(jnp.arange(n))
     aux = jax.vmap(aux_maybe_advance_round)(aux, s.phase)
-    return VecEnvState(env_state=s, aux=aux, main_is_p0=main_is_p0), key
+    return VecEnvState(env_state=s, aux=aux, main_is_p0=main_is_p0, rng=ks), key
 
 
 @jax.jit
@@ -818,8 +816,8 @@ def policy_act(
     value = value_b[0]
 
     dist = masked_categorical(logits, legal)
-    key, sub = jax.random.split(key)
-    action = dist.sample(seed=sub)
+    # `key` is already unique per-env and per-timestep (derived outside this fn).
+    action = dist.sample(seed=key)
     logp = dist.log_prob(action)
     return action.astype(jnp.int32), logp.astype(jnp.float32), value.astype(jnp.float32), key
 
@@ -832,7 +830,9 @@ def env_step_and_optional_reset(
 ) -> Tuple[State, State, chex.Array, chex.PRNGKey]:
     """Step one env and then (optionally) reset after producing terminal transition."""
 
-    key, k_step, k_reset = jax.random.split(key, 3)
+    # Avoid per-step `random.split` on TPU; derive subkeys deterministically.
+    k_step = jax.random.fold_in(key, jnp.uint32(0))
+    k_reset = jax.random.fold_in(key, jnp.uint32(1))
     s_next = ENV.step(s, k_step, action)
     done = s_next.done
     s_reset = ENV.reset(k_reset)
@@ -906,46 +906,59 @@ def collect_rollout(
         main_params,
     )
 
-    def step_fn(carry, _):
-        buf, vec, key = carry
+    env_ids = jnp.arange(CFG.num_envs, dtype=jnp.uint32)
+
+    def step_fn(carry, t):
+        buf, vec = carry
         s = vec.env_state
         aux = vec.aux
         main_is_p0 = vec.main_is_p0
+        base_keys = vec.rng
         learner_pid = jnp.where(main_is_p0, jnp.int32(0), jnp.int32(1))
 
         aux = jax.vmap(aux_maybe_advance_round)(aux, s.phase)
 
+
         is_learner_turn = s.current_player.astype(jnp.int32) == learner_pid
 
-        # Value baseline from learner perspective (seat-randomized)
-        def _value_learn_one(si, auxi, pid_i):
-            c, a_t, _ = encode_obs(si, auxi, pid_i)
-            _, v_b = forward_apply(main_params, c[None, ...], a_t[None, ...])
-            return v_b[0].astype(jnp.float32)
+        # --- Batched network forward (TPU-friendly) ---
+        # 1) Critic/value from learner perspective for *every* env.
+        card_v_b, act_v_b, _ = jax.vmap(encode_obs)(s, aux, learner_pid)
+        _, value_b = forward_apply(main_params, card_v_b, act_v_b)
+        value = value_b.astype(jnp.float32)
 
-        value = jax.vmap(_value_learn_one)(s, aux, learner_pid)
+        # 2) Policy logits from the *acting* player's perspective.
+        pid_cur = s.current_player.astype(jnp.int32)
+        card_a_b, act_a_b, legal_a_b = jax.vmap(encode_obs)(s, aux, pid_cur)
 
-        def _act_one(si, auxi, ki, learner_turn):
-            params = jax.lax.cond(learner_turn, lambda _: main_params, lambda _: opp_params, operand=None)
-            a, logp, _, ki2 = policy_act(params, si, auxi, ki)
-            # Store logp only for learner transitions; opponent transitions are invalid for training.
-            logp = jnp.where(learner_turn, logp, jnp.float32(0.0))
-            return a, logp, ki2
+        logits_main_b, _ = forward_apply(main_params, card_a_b, act_a_b)
+        logits_opp_b, _ = forward_apply(opp_params, card_a_b, act_a_b)
+        logits = jnp.where(is_learner_turn[:, None], logits_main_b, logits_opp_b)
 
-        keys = jax.random.split(key, CFG.num_envs + 1)
-        key = keys[0]
-        ks = keys[1:]
+        # Derive per-env, per-timestep keys without splitting a single global key.
+        def _mk_key(k, eid, salt):
+            k = jax.random.fold_in(k, eid)
+            return jax.random.fold_in(k, t + jnp.uint32(salt))
 
-        action, logp_old, ks2 = jax.vmap(_act_one)(s, aux, ks, is_learner_turn)
+        # Sample actions using Gumbel-max on masked logits (vectorized over envs).
+        k_act = jax.vmap(lambda k, eid: _mk_key(k, eid, 0))(base_keys, env_ids)
+        g = jax.vmap(lambda k: jax.random.gumbel(k, (NB_ACTIONS,), dtype=jnp.float32))(k_act)
+        neg_inf = jnp.finfo(jnp.float32).min
+        masked_logits = jnp.where(legal_a_b, logits, neg_inf)
+        action = jnp.argmax(masked_logits + g, axis=-1).astype(jnp.int32)
+
+        # Log-prob under the selected policy. Only learner-turn samples are valid.
+        logp_all = jax.nn.log_softmax(masked_logits, axis=-1)
+        logp = jnp.take_along_axis(logp_all, action[:, None], axis=-1)[:, 0].astype(jnp.float32)
+        logp_old = jnp.where(is_learner_turn, logp, jnp.float32(0.0))
+
 
         # Legal actions depend only on the current state (current_player), so compute once.
-        legal = jax.vmap(ENV.get_legal_actions)(s)
+        legal = legal_a_b
         aux2 = jax.vmap(aux_record_action)(aux, s.current_player.astype(jnp.int32), action, legal)
 
-        def _step_one(si, ki, ai):
-            return env_step_and_optional_reset(si, ki, ai)
-
-        s_next, s_cont, done, ks3 = jax.vmap(_step_one)(s, ks2, action)
+        k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
+        s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)
 
         # Terminal chip-delta reward, from learner seat perspective
         r0, r1 = terminal_rewards(s_next)
@@ -1005,28 +1018,31 @@ def collect_rollout(
         aux3 = jax.vmap(aux_maybe_advance_round)(aux3, s_cont.phase)
 
         # Re-randomize seating on episode resets so we train both positions.
-        new_seat = jax.vmap(lambda k: jax.random.bernoulli(k, 0.5))(ks3)
+        k_seat = jax.vmap(lambda k, eid: _mk_key(k, eid, 262143))(base_keys, env_ids)
+        new_seat = jax.vmap(lambda k: jax.random.bernoulli(k, 0.5))(k_seat)
         main_is_p0_2 = jnp.where(done, new_seat, main_is_p0)
 
-        vec2 = VecEnvState(env_state=s_cont, aux=aux3, main_is_p0=main_is_p0_2)
-        return (buf, vec2, key), tmp
+        vec2 = VecEnvState(env_state=s_cont, aux=aux3, main_is_p0=main_is_p0_2, rng=base_keys)
+        return (buf, vec2), tmp
 
-    (buf, vec2, key), traj = jax.lax.scan(step_fn, (buf, vec, key), None, length=CFG.rollout_len)
+    (buf, vec2), traj = jax.lax.scan(step_fn, (buf, vec), jnp.arange(CFG.rollout_len, dtype=jnp.uint32))
+
+    # Advance per-env RNGs once per rollout call to avoid repeating the same fold_in sequence.
+    key, sub = jax.random.split(key)
+    vec2 = vec2.replace(rng=jax.random.split(sub, CFG.num_envs))
 
     rewards = traj["reward"].astype(jnp.float32)
     values = traj["value"].astype(jnp.float32)
     dones = traj["done"]
 
-    def _last_v_one(si, auxi, pid_i):
-        c, a_t, _ = encode_obs(si, auxi, pid_i)
-        _, v_b = forward_apply(main_params, c[None, ...], a_t[None, ...])
-        return v_b[0].astype(jnp.float32)
 
-    last_value = jax.vmap(_last_v_one)(
-        vec2.env_state,
-        vec2.aux,
-        jnp.where(vec2.main_is_p0, jnp.int32(0), jnp.int32(1)),
-    )
+
+    # Batched last-value prediction (learner perspective) to avoid batch=1 forwards.
+    last_pid = jnp.where(vec2.main_is_p0, jnp.int32(0), jnp.int32(1))
+    last_card_b, last_act_b, _ = jax.vmap(encode_obs)(vec2.env_state, vec2.aux, last_pid)
+    _, last_value = forward_apply(main_params, last_card_b, last_act_b)
+    last_value = last_value.astype(jnp.float32)
+
 
     def _one(rew_n, val_n, done_n, last_v_n):
         return compute_gae_and_returns(rew_n, val_n, done_n, last_v_n)
