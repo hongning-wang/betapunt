@@ -653,20 +653,18 @@ def trinal_clip_value_target(ret: chex.Array, contrib_self: chex.Array, contrib_
 
 def make_train_state(rng: chex.PRNGKey) -> TrainState:
     model = AlphaHoldemNet()
-    dummy_card = jnp.zeros((1, CARD_CHANS, SUITS, RANKS), dtype=jnp.float32)
-    dummy_act = jnp.zeros((1, ACT_CHANS, 4, NB_ACTIONS), dtype=jnp.float32)
+
+    # NHWC layouts that match encode_obs() + AlphaHoldemNet.__call__()
+    dummy_card = jnp.zeros((1, SUITS, RANKS, CARD_CHANS), dtype=jnp.float32)          # (1,4,13,7)
+    dummy_act  = jnp.zeros((1, 4, NB_ACTIONS, ACT_CHANS), dtype=jnp.float32)         # (1,4,13,30)
+
     variables = model.init(rng, dummy_card, dummy_act)
 
     tx = optax.chain(
         optax.clip_by_global_norm(CFG.max_grad_norm),
         optax.adam(CFG.lr),
     )
-
-    return TrainState.create(
-        apply_fn=model.apply,
-        params=variables["params"],
-        tx=tx,
-    )
+    return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
 
 @jax.jit
