@@ -9,13 +9,12 @@ STACK_SIZE = 400
 SB = 1
 BB = 2
 MAX_ROUNDS = 1000
-WHEEL_PATTERN = jnp.array([12, 3, 2, 1, 0])
 
 # Phases
 PHASE_PREFLOP = 0
 PHASE_DISCARD_OOP = 1
 PHASE_DISCARD_DLR = 2
-PHASE_FLOP = 3
+PHASE_FLOP = 3  
 PHASE_TURN = 4
 PHASE_RIVER = 5
 PHASE_SHOWDOWN = 6
@@ -80,8 +79,8 @@ def score_5_hand(hand):
     # 1. Check Flush & Straight
     flush = jnp.all(s == s[0])
     is_standard_strt = jnp.all(sr[:-1] - sr[1:] == 1)
-    has_wheel = jnp.all(sr == WHEEL_PATTERN)
-    strt = is_standard_strt | has_wheel
+    is_wheel = jnp.all(sr == WHEEL_PATTERN)
+    strt = is_standard_strt | is_wheel
     
     # 2. Count Ranks (JAX-friendly replacement for bincount)
     rc = jnp.zeros(13, dtype=jnp.int32).at[r].add(1)
@@ -107,7 +106,7 @@ def score_5_hand(hand):
 
     # 4. Tie-breaking Logic
     # For Straights/Flushes/High Card: Use ranks in descending order (Ace low for Wheel)
-    unpaired_ranks = jnp.where(has_wheel, jnp.array([3, 2, 1, 0, 12]), sr)
+    unpaired_ranks = jnp.where(is_wheel, jnp.array([3, 2, 1, 0, 12]), sr)
 
     # For Paired hands (Quads, FH, Trips, Pairs): Order by frequency, then rank
     rank_indices = jnp.arange(13)
@@ -212,7 +211,7 @@ class TossHoldemEnv:
             mask_bits = jnp.zeros(13, dtype=bool)
             
             # Fold always legal
-            mask_bits = mask_bits.at[ACT_FOLD].set(True)
+            mask_bits = mask_bits.at[ACT_FOLD].set(to_call > 0)
             
             # Check vs Call Logic
             mask_bits = mask_bits.at[ACT_CHECK].set(to_call == 0)
@@ -300,17 +299,17 @@ class TossHoldemEnv:
         opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet)
         opp_stack = jnp.where(is_p0, state.p1_stack, state.p0_stack)
         
-        def _fold(s):
-            return s.replace(done=True, winner=1 - s.current_player)
+        def _fold(s, _):
+            return s.replace(done=True, winner=(1 - s.current_player))
         
-        def _check(s):
+        def _check(s, _):
             # Explicitly commits 0 chips
             return self._check_street_end(s.replace(
                 p0_acted_this_street=jnp.where(is_p0, True, s.p0_acted_this_street),
                 p1_acted_this_street=jnp.where(~is_p0, True, s.p1_acted_this_street)
             ), key)
 
-        def _call(s):
+        def _call(s, _):
             to_call = opp_bet - cur_bet
             actual_call = jnp.minimum(to_call, cur_stack)
             return self._check_street_end(s.replace(
@@ -322,13 +321,14 @@ class TossHoldemEnv:
                 p1_acted_this_street=jnp.where(~is_p0, True, s.p1_acted_this_street)
             ), key)
 
-        def _raise(s, mode_idx):
+        def _raise(s, phase_idx):
             to_call = opp_bet - cur_bet
             pot_base = s.pot + s.p0_bet + s.p1_bet + to_call
             eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
             
+            raise_idx = phase_idx - 3
             target_inc = jax.lax.switch(
-                mode_idx,
+                raise_idx,
                 [
                     lambda: s.last_raise_amt,
                     lambda: pot_base // 3,
@@ -364,7 +364,7 @@ class TossHoldemEnv:
                 p1_acted_this_street=jnp.where(~is_p0, True, False)
             )
 
-        def _all_in(s):
+        def _all_in(s, _):
             to_call = opp_bet - cur_bet
             eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
 
@@ -400,24 +400,27 @@ class TossHoldemEnv:
 
             return jax.lax.cond(eff_cap <= to_call, _all_in_as_call, _all_in_as_raise, s)
 
+        def _noop(s, _):
+            return s
+
         return jax.lax.switch(
             action,
             [
-                lambda s: _fold(s),       # 0: Fold
-                lambda s: _check(s),      # 1: Check
-                lambda s: _call(s),       # 2: Call
-                lambda s: _raise(s, 0),   # 3: Min
-                lambda s: _raise(s, 1),   # 4: 1/3
-                lambda s: _raise(s, 2),   # 5: 1/2
-                lambda s: _raise(s, 3),   # 6: 3/4
-                lambda s: _raise(s, 4),   # 7: 5/4
-                lambda s: _raise(s, 5),   # 8: 2x
-                lambda s: _all_in(s),     # 9: All-In
-                lambda s: s,              # 10: Discard 0 (noop here, handled in _step_discard)
-                lambda s: s,              # 11: Discard 1
-                lambda s: s               # 12: Discard 2
+                _fold,            # 0: Fold
+                _check,           # 1: Check
+                _call,            # 2: Call
+                _raise,           # 3: Min
+                _raise,           # 4: 1/3
+                _raise,           # 5: 1/2
+                _raise,           # 6: 3/4
+                _raise,           # 7: 5/4
+                _raise,           # 8: 2x
+                _all_in,          # 9: All-In
+                _noop,            # 10: Discard 0 (noop here, handled in _step_discard)
+                _noop,            # 11: Discard 1
+                _noop             # 12: Discard 2
             ],
-            state
+            state, action
         )
 
     def _check_street_end(self, state: State, key) -> State:
@@ -429,9 +432,9 @@ class TossHoldemEnv:
         
         return jax.lax.cond(
             street_over,
-            lambda s: self._advance_street(s, key),
-            lambda s: s.replace(current_player=1 - s.current_player),
-            state
+            lambda s, k: self._advance_street(s, k),
+            lambda s, _: s.replace(current_player=(1 - s.current_player)),
+            state, key
         )
 
     def _advance_street(self, state: State, key) -> State:
@@ -455,15 +458,18 @@ class TossHoldemEnv:
         opp_id = 1 - dealer_id
         
         def _goto_discard(s):
-            new_board = s.board.at[0:2].set(s.deck[s.deck_ptr:s.deck_ptr+2])
+            flop_cards = jax.lax.dynamic_slice(s.deck, (s.deck_ptr, ), 2)
+            new_board = s.board.at[0:2].set(flop_cards)
             return _reset_street_state(s, PHASE_DISCARD_OOP, opp_id, 2, new_board)
             
         def _goto_turn(s):
-            new_board = s.board.at[4].set(s.deck[s.deck_ptr])
+            turn_card = jax.lax.dynamic_slice(s.deck, (s.deck_ptr, ), 1)[0]
+            new_board = s.board.at[4].set(turn_card)
             return _reset_street_state(s, PHASE_TURN, opp_id, 1, new_board)
 
         def _goto_river(s):
-            new_board = s.board.at[5].set(s.deck[s.deck_ptr])
+            river_card = jax.lax.dynamic_slice(s.deck, (s.deck_ptr, ), 1)[0]
+            new_board = s.board.at[5].set(river_card)
             return _reset_street_state(s, PHASE_RIVER, opp_id, 1, new_board)
 
         def _goto_showdown(s):
