@@ -1413,6 +1413,7 @@ def main() -> None:
                 f"Val: {m['value_loss']:.4f} | "
                 f"Ent: {m['entropy']:.4f} | "
                 f"Clip: {m['clip_frac']:.3f} |",
+                f"VFrac: {m['valid_frac']:.3f} |",
                 f"VFit: {m['value_fit_ratio']:.3f}"
             )
 
