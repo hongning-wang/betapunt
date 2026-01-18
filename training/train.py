@@ -17,6 +17,7 @@ from functools import partial
 import os
 from typing import Any, Dict, Tuple
 
+import numpy as np
 import chex
 import distrax
 import flax.linen as nn
@@ -26,6 +27,7 @@ import optax
 from flax.training.train_state import TrainState
 import orbax.checkpoint
 from flax.training import orbax_utils
+from flax.traverse_util import flatten_dict
 
 # --- Environment ---
 from game import (
@@ -68,7 +70,7 @@ class Config:
     replay_capacity: int = 1_000_000
     batch_size: int = 32_768
     num_minibatches: int = 4
-    update_epochs: int = 8
+    update_epochs: int = 4
     warmup_steps: int = 400_000
 
     # Mild staleness control
@@ -105,7 +107,11 @@ CARD_CHANS = 7
 ACT_CHANS = 30
 SUITS = 4
 RANKS = 13
+_CARD_LUT_NP = np.zeros((52, SUITS, RANKS), dtype=np.float32)
+for c in range(52):
+    _CARD_LUT_NP[c, c // 13, c % 13] = 1.0
 
+CARD_LUT = jnp.asarray(_CARD_LUT_NP)
 
 def _phase_to_round_idx(phase: chex.Array) -> chex.Array:
     """Map env phases into action-tensor rounds.
@@ -131,29 +137,19 @@ def _phase_to_round_idx(phase: chex.Array) -> chex.Array:
     ).astype(jnp.int32)
 
 
-@jax.jit
-def _card_to_onehot(card_id: chex.Array) -> chex.Array:
-    """Convert card index (0..51 or -1) to a (4,13) sparse onehot."""
-
-    valid = card_id >= 0
-    suit = (card_id // 13).astype(jnp.int32)
-    rank = (card_id % 13).astype(jnp.int32)
-    mat = jnp.zeros((SUITS, RANKS), dtype=jnp.float32)
-    mat = jax.lax.cond(
-        valid,
-        lambda m: m.at[suit, rank].set(1.0),
-        lambda m: m,
-        mat,
-    )
-    return mat
-
 
 @jax.jit
 def _cards_to_plane(cards: chex.Array) -> chex.Array:
-    """Sum of per-card onehots into a (4,13) plane."""
+    """Fast gather-based version using CARD_LUT. cards in [-1, 51]."""
 
-    return jnp.sum(jax.vmap(_card_to_onehot)(cards), axis=0)
+    cards_i = cards.astype(jnp.int32)
+    valid = (cards_i >= 0) & (cards_i < 52)
 
+    idx = jnp.clip(cards_i, 0, 51)          # safe for gather
+    planes = CARD_LUT[idx]                  # (..., 4, 13)
+    mask = valid.astype(jnp.float32)[..., None, None]
+
+    return jnp.sum(planes * mask, axis=0)
 
 @chex.dataclass(frozen=True)
 class AuxState:
@@ -319,7 +315,7 @@ class AlphaHoldemNet(nn.Module):
     # TPU MXU-friendly widths (multiples of 128 where it matters).
     trunk_channels: int = 128
     num_blocks: int = 6
-    fc_dim: int = 2048  # already multiple-of-128
+    fc_dim: int = 512
 
     @nn.compact
     def __call__(
@@ -722,7 +718,14 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
     # AlphaHoldem clips the discounted return R^gamma_t into [-d2, d3]
     target = trinal_clip_value_target(batch.ret, batch.contrib_self, batch.contrib_opp)
     v_loss = (target - value) ** 2
+    err = target - value
+    rmse = jnp.sqrt(jnp.mean(err ** 2))
 
+    t_mean = jnp.mean(target)
+    t_var = jnp.mean((target - t_mean) ** 2)
+    t_std = jnp.sqrt(t_var) + 1e-8
+
+    value_fit_ratio = rmse / t_std
     ent = dist.entropy()
 
     valid_f = batch.valid.astype(jnp.float32)
@@ -752,6 +755,8 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
         "valid_frac": jnp.mean(valid_f),
         "mean_ratio": jnp.sum(rt * valid_f) / denom,
         "clip_frac": jnp.sum(((jnp.abs(rt - 1.0) > CFG.clip_eps).astype(jnp.float32)) * valid_f) / denom,
+        "valid_frac": jnp.mean(valid_f),
+        "value_fit_ratio": value_fit_ratio
     }
     return total, metrics
 
@@ -1339,7 +1344,7 @@ def main() -> None:
     buf = replay_init(CFG.replay_capacity)
 
     # Initialize checkpointing for the training state.
-    ckpt_dir = os.path.abspath("./checkpoints")
+    ckpt_dir = os.path.abspath("/content/drive/MyDrive/checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
     ckpter = orbax.checkpoint.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(ts)
@@ -1407,7 +1412,8 @@ def main() -> None:
                 f"Pol: {m['policy_loss']:.4f} | "
                 f"Val: {m['value_loss']:.4f} | "
                 f"Ent: {m['entropy']:.4f} | "
-                f"Clip: {m['clip_frac']:.3f}"
+                f"Clip: {m['clip_frac']:.3f} |",
+                f"VFit: {m['value_fit_ratio']:.3f}"
             )
 
         # SAVE CHECKPOINT every 1000 updates
