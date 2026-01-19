@@ -2,6 +2,8 @@ import jax
 import jax.numpy as jnp
 import chex
 import itertools
+from training.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards
+
 
 # --- 1. CONFIGURATION & CONSTANTS ---
 NUM_CARDS = 52
@@ -67,112 +69,122 @@ class State:
     winner: int               # 0=P0, 1=P1, 2=Tie, -1=None
 
 # --- 2. HAND EVALUATOR ---
-TIER_SF, TIER_QA, TIER_FH, TIER_FL = 8, 7, 6, 5
-TIER_ST, TIER_TR, TIER_2P, TIER_1P, TIER_HC = 4, 3, 2, 1, 0
-WHEEL_PATTERN = jnp.array([12, 3, 2, 1, 0]) # A, 5, 4, 3, 2
+# TIER_SF, TIER_QA, TIER_FH, TIER_FL = 8, 7, 6, 5
+# TIER_ST, TIER_TR, TIER_2P, TIER_1P, TIER_HC = 4, 3, 2, 1, 0
+# WHEEL_PATTERN = jnp.array([12, 3, 2, 1, 0]) # A, 5, 4, 3, 2
 
-def _build_straight_table():
-    import numpy as np
-    tbl = np.full((1 << 13,), -1, dtype=np.int8)
+# def _build_straight_table():
+#     import numpy as np
+#     tbl = np.full((1 << 13,), -1, dtype=np.int8)
 
-    # Standard 5-long runs: high from 4..12 corresponds to ranks [high, high-1, ..., high-4]
-    for high in range(4, 13):
-        mask = 0
-        for r in range(high - 4, high + 1):
-            mask |= (1 << r)
-        tbl[mask] = np.int8(high)
+#     # Standard 5-long runs: high from 4..12 corresponds to ranks [high, high-1, ..., high-4]
+#     for high in range(4, 13):
+#         mask = 0
+#         for r in range(high - 4, high + 1):
+#             mask |= (1 << r)
+#         tbl[mask] = np.int8(high)
 
-    # Wheel: A,2,3,4,5 i.e. ranks {12,0,1,2,3}
-    wheel_mask = (1 << 12) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3)
-    tbl[wheel_mask] = np.int8(3)  # treat as 5-high straight
+#     # Wheel: A,2,3,4,5 i.e. ranks {12,0,1,2,3}
+#     wheel_mask = (1 << 12) | (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3)
+#     tbl[wheel_mask] = np.int8(3)  # treat as 5-high straight
 
-    return jnp.asarray(tbl)
+#     return jnp.asarray(tbl)
 
-STRAIGHT_HIGH_FROM_MASK = _build_straight_table()
+# STRAIGHT_HIGH_FROM_MASK = _build_straight_table()
 
-@jax.jit
-def score_5_hand(hand):
-    """Fast 5-card evaluator: bitmask straight lookup + top_k rank ordering.
+# @jax.jit
+# def score_5_hand(hand):
+#     """Fast 5-card evaluator: bitmask straight lookup + top_k rank ordering.
 
-    Returns packed int32 score: (tier << 20) | (r0<<16) | ... | r4
-    where r0..r4 are tie-break ranks (higher better).
-    """
-    ranks = (hand % 13).astype(jnp.int32)   # (5,)
-    suits = (hand // 13).astype(jnp.int32) # (5,)
+#     Returns packed int32 score: (tier << 20) | (r0<<16) | ... | r4
+#     where r0..r4 are tie-break ranks (higher better).
+#     """
+#     ranks = (hand % 13).astype(jnp.int32)   # (5,)
+#     suits = (hand // 13).astype(jnp.int32) # (5,)
 
-    # Flush check
-    flush = jnp.all(suits == suits[0])
+#     # Flush check
+#     flush = jnp.all(suits == suits[0])
 
-    # Build 13-bit rank presence mask
-    rank_bits = (jnp.int32(1) << ranks)  # (5,)
-    rank_mask = jnp.bitwise_or.reduce(rank_bits)  # scalar int32
+#     # Build 13-bit rank presence mask
+#     rank_bits = (jnp.int32(1) << ranks)  # (5,)
+#     rank_mask = jnp.bitwise_or.reduce(rank_bits)  # scalar int32
 
-    # Straight check via lookup table
-    straight_high = STRAIGHT_HIGH_FROM_MASK[rank_mask].astype(jnp.int32)
-    strt = straight_high >= 0
+#     # Straight check via lookup table
+#     straight_high = STRAIGHT_HIGH_FROM_MASK[rank_mask].astype(jnp.int32)
+#     strt = straight_high >= 0
 
-    # Rank histogram (13,) using scatter-add (still fine; 13 is tiny)
-    rc = jnp.zeros((13,), dtype=jnp.int32).at[ranks].add(1)
-    mc = jnp.max(rc)                 # 4,3,2,1
-    pc = jnp.sum(rc == 2)            # number of pairs
+#     # Rank histogram (13,) using scatter-add (still fine; 13 is tiny)
+#     rc = jnp.zeros((13,), dtype=jnp.int32).at[ranks].add(1)
+#     mc = jnp.max(rc)                 # 4,3,2,1
+#     pc = jnp.sum(rc == 2)            # number of pairs
 
-    # Tier selection (same logic you had) :contentReference[oaicite:2]{index=2}
-    tier = jnp.select(
-        [
-            strt & flush,           # Straight Flush
-            mc == 4,                # Quads
-            (mc == 3) & (pc >= 1),  # Full House
-            flush,                  # Flush
-            strt,                   # Straight
-            mc == 3,                # Trips
-            pc >= 2,                # Two Pair
-            pc == 1,                # One Pair
-        ],
-        [8, 7, 6, 5, 4, 3, 2, 1],
-        default=0
-    ).astype(jnp.int32)
+#     # Tier selection (same logic you had) :contentReference[oaicite:2]{index=2}
+#     tier = jnp.select(
+#         [
+#             strt & flush,           # Straight Flush
+#             mc == 4,                # Quads
+#             (mc == 3) & (pc >= 1),  # Full House
+#             flush,                  # Flush
+#             strt,                   # Straight
+#             mc == 3,                # Trips
+#             pc >= 2,                # Two Pair
+#             pc == 1,                # One Pair
+#         ],
+#         [8, 7, 6, 5, 4, 3, 2, 1],
+#         default=0
+#     ).astype(jnp.int32)
 
-    # Tie-break ranks:
-    # - For straights: just need (high, then zeros)
-    # - Otherwise, order ranks by (count desc, rank desc) using top_k on a 13-vector.
-    #
-    # Key idea: top_k is much cheaper than argsort for TPU.
-    keys = rc * 32 + jnp.arange(13, dtype=jnp.int32)  # (13,), count dominates
-    _, ordered = jax.lax.top_k(keys, k=5)             # ranks ordered by freq then rank
+#     # Tie-break ranks:
+#     # - For straights: just need (high, then zeros)
+#     # - Otherwise, order ranks by (count desc, rank desc) using top_k on a 13-vector.
+#     #
+#     # Key idea: top_k is much cheaper than argsort for TPU.
+#     keys = rc * 32 + jnp.arange(13, dtype=jnp.int32)  # (13,), count dominates
+#     _, ordered = jax.lax.top_k(keys, k=5)             # ranks ordered by freq then rank
 
-    # For straights, override to a canonical list: [high, high-1, ..., high-4] with wheel fix
-    def _straight_ranks(high):
-        # Wheel case: high==3 should map to [3,2,1,0,12]
-        is_wheel = high == 3
-        std = jnp.array([high, high-1, high-2, high-3, high-4], dtype=jnp.int32)
-        wheel = jnp.array([3, 2, 1, 0, 12], dtype=jnp.int32)
-        return jnp.where(is_wheel, wheel, std)
+#     # For straights, override to a canonical list: [high, high-1, ..., high-4] with wheel fix
+#     def _straight_ranks(high):
+#         # Wheel case: high==3 should map to [3,2,1,0,12]
+#         is_wheel = high == 3
+#         std = jnp.array([high, high-1, high-2, high-3, high-4], dtype=jnp.int32)
+#         wheel = jnp.array([3, 2, 1, 0, 12], dtype=jnp.int32)
+#         return jnp.where(is_wheel, wheel, std)
 
-    ranks_straight = _straight_ranks(straight_high)
-    # For flush/high-card, duplicates can exist, but in 5 cards sorting 5 items is cheap.
-    ranks_sorted5 = jnp.sort(ranks)[::-1].astype(jnp.int32)
+#     ranks_straight = _straight_ranks(straight_high)
+#     # For flush/high-card, duplicates can exist, but in 5 cards sorting 5 items is cheap.
+#     ranks_sorted5 = jnp.sort(ranks)[::-1].astype(jnp.int32)
 
-    # Choose final tie-break list by category
-    # - Straight / straight flush: straight sequence
-    # - Flush / high card: sorted ranks of the 5 cards
-    # - Pair+ hands: ordered by (count, rank) from top_k(keys)
-    use_sorted5 = (tier == 5) | (tier == 0)  # flush or high-card
-    use_straight = (tier == 4) | (tier == 8) # straight or straight flush
+#     # Choose final tie-break list by category
+#     # - Straight / straight flush: straight sequence
+#     # - Flush / high card: sorted ranks of the 5 cards
+#     # - Pair+ hands: ordered by (count, rank) from top_k(keys)
+#     use_sorted5 = (tier == 5) | (tier == 0)  # flush or high-card
+#     use_straight = (tier == 4) | (tier == 8) # straight or straight flush
 
-    final = jnp.where(use_sorted5, ranks_sorted5, ordered)
-    final = jnp.where(use_straight, ranks_straight, final)
+#     final = jnp.where(use_sorted5, ranks_sorted5, ordered)
+#     final = jnp.where(use_straight, ranks_straight, final)
 
-    return (tier << 20) | (final[0] << 16) | (final[1] << 12) | (final[2] << 8) | (final[3] << 4) | final[4]
+#     return (tier << 20) | (final[0] << 16) | (final[1] << 12) | (final[2] << 8) | (final[3] << 4) | final[4]
 
 
-COMBINATIONS_8_5 = jnp.array(list(itertools.combinations(range(8), 5)), dtype=jnp.int32)
+# COMBINATIONS_8_5 = jnp.array(list(itertools.combinations(range(8), 5)), dtype=jnp.int32)
 
-@jax.jit
+# @jax.jit
+# def evaluate_best_hand(hole_cards, board_cards):
+#     pool = jnp.concatenate([hole_cards, board_cards])
+#     candidate_hands = pool[COMBINATIONS_8_5]
+#     scores = jax.vmap(score_5_hand)(candidate_hands)
+#     return jnp.max(scores)
+
+COMBINATIONS_8_7 = jnp.array(list(itertools.combinations(range(8), 7)), dtype=jnp.int32)
+HR = load_hand_ranks_table("training/HandRanks.dat")
+
 def evaluate_best_hand(hole_cards, board_cards):
     pool = jnp.concatenate([hole_cards, board_cards])
-    candidate_hands = pool[COMBINATIONS_8_5]
-    scores = jax.vmap(score_5_hand)(candidate_hands)
+    candidate_hands = pool[COMBINATIONS_8_7]
+    scores = jax.vmp(evaluate_7_cards)(candidate_hands)
     return jnp.max(scores)
+
 
 @jax.jit
 def get_showdown_result(state):
