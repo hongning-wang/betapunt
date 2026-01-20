@@ -136,8 +136,6 @@ def _phase_to_round_idx(phase: chex.Array) -> chex.Array:
         default=4,
     ).astype(jnp.int32)
 
-
-
 @jax.jit
 def _cards_to_plane(cards: chex.Array) -> chex.Array:
     """Fast gather-based version using CARD_LUT. cards in [-1, 51]."""
@@ -186,6 +184,7 @@ def aux_record_action(
     aux: AuxState,
     player_id: chex.Array,
     action: chex.Array,
+    pot: chex.Array,
     legal_mask: chex.Array,
 ) -> AuxState:
     """Record an action into the AlphaHoldem-style action tensor.
@@ -202,7 +201,7 @@ def aux_record_action(
     def _shift_and_write(tensor_hwk):
         # Shift the 6-slot segment inside the round along the channel axis (last dim).
         seg = jax.lax.dynamic_slice(tensor_hwk, (0, 0, base), (4, NB_ACTIONS, 6))
-        seg = jnp.concatenate([seg[:, :, 1:], seg[:, :, -1:]], axis=2)
+        # seg = jnp.concatenate([seg[:, :, 1:], seg[:, :, -1:]], axis=2)
         return jax.lax.dynamic_update_slice(tensor_hwk, seg, (0, 0, base))
 
     action_tensor = jax.lax.cond(aux.slot_idx >= 6, _shift_and_write, lambda t: t, aux.action_tensor)
@@ -212,9 +211,9 @@ def aux_record_action(
 
     row_p0 = jnp.where(player_id == 0, a_oh, jnp.zeros_like(a_oh))
     row_p1 = jnp.where(player_id == 1, a_oh, jnp.zeros_like(a_oh))
-    row_sum = row_p0 + row_p1
+    row_pot = a_oh * pot
 
-    chan_mat = jnp.stack([row_p0, row_p1, row_sum, legal_f], axis=0)  # (4, NB_ACTIONS)
+    chan_mat = jnp.stack([row_p0, row_p1, row_pot, legal_f], axis=0)  # (4, NB_ACTIONS)
     action_tensor = action_tensor.at[:, :, chan].set(chan_mat)
 
     return aux.replace(action_tensor=action_tensor, slot_idx=aux.slot_idx + 1)
@@ -252,7 +251,7 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
     # All public information in this variant includes the revealed discard cards.
     public_cards = jnp.where(state.board >= 0, state.board, jnp.int32(-1))
 
-    ch0_hole = _cards_to_plane(hole_active)
+    ch0_hole = _cards_to_plane(hole)
     ch1_flop = _cards_to_plane(jnp.where(flop_cards >= 0, flop_cards, jnp.int32(-1)))
     ch2_turn = _cards_to_plane(jnp.where(turn_card >= 0, turn_card, jnp.int32(-1)))
     ch3_river = _cards_to_plane(jnp.where(river_card >= 0, river_card, jnp.int32(-1)))
@@ -274,6 +273,7 @@ def encode_obs(state: State, aux: AuxState, player_id: chex.Array) -> Tuple[chex
         swapped = jnp.take(tensor, SWAP01, axis=0)
 
         return jnp.where(player_id == 0, tensor, swapped)
+    
     action_tensor = make_ego_relative(action_tensor, player_id)
     legal = ENV.get_legal_actions(state)
     return card_tensor, action_tensor, legal
@@ -585,7 +585,7 @@ def pool_add(pool: AgentPool, new_params: Any, initial_elo: chex.Array) -> Agent
     def _write_leaf(pool_leaf, new_leaf):
         return pool_leaf.at[write_idx].set(new_leaf)
 
-    params = jax.tree_util.tree_map(_write_leaf, pool.params, new_params)
+    params = jax.tree_util.tree_map(_write_leaf, pool.params, new_params)                                                                
     elo = pool.elo.at[write_idx].set(initial_elo)
     size2 = jnp.where(can_append, size + 1, size)
     return pool.replace(params=params, elo=elo, size=size2)
@@ -709,8 +709,8 @@ def ppo_loss_and_metrics(state: TrainState, batch: Transition) -> Tuple[chex.Arr
     log_ratio = logp - batch.logp_old
     rt = jnp.where(
     batch.valid,
-    jnp.exp(log_ratio),
-    1.0,   # neutral ratio for invalid samples
+        jnp.exp(log_ratio),
+        1.0,   # neutral ratio for invalid samples
     )
 
     obj = trinal_clip_policy_objective(rt, batch.adv, CFG.clip_eps, CFG.delta1)
@@ -960,7 +960,8 @@ def collect_rollout(
 
         # Legal actions depend only on the current state (current_player), so compute once.
         legal = legal_a_b
-        aux2 = jax.vmap(aux_record_action)(aux, s.current_player.astype(jnp.int32), action, legal)
+        pot = s.pot + s.p0_bet + s.p1_bet
+        aux2 = jax.vmap(aux_record_action)(aux, s.current_player.astype(jnp.int32), action, pot, legal)
 
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
         s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)

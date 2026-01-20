@@ -182,7 +182,7 @@ HR = load_hand_ranks_table("training/HandRanks.dat")
 def evaluate_best_hand(hole_cards, board_cards):
     pool = jnp.concatenate([hole_cards, board_cards])
     candidate_hands = pool[COMBINATIONS_8_7]
-    scores = jax.vmp(evaluate_7_cards)(candidate_hands)
+    scores = jax.vmap(evaluate_7_cards)(candidate_hands)
     return jnp.max(scores)
 
 
