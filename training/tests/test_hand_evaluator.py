@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import pkrbot
 import itertools
 
-from training.game import evaluate_best_hand
+# from training.game import evaluate_best_hand
 from training.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards_batch
 
 
