@@ -877,7 +877,7 @@ def compute_gae_and_returns(
         return adv_t, adv_t
 
     _, adv_rev = jax.lax.scan(adv_scan, jnp.float32(0.0), jnp.arange(T - 1, -1, -1))
-    adv = adv_rev[::-1]
+    adv = jnp.flip(adv_rev, axis=0)
 
     def ret_scan(carry, t):
         g_next = carry
@@ -885,7 +885,7 @@ def compute_gae_and_returns(
         return g, g
 
     _, ret_rev = jax.lax.scan(ret_scan, last_value, jnp.arange(T - 1, -1, -1))
-    ret = ret_rev[::-1]
+    ret = jnp.flip(ret_rev, axis=0)
 
     return adv, ret
 
