@@ -240,12 +240,12 @@ def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
     Card positions:
       0-1: Player's hole cards (active only)
       2-3: Initial flop cards (board[0:2])
-      4-5: Discard cards (board[2:4]) - marked with player_id of who discarded
+      4-5: Discard cards (board[2:4]) - marked with dealer_id of who discarded
       6: Turn card (board[4])
       7: River card (board[5])
     
-    Each card entry: [owner_id, card_index]
-      - owner_id: 0=player0, 1=player1, 2=community
+    Each card entry: [dealer_id, card_index]
+      - dealer_id: 0=non-dealer, 1=dealer, 2=community
       - card_index: 0-51 (or -1 for undealt/invalid)
     """
     is_p0 = player_id == 0
@@ -253,10 +253,6 @@ def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
     # Get hole cards for the viewing player
     hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)
     active_mask = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)
-    
-    # Get opponent's discard info for marking ownership
-    # OOP player discards first (to board[2]), dealer discards second (to board[3])
-    opp_is_dealer = jnp.where(is_p0, ~state.is_dealer_p0, state.is_dealer_p0)
     
     # OPTIMIZATION D4: Vectorize card tensor construction to avoid Python loops
     # Initialize card tensor with -1 (invalid)
@@ -622,10 +618,12 @@ def trinal_clip_policy_objective(
     eps: float,
     delta1: float,
 ) -> chex.Array:
-    """Trinal-Clip PPO objective.
+    """Trinal-Clip PPO objective from AlphaHoldem Eq. (3).
     
-    From AlphaHoldem Eq. (3):
-      r_tcp = clip(rt, clip(rt, 1-eps, 1+eps), delta1)
+    L_tcp = clip(r_t, clip(r_t, 1-eps, 1+eps), delta1) * A_t
+    
+    Inner clip bounds r_t to [1-eps, 1+eps]
+    Outer clip uses inner result as lower bound and delta1 as upper bound
     """
     rt_clip = jnp.clip(rt, 1.0 - eps, 1.0 + eps)
     rt_tcp = jnp.clip(rt, rt_clip, delta1)
@@ -809,6 +807,7 @@ def train_step(
 
 # =============================================================================
 # 8) Rollout Collection
+# 8) Rollout Collection
 # =============================================================================
 
 
@@ -925,30 +924,43 @@ def compute_gae_and_returns(
     dones: chex.Array,
     last_value: chex.Array,
 ) -> Tuple[chex.Array, chex.Array]:
-    """Compute GAE advantages and discounted returns."""
-    T = rewards.shape[0]
-    values_next = jnp.concatenate([values[1:], last_value[None]], axis=0)
-    deltas = rewards + CFG.gamma * (1.0 - dones.astype(jnp.float32)) * values_next - values
+    """Compute GAE advantages and discounted returns.
     
-    # Scan backward for advantages
-    def adv_scan(carry, t):
-        adv_next = carry
-        adv_t = deltas[t] + CFG.gamma * CFG.gae_lambda * (1.0 - dones[t].astype(jnp.float32)) * adv_next
-        return adv_t, adv_t
+    Args:
+        rewards: (T,) rewards at each timestep
+        values: (T,) value estimates at each timestep
+        dones: (T,) episode termination flags
+        last_value: scalar, bootstrap value for final state
     
-    _, adv_rev = jax.lax.scan(adv_scan, jnp.float32(0.0), jnp.arange(T - 1, -1, -1))
-    adv = jnp.flip(adv_rev, axis=0)
+    Returns:
+        advantages: (T,) GAE advantages
+        returns: (T,) discounted returns (advantages + values)
+    """
+    not_done = 1.0 - dones.astype(jnp.float32)
     
-    # Scan backward for returns
-    def ret_scan(carry, t):
-        g_next = carry
-        g = rewards[t] + CFG.gamma * (1.0 - dones[t].astype(jnp.float32)) * g_next
-        return g, g
+    # Append bootstrap value
+    values_extended = jnp.concatenate([values, last_value[None]])
     
-    _, ret_rev = jax.lax.scan(ret_scan, last_value, jnp.arange(T - 1, -1, -1))
-    ret = jnp.flip(ret_rev, axis=0)
+    # TD residuals: δ_t = r_t + γ * (1 - done_t) * V(s_{t+1}) - V(s_t)
+    deltas = rewards + CFG.gamma * not_done * values_extended[1:] - values_extended[:-1]
     
-    return adv, ret
+    # Reverse for backward scan
+    deltas_rev = jnp.flip(deltas, axis=0)
+    not_done_rev = jnp.flip(not_done, axis=0)
+    
+    # GAE: A_t = δ_t + γλ(1-done_t) * A_{t+1}
+    def gae_step(adv_next, inputs):
+        delta, nd = inputs
+        adv = delta + CFG.gamma * CFG.gae_lambda * nd * adv_next
+        return adv, adv
+    
+    _, advantages_rev = jax.lax.scan(gae_step, 0.0, (deltas_rev, not_done_rev))
+    advantages = jnp.flip(advantages_rev, axis=0)
+    
+    # Returns = Advantages + Values (standard GAE identity)
+    returns = advantages + values
+    
+    return advantages, returns  
 
 
 @jax.jit
@@ -1138,6 +1150,7 @@ def collect_rollout(
     last_card_b, last_action_hist_b, last_action_mask_b, _ = jax.vmap(encode_obs)(
         vec2.env_state, vec2.aux, last_pid
     )
+    _, last_value = forward_apply(main_params, last_card_b, last_action_hist_b, last_action_mask_b)
     _, last_value = forward_apply(main_params, last_card_b, last_action_hist_b, last_action_mask_b)
     last_value = last_value.astype(jnp.float32)
     
