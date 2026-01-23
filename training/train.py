@@ -51,11 +51,11 @@ from game import (
 @dataclass(frozen=True)
 class Config:
     # Parallel sampling
-    num_envs: int = 1_024
-    rollout_len: int = 128
+    num_envs: int = 2_048
+    rollout_len: int = 64
 
     # PPO/GAE
-    gamma: float = 0.999
+    gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
     delta1: float = 3.0
@@ -69,7 +69,7 @@ class Config:
     # Off-policy replay + updates
     replay_capacity: int = 1_000_000
     batch_size: int = 32_768
-    num_minibatches: int = 4
+    num_minibatches: int = 8
     update_epochs: int = 4
     warmup_steps: int = 400_000
 

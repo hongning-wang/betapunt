@@ -8,7 +8,7 @@ AlphaHoldem's training methodology:
   4) K-Best self-play with ELO-based opponent pool selection
 
 Key changes from original AlphaHoldem:
-  - Card tensor: (B, 8, 2) instead of (B, 4, 13, 7)
+    - Card tensor: (B, 9, 2) instead of (B, 4, 13, 7)
     - Action tensor: (B, 30, 7) instead of (B, 4, 13, 30)
   - Transformer encoders instead of ConvNets
   - Cross-attention fusion instead of element-wise addition
@@ -31,6 +31,7 @@ import optax
 from flax.training.train_state import TrainState
 import orbax.checkpoint
 from flax.training import orbax_utils
+from jax import debug as jax_debug
 
 # Import the transformer model
 from model import (
@@ -171,7 +172,7 @@ def phase_to_street(phase: chex.Array) -> chex.Array:
 def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> chex.Array:
     """Build a 7-field action token from the current state and action.
 
-    time_id is per-street (slot index within the current round).
+    time_id is a monotonically increasing index (global action count).
     """
     is_p0 = state.current_player == 0
 
@@ -200,6 +201,28 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
         dtype=jnp.float32,
     )
     return token
+
+
+def _assert_card_tensor(card_tensor: chex.Array) -> None:
+    """Sanity check card tensor contract.
+
+    card[...,0] in {-1} ∪ [0, 51]
+    card[...,1] in {-1} ∪ [0, 8]
+    """
+    card_idx = card_tensor[..., 0]
+    type_id = card_tensor[..., 1]
+
+    ok_idx = (card_idx == -1) | ((card_idx >= 0) & (card_idx <= 51))
+    ok_type = (type_id == -1) | ((type_id >= 0) & (type_id <= 8))
+
+    jax_debug.assert_(jnp.all(ok_idx), "Invalid card_index in card_tensor")
+    jax_debug.assert_(jnp.all(ok_type), "Invalid type_id in card_tensor")
+
+
+def _assert_legal_action(legal_mask: chex.Array, action: chex.Array) -> None:
+    """Sanity check: sampled action must be legal."""
+    chosen = jnp.take_along_axis(legal_mask, action[:, None], axis=-1)[:, 0]
+    jax_debug.assert_(jnp.all(chosen), "Sampled illegal action")
 
 
 @chex.dataclass(frozen=True)
@@ -252,7 +275,8 @@ def aux_record_action(
     """Record an action into the action history tensor.
     """
 
-    time_id = aux.slot_idx.astype(jnp.int32)
+    # Use a monotonically increasing time id to avoid saturation loss
+    time_id = aux.action_ptr.astype(jnp.int32)
     action_entry = make_action_token(state, action, time_id)
     
     # Write to action tensor (circular buffer behavior if > 30 actions)
@@ -262,74 +286,77 @@ def aux_record_action(
     return aux.replace(
         action_tensor=action_tensor,
         action_ptr=aux.action_ptr + 1,
-        slot_idx=jnp.minimum(aux.slot_idx + 1, jnp.int32(5)),
+        slot_idx=aux.slot_idx + 1,
     )
 
 
 @jax.jit
 def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
-    """Encode cards into (8, 2) tensor.
+        """Encode cards into (9, 2) tensor.
     
-    Card positions:
-      0-1: Player's hole cards (active only)
-      2-3: Initial flop cards (board[0:2])
-      4-5: Discard cards (board[2:4]) - marked with dealer_id of who discarded
-      6: Turn card (board[4])
-      7: River card (board[5])
+        Card positions / type_id mapping:
+            0: heropriv0
+            1: heropriv1
+            2: heropriv2
+            3: flop0
+            4: flop1
+            5: herodiscard
+            6: villaindiscard
+            7: turn
+            8: river
     
-    Each card entry: [dealer_id, card_index]
-      - dealer_id: 0=non-dealer, 1=dealer, 2=community
-      - card_index: 0-51 (or -1 for undealt/invalid)
-    """
-    is_p0 = player_id == 0
+        Each card entry: [card_index, type_id]
+            - card_index: 0-51 (or -1 for undealt/invalid)
+            - type_id: 0-8 (or -1 for invalid)
+        """
+        is_p0 = player_id == 0
     
-    # Get hole cards for the viewing player
-    hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)
-    active_mask = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)
+        # Get hole cards for the viewing player
+        hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)
+        active_mask = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)
     
-    # OPTIMIZATION D4: Vectorize card tensor construction to avoid Python loops
-    # Initialize card tensor with -1 (invalid)
-    card_tensor = jnp.full((CARD_SEQ_LEN, CARD_INPUT_DIM), -1, dtype=jnp.int32)
+        # Initialize with invalids
+        card_index = jnp.full((CARD_SEQ_LEN,), -1, dtype=jnp.int32)
+        type_id = jnp.full((CARD_SEQ_LEN,), -1, dtype=jnp.int32)
 
-    # Hole cards (positions 0-1): only active cards
-    # Get indices of active hole cards (up to 2)
-    active_indices = jnp.where(active_mask, jnp.arange(3), jnp.int32(-1))
-    # Sort to get valid indices first (use jnp.flip instead of [::-1] for JIT compatibility)
-    sorted_active = jnp.flip(jnp.sort(active_indices))[:2]
+        # Hero hole cards (positions 0-2)
+        hole_valid = active_mask.astype(jnp.bool_)
+        card_index = card_index.at[0:3].set(jnp.where(hole_valid, hole, -1))
+        type_id = type_id.at[0:3].set(
+                jnp.where(hole_valid, jnp.arange(3, dtype=jnp.int32), -1)
+        )
 
-    # Vectorized hole card filling (positions 0-1)
-    valid_hole = sorted_active >= 0
-    card_vals_hole = jnp.where(valid_hole, hole[jnp.clip(sorted_active, 0, 2)], -1)
-    owners_hole = jnp.where(valid_hole, player_id, -1)
-    card_tensor = card_tensor.at[0:2, 0].set(owners_hole)
-    card_tensor = card_tensor.at[0:2, 1].set(card_vals_hole)
+        # Flop (positions 3-4)
+        flop_cards = state.board[0:2]
+        flop_valid = flop_cards >= 0
+        card_index = card_index.at[3:5].set(jnp.where(flop_valid, flop_cards, -1))
+        type_id = type_id.at[3:5].set(
+                jnp.where(flop_valid, jnp.array([3, 4], dtype=jnp.int32), -1)
+        )
 
-    # Vectorized flop cards (positions 2-3): community cards
-    flop_cards = state.board[0:2]
-    valid_flop = flop_cards >= 0
-    owners_flop = jnp.where(valid_flop, 2, -1)  # 2 = community
-    card_tensor = card_tensor.at[2:4, 0].set(owners_flop)
-    card_tensor = card_tensor.at[2:4, 1].set(flop_cards)
+        # Discards: board[2] = OOP discard, board[3] = dealer discard
+        hero_is_dealer = jnp.where(is_p0, state.is_dealer_p0, jnp.logical_not(state.is_dealer_p0))
+        hero_discard = jnp.where(hero_is_dealer, state.board[3], state.board[2])
+        villain_discard = jnp.where(hero_is_dealer, state.board[2], state.board[3])
+
+        hero_discard_valid = hero_discard >= 0
+        villain_discard_valid = villain_discard >= 0
+        card_index = card_index.at[5].set(jnp.where(hero_discard_valid, hero_discard, -1))
+        type_id = type_id.at[5].set(jnp.where(hero_discard_valid, jnp.int32(5), -1))
+        card_index = card_index.at[6].set(jnp.where(villain_discard_valid, villain_discard, -1))
+        type_id = type_id.at[6].set(jnp.where(villain_discard_valid, jnp.int32(6), -1))
+
+        # Turn/River (positions 7-8)
+        turn_card = state.board[4]
+        river_card = state.board[5]
+        turn_valid = turn_card >= 0
+        river_valid = river_card >= 0
+        card_index = card_index.at[7].set(jnp.where(turn_valid, turn_card, -1))
+        type_id = type_id.at[7].set(jnp.where(turn_valid, jnp.int32(7), -1))
+        card_index = card_index.at[8].set(jnp.where(river_valid, river_card, -1))
+        type_id = type_id.at[8].set(jnp.where(river_valid, jnp.int32(8), -1))
     
-    # Vectorized discard cards (positions 4-5): marked with who discarded
-    # board[2] = OOP discard, board[3] = dealer discard
-    oop_id = jnp.where(state.is_dealer_p0, 1, 0)
-    dlr_id = jnp.where(state.is_dealer_p0, 0, 1)
-    discard_cards = state.board[2:4]
-    discard_ids = jnp.array([oop_id, dlr_id], dtype=jnp.int32)
-    valid_discards = discard_cards >= 0
-    owners_discards = jnp.where(valid_discards, discard_ids, -1)
-    card_tensor = card_tensor.at[4:6, 0].set(owners_discards)
-    card_tensor = card_tensor.at[4:6, 1].set(discard_cards)
-
-    # Vectorized turn and river (positions 6-7): community cards
-    turn_river = state.board[4:6]
-    valid_turn_river = turn_river >= 0
-    owners_turn_river = jnp.where(valid_turn_river, 2, -1)
-    card_tensor = card_tensor.at[6:8, 0].set(owners_turn_river)
-    card_tensor = card_tensor.at[6:8, 1].set(turn_river)
-    
-    return card_tensor
+        return jnp.stack([card_index, type_id], axis=-1)
 
 
 @jax.jit
@@ -340,7 +367,9 @@ def encode_actions(aux: AuxState, player_id: chex.Array) -> Tuple[chex.Array, ch
         action_tensor: (30, 7) action history
         action_mask: (30,) boolean mask for valid actions
     """
-    action_tensor = aux.action_tensor
+    # Re-center circular buffer so the most recent action is at the end
+    ptr = aux.action_ptr % ACTION_SEQ_LEN
+    action_tensor = jnp.roll(aux.action_tensor, shift=-ptr, axis=0)
     
     # Make player IDs ego-relative (0 = self, 1 = opponent)
     # Original: actor_id in action_tensor[..., 0]
@@ -371,7 +400,7 @@ def encode_obs(
     """Build card/action tensors + legal mask from state.
     
     Returns:
-        card_tensor: (8, 2) int32
+        card_tensor: (9, 2) int32
         action_tensor: (30, 7) float32
         action_mask: (30,) bool
         legal_mask: (NUM_ACTIONS,) bool
@@ -391,10 +420,10 @@ def encode_obs(
 @chex.dataclass(frozen=True)
 class Transition:
     """Single transition for training."""
-    card: chex.Array        # (8, 2) int32 - card tensor
+    card: chex.Array        # (9, 2) int32 - card tensor
     action_hist: chex.Array # (30, 7) float32 - action history
     action_mask: chex.Array # (30,) bool - action history mask
-    card_v: chex.Array      # (8, 2) - critic view cards
+    card_v: chex.Array      # (9, 2) - critic view cards
     action_hist_v: chex.Array  # (30, 7) - critic view actions
     action_mask_v: chex.Array  # (30,) - critic view action mask
     legal: chex.Array       # (13,) bool - legal actions
@@ -412,7 +441,7 @@ class Transition:
 @chex.dataclass(frozen=True)
 class ReplayBuffer:
     """Off-policy replay buffer with fixed capacity."""
-    card: chex.Array        # (cap, 8, 2)
+    card: chex.Array        # (cap, 9, 2)
     action_hist: chex.Array # (cap, 30, 7)
     action_mask: chex.Array # (cap, 30)
     card_v: chex.Array
@@ -504,9 +533,25 @@ def replay_sample(
     )
     available = jnp.minimum(buf.size, limit)
     
-    # Sample random offsets
-    offsets = jax.random.randint(sub, (batch_size,), 0, available)
-    idx = (buf.ptr - 1 - offsets) % cap
+    # Sample only learner-turn transitions to avoid wasted policy computation
+    age = (buf.ptr - 1 - jnp.arange(cap, dtype=jnp.int32)) % cap
+    eligible = jnp.where(available > 0, age < available, jnp.zeros_like(age, dtype=jnp.bool_))
+    valid_mask = buf.valid & eligible
+
+    valid_w = valid_mask.astype(jnp.float32)
+    valid_sum = jnp.sum(valid_w)
+
+    def _sample_valid():
+        p = valid_w / valid_sum
+        return jax.random.choice(sub, cap, shape=(batch_size,), replace=True, p=p)
+
+    def _sample_fallback():
+        elig_w = eligible.astype(jnp.float32)
+        elig_sum = jnp.sum(elig_w)
+        p = jnp.where(elig_sum > 0, elig_w / elig_sum, jnp.ones((cap,), dtype=jnp.float32) / jnp.float32(cap))
+        return jax.random.choice(sub, cap, shape=(batch_size,), replace=True, p=p)
+
+    idx = jax.lax.cond(valid_sum > 0, _sample_valid, _sample_fallback)
     
     tr = Transition(
         card=buf.card[idx],
@@ -748,6 +793,12 @@ def ppo_loss_and_metrics(
 ) -> Tuple[chex.Array, Dict[str, chex.Array]]:
     """Compute PPO loss and metrics."""
 
+    def _masked_mean_std(x: chex.Array, w: chex.Array) -> Tuple[chex.Array, chex.Array]:
+        denom = jnp.maximum(1.0, jnp.sum(w))
+        mean = jnp.sum(x * w) / denom
+        var = jnp.sum(((x - mean) ** 2) * w) / denom
+        return mean, jnp.sqrt(var + 1e-8)
+
     # Forward pass for policy (actor view)
     logits, _ = forward_apply(
         state.params,
@@ -800,14 +851,22 @@ def ppo_loss_and_metrics(
     t_std = jnp.sqrt(t_var) + 1e-8
     value_fit_ratio = rmse / t_std
 
+    ret_mean, ret_std = _masked_mean_std(batch.ret, valid_f)
+    value_mean, value_std = _masked_mean_std(value, valid_f)
+    rv_mean, rv_std = _masked_mean_std(batch.ret - value, valid_f)
+
     metrics = {
         "loss": total,
         "policy_loss": policy_loss,
         "value_loss": value_loss,
         "entropy": entropy,
-        "value_mean": jnp.mean(value),
+        "value_mean": value_mean,
+        "value_std": value_std,
         "adv_mean": jnp.sum(batch.adv * valid_f) / denom,
-        "ret_mean": jnp.sum(batch.ret * valid_f) / denom,
+        "ret_mean": ret_mean,
+        "ret_std": ret_std,
+        "ret_value_mean": rv_mean,
+        "ret_value_std": rv_std,
         "valid_frac": jnp.mean(valid_f),
         "mean_ratio": jnp.sum(rt * valid_f) / denom,
         "clip_frac": jnp.sum(
@@ -1046,6 +1105,7 @@ def collect_rollout(
         card_cur_b, action_hist_cur_b, action_mask_cur_b, legal_a_b = jax.vmap(encode_obs)(
             s, aux, pid_cur
         )
+        _assert_card_tensor(card_cur_b)
 
         # OPTIMIZATION D1: Reduce forward passes
         # Strategy:
@@ -1054,14 +1114,15 @@ def collect_rollout(
         # - Always forward main_params with learner view for value (critic always needs learner perspective)
         # Result: 2 forwards when opponent acts, 2 forwards when learner acts (can't avoid both logits+value needs)
 
-        # Forward #1: Main agent from current player perspective (for learner logits)
-        logits_main_b, _ = forward_apply(
+        # Forward #1: Main agent from current player perspective (logits + value)
+        logits_main_b, value_main_b = forward_apply(
             main_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
         )
 
         # Forward #2 (conditional): Opponent from current player perspective (for opponent logits)
         # OPTIMIZATION D2: Skip when pool is empty
         has_opponent = pool.size > 0
+        need_opp_logits = has_opponent & jnp.any(~is_learner_turn)
 
         def compute_opp_logits():
             return forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b)[0]
@@ -1069,23 +1130,27 @@ def collect_rollout(
         def use_main_logits():
             return logits_main_b
 
-        logits_opp_b = jax.lax.cond(has_opponent, compute_opp_logits, use_main_logits)
+        logits_opp_b = jax.lax.cond(need_opp_logits, compute_opp_logits, use_main_logits)
 
         # Select logits based on whose turn it is
         logits = jnp.where(is_learner_turn[:, None], logits_main_b, logits_opp_b)
 
-        # Forward #3: Value from learner perspective (always needed for critic)
-        # We can reuse current player encoding if learner is acting, but need separate
-        # encoding if opponent is acting. To keep it simple and avoid per-env branching,
-        # we always do a separate forward from learner perspective for value.
-        # This is unavoidable: critic MUST see from learner perspective.
+        # Forward #3: Value from learner perspective (only needed for opponent turns)
+        # Reuse current-player value when learner is acting; compute learner view
+        # only if any opponent turns exist in the batch.
         card_learner_b, action_hist_learner_b, action_mask_learner_b, _ = jax.vmap(encode_obs)(
             s, aux, learner_pid
         )
-        _, value_b = forward_apply(
-            main_params, card_learner_b, action_hist_learner_b, action_mask_learner_b
-        )
-        value = value_b.astype(jnp.float32)
+        _assert_card_tensor(card_learner_b)
+        need_learner_value = jnp.any(~is_learner_turn)
+
+        def compute_learner_value():
+            return forward_apply(
+                main_params, card_learner_b, action_hist_learner_b, action_mask_learner_b
+            )[1]
+
+        value_learner_b = jax.lax.cond(need_learner_value, compute_learner_value, lambda: value_main_b)
+        value = jnp.where(is_learner_turn, value_main_b, value_learner_b).astype(jnp.float32)
         
         # Sample actions
         def _mk_key(k, eid, salt):
@@ -1098,6 +1163,7 @@ def collect_rollout(
         neg_inf = -1e9
         masked_logits = jnp.where(legal_a_b, logits, neg_inf)
         action = jnp.argmax(masked_logits + g, axis=-1).astype(jnp.int32)
+        _assert_legal_action(legal_a_b, action)
         
         # Compute log probabilities
         logp_all = jax.nn.log_softmax(masked_logits, axis=-1)
@@ -1180,7 +1246,6 @@ def collect_rollout(
     last_card_b, last_action_hist_b, last_action_mask_b, _ = jax.vmap(encode_obs)(
         vec2.env_state, vec2.aux, last_pid
     )
-    _, last_value = forward_apply(main_params, last_card_b, last_action_hist_b, last_action_mask_b)
     _, last_value = forward_apply(main_params, last_card_b, last_action_hist_b, last_action_mask_b)
     last_value = last_value.astype(jnp.float32)
     

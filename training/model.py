@@ -1,8 +1,8 @@
 """Transformer-based AlphaHoldem model for Toss or Hold'em.
 
 Architecture:
-- Card Encoder: (B, 8, 2) -> Embeddings -> Transformer -> (B, 8, 128)
-- Action Encoder: (B, 40, 7) -> Embeddings + Dense -> Transformer -> (B, 40, 128)
+- Card Encoder: (B, 9, 2) -> Embeddings -> Transformer -> (B, 9, 128)
+- Action Encoder: (B, 30, 7) -> Embeddings + Dense -> Transformer -> (B, 30, 128)
 - Cross-Attention Fusion: Learnable queries attend to concatenated context
 - Output Heads: Policy (13), Value (1)
 
@@ -24,7 +24,7 @@ NUM_ACTIONS = 13
 CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
 ACTION_SEQ_LEN = 40
 NUM_CARD_TYPES = 9
-CARD_INPUT_DIM = 2      # [dealer_id, card_index]
+CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
 EMB_DIM = 128
@@ -186,12 +186,12 @@ class CardEncoder(nn.Module):
     Input: (B, 9, 2) where each entry is [card_index, type_id]. 
     
     Position semantics:
-        0-1: Player's hole cards
-        2-3: Initial flop (community)
-        4: OOP player's discard (non-dealer discards first)
-        5: Dealer's discard
-        6: Turn
-        7: River
+        0-2: Hero's private cards
+        3-4: Flop (community)
+        5: Hero's discard
+        6: Villain's discard
+        7: Turn
+        8: River
     
     Output: (B, 9, emb_dim)
     """
@@ -425,7 +425,7 @@ class TossHoldemModel(nn.Module):
     ) -> Tuple[chex.Array, chex.Array]:
         """
         Args:
-            card_tensor: (B, 9, 2) int32 - [dealer_id, card_index]
+            card_tensor: (B, 9, 2) int32 - [card_index, type_id]
             action_tensor: (B, 40, 7) float32 - action history features
             action_mask: (B, 40) boolean - True for valid actions, False for padding
             
