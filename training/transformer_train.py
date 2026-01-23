@@ -7,8 +7,8 @@ This training script implements IMPALA-style training:
   4) K-Best self-play league training with ELO-based opponent selection
 
 Key architectural choices:
-  - Card tensor: (B, 9, 2) - card index + type embedding
-  - Action tensor: (B, 30, 7) - action history with context features
+  - Card tensor: (B, 9, 2) - [card_index, type_id] matching model.py CardEncoder
+  - Action tensor: (B, 40, 7) - action history matching model.py ActionEncoder
   - Transformer encoders with cross-attention fusion
   - Critic trained on PRIVATE cards (same info as actor)
 
@@ -61,8 +61,6 @@ from game import (
     PHASE_RIVER,
 )
 
-ACTION_INPUT_DIM = 18
-
 
 # =============================================================================
 # 1) Configuration
@@ -80,7 +78,7 @@ class Config:
     """
 
     # Parallel sampling
-    num_envs: int = 1_024  # 2,048 parallel environments (not 2^4=16)
+    num_envs: int = 1_024  # parallel environments
     rollout_len: int = 40
 
     # V-trace hyperparameters (IMPALA-style)
@@ -229,17 +227,17 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
 class AuxState:
     """Extra per-env state to build action history tensors.
 
-        Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (30, 7)
-        Each action entry contains:
-            [0] actor_id          int {0,1}
-            [1] event_type        int {0..12}
-            [2] street_id         int {0..4}
-            [3] time_id           int
-            [4] to_call           float
-            [5] pot_committed     float (chips already in middle)
-            [6] effective_stack   float
+    Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7)
+    Each action entry contains (matching model.py ActionEncoder):
+        [0] actor_id          int {0,1}
+        [1] event_type        int {0..12}
+        [2] street_id         int {0..4}
+        [3] time_id           int (monotonic action counter)
+        [4] to_call           float
+        [5] pot_committed     float (chips already in middle)
+        [6] effective_stack   float
     """
-    action_tensor: chex.Array  # (30, 18)
+    action_tensor: chex.Array  # (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7)
     action_ptr: chex.Array     # Current position in action history
     round_idx: chex.Array      # Current round index
     slot_idx: chex.Array       # Position within current round
@@ -269,47 +267,27 @@ def aux_maybe_advance_round(aux: AuxState, phase: chex.Array) -> AuxState:
 @jax.jit
 def aux_record_action(
     aux: AuxState,
-    player_id: chex.Array,
+    state: State,
     action: chex.Array,
-    pot: chex.Array,
-    legal_mask: chex.Array,
 ) -> AuxState:
     """Record an action into the action history tensor.
-    
-    Action tensor format (18 features):
-      [0]: player_id (0 or 1)
-      [1:14]: legal action mask (13 actions)
-      [14]: action taken (0-12)
-      [15]: pot size (normalized by stack)
-      [16]: round index (0-4)
-      [17]: position in round (0-5)
+
+    Uses make_action_token to build the 7-feature action entry matching model.py:
+      [0]: actor_id (0 or 1)
+      [1]: event_type (0-12)
+      [2]: street_id (0-4)
+      [3]: time_id (monotonic action counter)
+      [4]: to_call
+      [5]: pot_committed
+      [6]: effective_stack
     """
-    # Build the action entry
-    action_entry = jnp.zeros(ACTION_INPUT_DIM, dtype=jnp.float32)
-    
-    # Player ID
-    action_entry = action_entry.at[0].set(player_id.astype(jnp.float32))
-    
-    # Legal mask (13 actions)
-    action_entry = action_entry.at[1:14].set(legal_mask.astype(jnp.float32))
-    
-    # Action taken
-    action_entry = action_entry.at[14].set(action.astype(jnp.float32))
-    
-    # Pot (normalized by 2x stack for reasonable scale)
-    pot_normalized = pot.astype(jnp.float32) / (2.0 * STACK_SIZE)
-    action_entry = action_entry.at[15].set(pot_normalized)
-    
-    # Round index
-    action_entry = action_entry.at[16].set(aux.round_idx.astype(jnp.float32))
-    
-    # Position in round
-    action_entry = action_entry.at[17].set(aux.slot_idx.astype(jnp.float32))
-    
-    # Write to action tensor (circular buffer behavior if > 30 actions)
+    # Build the 7-feature action token using existing make_action_token
+    action_entry = make_action_token(state, action, aux.action_ptr)
+
+    # Write to action tensor (circular buffer behavior if > ACTION_SEQ_LEN actions)
     write_idx = aux.action_ptr % ACTION_SEQ_LEN
     action_tensor = aux.action_tensor.at[write_idx].set(action_entry)
-    
+
     return aux.replace(
         action_tensor=action_tensor,
         action_ptr=aux.action_ptr + 1,
@@ -319,82 +297,88 @@ def aux_record_action(
 
 @jax.jit
 def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
-    """Encode cards into (8, 2) tensor.
-    
-    Card positions:
-      0-1: Player's hole cards (active only)
-      2-3: Initial flop cards (board[0:2])
-      4-5: Discard cards (board[2:4]) - marked with dealer_id of who discarded
-      6: Turn card (board[4])
-      7: River card (board[5])
-    
-    Each card entry: [dealer_id, card_index]
-      - dealer_id: 0=non-dealer, 1=dealer, 2=community
-      - card_index: 0-51 (or -1 for undealt/invalid)
+    """Encode cards into (9, 2) tensor matching model.py CardEncoder format.
+
+    Output format: (CARD_SEQ_LEN, CARD_INPUT_DIM) = (9, 2)
+    Each card entry: [card_index, type_id]
+      - card_index: 0-51 valid cards, -1 for undealt/invalid
+      - type_id: 0-8 for slot type, -1 for invalid
+
+    Card positions (matching model.py):
+      0: heropriv0 (type_id=0)
+      1: heropriv1 (type_id=1)
+      2: heropriv2 (type_id=2)
+      3: flop0 (type_id=3)
+      4: flop1 (type_id=4)
+      5: herodiscard (type_id=5)
+      6: villaindiscard (type_id=6)
+      7: turn (type_id=7)
+      8: river (type_id=8)
     """
     is_p0 = player_id == 0
-    
-    # Get hole cards for the viewing player
-    hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)
-    active_mask = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)
-    
-    # Determine if viewing player is dealer (for hole card dealer_id)
-    viewer_is_dealer = jnp.where(is_p0, state.is_dealer_p0, ~state.is_dealer_p0)
-    
-    # OPTIMIZATION D4: Vectorize card tensor construction to avoid Python loops
+
+    # Get hole cards for the viewing player (hero)
+    hero_hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)  # (3,)
+    hero_active = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)  # (3,)
+
     # Initialize card tensor with -1 (invalid)
     card_tensor = jnp.full((CARD_SEQ_LEN, CARD_INPUT_DIM), -1, dtype=jnp.int32)
 
-    # Hole cards (positions 0-1): only active cards
-    # Get indices of active hole cards (up to 2)
-    active_indices = jnp.where(active_mask, jnp.arange(3), jnp.int32(-1))
-    # Sort to get valid indices first (use jnp.flip instead of [::-1] for JIT compatibility)
-    sorted_active = jnp.flip(jnp.sort(active_indices))[:2]
+    # Positions 0-2: Hero's private cards (all 3 hole cards)
+    # card_index = hole card value, type_id = position (0, 1, 2)
+    for i in range(3):
+        card_idx = jnp.where(hero_active[i], hero_hole[i], jnp.int32(-1))
+        type_id = jnp.where(hero_active[i], jnp.int32(i), jnp.int32(-1))
+        card_tensor = card_tensor.at[i, 0].set(card_idx)
+        card_tensor = card_tensor.at[i, 1].set(type_id)
 
-    # Vectorized hole card filling (positions 0-1)
-    valid_hole = sorted_active >= 0
-    # When valid_hole is False, sorted_active is -1, but jnp.where will discard the result anyway
-    card_vals_hole = jnp.where(valid_hole, hole[jnp.maximum(sorted_active, 0)], -1)
-    # dealer_id for hole cards: 1 if viewer is dealer, 0 if not
-    hole_dealer_id = jnp.where(viewer_is_dealer, jnp.int32(1), jnp.int32(0))
-    owners_hole = jnp.where(valid_hole, hole_dealer_id, -1)
-    card_tensor = card_tensor.at[0:2, 0].set(owners_hole)
-    card_tensor = card_tensor.at[0:2, 1].set(card_vals_hole)
+    # Positions 3-4: Flop cards (board[0:2])
+    # type_id = 3 for flop0, 4 for flop1
+    for i, board_idx in enumerate([0, 1]):
+        card_idx = state.board[board_idx]
+        valid = card_idx >= 0
+        type_id = jnp.where(valid, jnp.int32(3 + i), jnp.int32(-1))
+        card_tensor = card_tensor.at[3 + i, 0].set(card_idx)
+        card_tensor = card_tensor.at[3 + i, 1].set(type_id)
 
-    # Vectorized flop cards (positions 2-3): community cards
-    flop_cards = state.board[0:2]
-    valid_flop = flop_cards >= 0
-    owners_flop = jnp.where(valid_flop, 2, -1)  # 2 = community
-    card_tensor = card_tensor.at[2:4, 0].set(owners_flop)
-    card_tensor = card_tensor.at[2:4, 1].set(flop_cards)
-    
-    # Vectorized discard cards (positions 4-5): marked with who discarded
-    # board[2] = OOP discard (non-dealer discards first) -> dealer_id = 0
-    # board[3] = dealer discard -> dealer_id = 1
-    discard_cards = state.board[2:4]
-    discard_ids = jnp.array([0, 1], dtype=jnp.int32)  # 0=non-dealer, 1=dealer
-    valid_discards = discard_cards >= 0
-    owners_discards = jnp.where(valid_discards, discard_ids, -1)
-    card_tensor = card_tensor.at[4:6, 0].set(owners_discards)
-    card_tensor = card_tensor.at[4:6, 1].set(discard_cards)
+    # Position 5: Hero's discard (board[2] if hero is OOP, board[3] if hero is dealer)
+    # In Toss-or-Holdem: OOP discards first (board[2]), dealer discards second (board[3])
+    hero_is_dealer = jnp.where(is_p0, state.is_dealer_p0, jnp.logical_not(state.is_dealer_p0))
+    hero_discard_idx = jnp.where(hero_is_dealer, jnp.int32(3), jnp.int32(2))
+    hero_discard_card = state.board[hero_discard_idx]
+    valid_hero_discard = hero_discard_card >= 0
+    card_tensor = card_tensor.at[5, 0].set(hero_discard_card)
+    card_tensor = card_tensor.at[5, 1].set(jnp.where(valid_hero_discard, jnp.int32(5), jnp.int32(-1)))
 
-    # Vectorized turn and river (positions 6-7): community cards
-    turn_river = state.board[4:6]
-    valid_turn_river = turn_river >= 0
-    owners_turn_river = jnp.where(valid_turn_river, 2, -1)
-    card_tensor = card_tensor.at[6:8, 0].set(owners_turn_river)
-    card_tensor = card_tensor.at[6:8, 1].set(turn_river)
-    
+    # Position 6: Villain's discard (the other discard slot)
+    villain_discard_idx = jnp.where(hero_is_dealer, jnp.int32(2), jnp.int32(3))
+    villain_discard_card = state.board[villain_discard_idx]
+    valid_villain_discard = villain_discard_card >= 0
+    card_tensor = card_tensor.at[6, 0].set(villain_discard_card)
+    card_tensor = card_tensor.at[6, 1].set(jnp.where(valid_villain_discard, jnp.int32(6), jnp.int32(-1)))
+
+    # Position 7: Turn (board[4])
+    turn_card = state.board[4]
+    valid_turn = turn_card >= 0
+    card_tensor = card_tensor.at[7, 0].set(turn_card)
+    card_tensor = card_tensor.at[7, 1].set(jnp.where(valid_turn, jnp.int32(7), jnp.int32(-1)))
+
+    # Position 8: River (board[5])
+    river_card = state.board[5]
+    valid_river = river_card >= 0
+    card_tensor = card_tensor.at[8, 0].set(river_card)
+    card_tensor = card_tensor.at[8, 1].set(jnp.where(valid_river, jnp.int32(8), jnp.int32(-1)))
+
     return card_tensor
 
 
 @jax.jit
 def encode_actions(aux: AuxState, player_id: chex.Array) -> Tuple[chex.Array, chex.Array]:
-    """Encode action history into (30, 7) tensor with ego-relative player IDs.
+    """Encode action history into (ACTION_SEQ_LEN, ACTION_INPUT_DIM) tensor with ego-relative player IDs.
 
     Returns:
-        action_tensor: (30, 7) action history
-        action_mask: (30,) boolean mask for valid actions (pointer-based)
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7) action history
+        action_mask: (ACTION_SEQ_LEN,) = (40,) boolean mask for valid actions (pointer-based)
     """
     # Re-center circular buffer so the most recent action is at the end
     ptr = aux.action_ptr % ACTION_SEQ_LEN
@@ -429,12 +413,12 @@ def encode_obs(
     player_id: chex.Array,
 ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
     """Build card/action tensors + legal mask from state.
-    
+
     Returns:
-        card_tensor: (8, 2) int32
-        action_tensor: (30, 18) float32
-        action_mask: (30,) bool
-        legal_mask: (NUM_ACTIONS,) bool
+        card_tensor: (CARD_SEQ_LEN, CARD_INPUT_DIM) = (9, 2) int32
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7) float32
+        action_mask: (ACTION_SEQ_LEN,) = (40,) bool
+        legal_mask: (NUM_ACTIONS,) = (13,) bool
     """
     card_tensor = encode_cards(state, player_id)
     action_tensor, action_mask = encode_actions(aux, player_id)
@@ -456,8 +440,8 @@ class Unroll:
     across time steps. adv/ret are NOT stored - computed at training time.
     """
     card: chex.Array        # (T, E, 9, 2) int32 - card tensor
-    action_hist: chex.Array # (T, E, 30, 7) float32 - action history
-    action_mask: chex.Array # (T, E, 30) bool - action history mask
+    action_hist: chex.Array # (T, E, 40, 7) float32 - action history
+    action_mask: chex.Array # (T, E, 40) bool - action history mask
     legal: chex.Array       # (T, E, 13) bool - legal actions
     action: chex.Array      # (T, E) int32 - action taken
     logp_mu: chex.Array     # (T, E) float32 - log prob under BEHAVIOR policy
@@ -468,8 +452,8 @@ class Unroll:
     valid: chex.Array       # (T, E) bool - is this a learner turn
     # Bootstrap data for V-trace: observation of state AFTER last transition
     bootstrap_card: chex.Array        # (E, 9, 2) - card tensor for s_T
-    bootstrap_action_hist: chex.Array # (E, 30, 7) - action history for s_T
-    bootstrap_action_mask: chex.Array # (E, 30) - action mask for s_T
+    bootstrap_action_hist: chex.Array # (E, 40, 7) - action history for s_T
+    bootstrap_action_mask: chex.Array # (E, 40) - action mask for s_T
     bootstrap_done: chex.Array        # (E,) - whether last transition was terminal
 
 
@@ -481,8 +465,8 @@ class UnrollBuffer:
     This enables proper importance weight computation across time.
     """
     card: chex.Array        # (cap, T, E, 9, 2)
-    action_hist: chex.Array # (cap, T, E, 30, 7)
-    action_mask: chex.Array # (cap, T, E, 30)
+    action_hist: chex.Array # (cap, T, E, 40, 7)
+    action_mask: chex.Array # (cap, T, E, 40)
     legal: chex.Array       # (cap, T, E, 13)
     action: chex.Array      # (cap, T, E)
     logp_mu: chex.Array     # (cap, T, E) - behavior policy log prob
@@ -493,8 +477,8 @@ class UnrollBuffer:
     valid: chex.Array       # (cap, T, E)
     # Bootstrap data for V-trace
     bootstrap_card: chex.Array        # (cap, E, 9, 2)
-    bootstrap_action_hist: chex.Array # (cap, E, 30, 7)
-    bootstrap_action_mask: chex.Array # (cap, E, 30)
+    bootstrap_action_hist: chex.Array # (cap, E, 40, 7)
+    bootstrap_action_mask: chex.Array # (cap, E, 40)
     bootstrap_done: chex.Array        # (cap, E)
     ptr: chex.Array
     size: chex.Array
@@ -826,8 +810,8 @@ def forward_apply(
     Args:
         params: Model parameters
         card: (B, 9, 2) card tensor
-        action_hist: (B, 30, 7) action history
-        action_mask: (B, 30) action mask
+        action_hist: (B, 40, 7) action history
+        action_mask: (B, 40) action mask
 
     Returns:
         logits: (B, NUM_ACTIONS) action logits
@@ -998,7 +982,10 @@ def vtrace_loss_on_unroll(
         d = jnp.maximum(1.0, jnp.sum(w))
         return jnp.sum(x * w) / d
 
-    rho_exp = jnp.exp(logp_pi_flat - unroll.logp_mu.reshape(-1))
+    # Compute rho only on learner steps (where logp_mu is meaningful)
+    # On opponent steps, logp_mu=0 which would give misleading rho values
+    logp_mu_flat = unroll.logp_mu.reshape(-1)
+    rho_exp = jnp.where(valid_flat, jnp.exp(logp_pi_flat - logp_mu_flat), 1.0)
     rho_valid = jnp.where(valid_flat, rho_exp, 0.0)
 
     metrics = {
@@ -1353,8 +1340,7 @@ def collect_rollout(
         logp_mu = jnp.where(is_learner_turn, logp, jnp.float32(0.0))
 
         # Record action
-        pot_committed = s.pot + s.p0_bet + s.p1_bet
-        aux2 = jax.vmap(aux_record_action)(aux, pid_cur, action, pot_committed, legal_cur_b)
+        aux2 = jax.vmap(aux_record_action)(aux, s, action)
 
         # Step environment
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
@@ -1484,9 +1470,7 @@ def play_one_hand(
         params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
         # Use deterministic=True for stable ELO evaluation
         a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
-        pot_committed = s.pot + s.p0_bet + s.p1_bet
-        legal_mask = ENV.get_legal_actions(s)
-        aux2 = aux_record_action(aux, pid, a, pot_committed, legal_mask)
+        aux2 = aux_record_action(aux, s, a)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
         return (s2, aux2, key)
