@@ -22,8 +22,8 @@ import chex
 # =============================================================================
 
 NUM_ACTIONS = 13
-CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, herodiscard, villaindiscard, turn, river]
-ACTION_SEQ_LEN = 30
+CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
+ACTION_SEQ_LEN = 40
 NUM_CARD_TYPES = 9
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
@@ -103,30 +103,19 @@ class TransformerBlock(nn.Module):
             output: (B, S, D)
         """
         head_dim = self.emb_dim // self.num_heads
-
+        
         # Pre-norm self-attention
         residual = x
         x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
-        x = MultiHeadAttention(
-            num_heads=self.num_heads,
-            head_dim=head_dim,
-        )(x, x, x, mask)
+        x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
         x = residual + x
 
         # Pre-norm FFN
         residual = x
         x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
-        x = nn.Dense(
-            self.ffn_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(x)
+        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = nn.Dense(
-            self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(x)
+        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = residual + x
 
         return x
@@ -339,7 +328,6 @@ class CardEncoder(nn.Module):
 
         return card_repr, valid_mask
 
-
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
 
@@ -375,7 +363,7 @@ class ActionEncoder(nn.Module):
             action_mask: (B, 30) boolean mask where True = valid action
 
         Returns:
-            action_representation: (B, 30, emb_dim)
+            action_representation: (B, 40, emb_dim)
         """
         # === Extract components ===
         actor_id = action_tensor[..., 0].astype(jnp.int32)
@@ -422,7 +410,7 @@ class ActionEncoder(nn.Module):
         cont1 = jnp.log1p(to_call / pot_base_safe)
         cont2 = jnp.log1p(pot_base_safe)
         cont3 = jnp.log1p(eff_stack / pot_base_safe)
-        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 30, 3)
+        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 40, 3)
         continuous_emb = nn.Dense(
             32,  # Project continuous features to 32 dims
             dtype=jnp.bfloat16,
@@ -485,7 +473,7 @@ class TossHoldemModel(nn.Module):
         self,
         card_tensor: chex.Array,
         action_tensor: chex.Array,
-        action_mask: Optional[chex.Array] = None,
+        action_mask: chex.Array,
     ) -> Tuple[chex.Array, chex.Array]:
         """
         Args:
@@ -513,7 +501,7 @@ class TossHoldemModel(nn.Module):
             ffn_dim=self.ffn_dim,
             num_layers=self.num_layers,
         )(action_tensor, action_mask)  # (B, 30, 128)
-
+        
         # =================================================================
         # 2. Concatenate to form context
         # =================================================================
