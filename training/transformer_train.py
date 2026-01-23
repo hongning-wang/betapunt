@@ -105,7 +105,6 @@ class Config:
     recent_window_transitions: int = 2 * num_envs * rollout_len # Sample only from recent N transitions (0 = no limit)
 
     # League training (K-best self-play)
-    k_best: int = 5
     pool_max: int = 8
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
@@ -1936,7 +1935,7 @@ def main() -> None:
     ckpter = orbax.checkpoint.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(ts)
 
-    # Restore latest checkpoint if available
+    # Restore latest checkpoint if available (params only; fresh optimizer state)
     ckpt_steps = []
     for name in os.listdir(ckpt_dir):
         full = os.path.join(ckpt_dir, name)
@@ -1949,8 +1948,14 @@ def main() -> None:
     if ckpt_steps:
         latest_step = max(ckpt_steps)
         restore_path = os.path.join(ckpt_dir, f"step_{latest_step}")
-        ts = ckpter.restore(restore_path, item=ts)
-        print(f"Restored checkpoint from {restore_path}")
+        restored = ckpter.restore(restore_path)
+        restored_params = (
+            restored["params"]
+            if isinstance(restored, dict) and "params" in restored
+            else getattr(restored, "params", restored)
+        )
+        ts = ts.replace(params=restored_params)
+        print(f"Restored checkpoint params from {restore_path}")
 
     # Initialize pool with initial agent (compute style stats for diversity tracking)
     pool = pool_init(ts.params)

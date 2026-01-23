@@ -9,6 +9,7 @@ from skeleton.runner import parse_args, run_bot
 
 import os
 import random
+import traceback
 from typing import List, Optional, Tuple
 
 import torch
@@ -295,6 +296,7 @@ class Player(Bot):
                 print(f"Loaded model from {model_path}")
             except Exception as e:
                 print(f"Warning: Could not load model: {e}")
+                traceback.print_exc()
                 self.model = None
         else:
             print(f"Warning: Model file not found at {model_path}")
@@ -312,6 +314,7 @@ class Player(Bot):
             )
         except Exception as exc:
             print(f"Warning: Could not import exporter dependencies: {exc}")
+            traceback.print_exc()
             return False
 
         try:
@@ -330,6 +333,7 @@ class Player(Bot):
             return True
         except Exception as exc:
             print(f"Warning: Failed to export checkpoint: {exc}")
+            traceback.print_exc()
             return False
     
     def handle_new_round(self, game_state, round_state, active):
@@ -428,7 +432,7 @@ class Player(Bot):
         action_mask = action_mask.unsqueeze(0)
         
         # Build legal mask
-        legal_mask = self._build_legal_mask(round_state, legal_actions)
+        legal_mask = self._build_legal_mask(round_state, legal_actions, active)
         legal_mask = legal_mask.unsqueeze(0)
         
         # Get model prediction
@@ -439,19 +443,20 @@ class Player(Bot):
             action_idx = torch.argmax(probs, dim=-1).item()
         
         # Convert to skeleton action
-        skeleton_action = self._model_action_to_skeleton(action_idx, round_state, legal_actions)
+        skeleton_action = self._model_action_to_skeleton(action_idx, round_state, legal_actions, active)
         
         # Record the action
         self._record_my_action(round_state, active, action_idx)
         
         return skeleton_action
     
-    def _build_legal_mask(self, round_state, legal_actions) -> torch.Tensor:
+    def _build_legal_mask(self, round_state, legal_actions, active: int) -> torch.Tensor:
         """Build legal action mask for betting."""
         mask = torch.zeros(NUM_ACTIONS, dtype=torch.bool)
+        to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
         
         # Basic actions
-        if FoldAction in legal_actions:
+        if FoldAction in legal_actions and to_call > 0:
             mask[ACT_FOLD] = True
         if CheckAction in legal_actions:
             mask[ACT_CHECK] = True
@@ -491,12 +496,13 @@ class Player(Bot):
         
         return mask
     
-    def _model_action_to_skeleton(self, action_idx: int, round_state, legal_actions):
+    def _model_action_to_skeleton(self, action_idx: int, round_state, legal_actions, active: int):
         """Convert model action index to skeleton action."""
         if action_idx == ACT_FOLD:
-            if FoldAction in legal_actions:
+            to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+            if FoldAction in legal_actions and to_call > 0:
                 return FoldAction()
-            return CallAction() if CallAction in legal_actions else CheckAction()
+            return CheckAction() if CheckAction in legal_actions else CallAction()
         
         elif action_idx == ACT_CHECK:
             if CheckAction in legal_actions:
@@ -537,13 +543,6 @@ class Player(Bot):
             amount = max(min_raise, min(amount, max_raise))
             return RaiseAction(amount)
         
-        # Fallback
-        if CheckAction in legal_actions:
-            return CheckAction()
-        elif CallAction in legal_actions:
-            return CallAction()
-        else:
-            return FoldAction()
     
     def _record_my_action(self, round_state, active, action_idx: int):
         """Record our action in the history."""
@@ -570,17 +569,10 @@ class Player(Bot):
     
     def _fallback_action(self, round_state, legal_actions):
         """Fallback action when model is not available."""
-        if CheckAction in legal_actions:
-            return CheckAction()
-        if CallAction in legal_actions:
-            if random.random() < 0.25:
-                return FoldAction()
-            return CallAction()
-        if RaiseAction in legal_actions:
-            min_raise, max_raise = round_state.raise_bounds()
-            return RaiseAction(min_raise)
-        return FoldAction()
-
+        raise RuntimeError(
+            "Model unavailable; refusing to take fallback action. "
+            "Check model load/export logs for the root cause."
+        )
 
 if __name__ == '__main__':
     run_bot(Player(), parse_args())
