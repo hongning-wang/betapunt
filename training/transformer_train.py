@@ -78,8 +78,8 @@ class Config:
     """
 
     # Parallel sampling
-    num_envs: int = 2_048  # 2,048 parallel environments (not 2^4=16)
-    rollout_len: int = 64
+    num_envs: int = 1_024  # 2,048 parallel environments (not 2^4=16)
+    rollout_len: int = 40
 
     # V-trace hyperparameters (IMPALA-style)
     gamma: float = 0.999
@@ -109,7 +109,7 @@ class Config:
     warmup_steps: int = 100_000  # Shorter warmup (in transitions)
 
     # Short replay window (key for V-trace) - only sample from recent data
-    recent_window_transitions: int = 50_000  # Sample only from recent N transitions (0 = no limit)
+    recent_window_transitions: int = 80_000  # Sample only from recent N transitions (0 = no limit)
 
     # League training (K-best self-play)
     k_best: int = 5
