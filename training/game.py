@@ -1,8 +1,6 @@
 import jax
 import jax.numpy as jnp
 import chex
-import itertools
-from training.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards
 
 
 # --- 1. CONFIGURATION & CONSTANTS ---
