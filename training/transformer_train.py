@@ -9,7 +9,7 @@ AlphaHoldem's training methodology:
 
 Key changes from original AlphaHoldem:
   - Card tensor: (B, 8, 2) instead of (B, 4, 13, 7)
-  - Action tensor: (B, 30, 18) instead of (B, 4, 13, 30)
+    - Action tensor: (B, 30, 7) instead of (B, 4, 13, 30)
   - Transformer encoders instead of ConvNets
   - Cross-attention fusion instead of element-wise addition
 """
@@ -55,6 +55,7 @@ from game import (
     PHASE_FLOP,
     PHASE_TURN,
     PHASE_RIVER,
+    PHASE_SHOWDOWN,
 )
 
 
@@ -142,20 +143,77 @@ def _phase_to_round_idx(phase: chex.Array) -> chex.Array:
     ).astype(jnp.int32)
 
 
+STREET_PREFLOP = 0
+STREET_DISCARD = 1
+STREET_FLOP = 2
+STREET_TURN = 3
+STREET_RIVER = 4
+
+
+@jax.jit
+def phase_to_street(phase: chex.Array) -> chex.Array:
+    """Map engine phases to 5 street ids used in action history."""
+    return jax.lax.switch(
+        phase,
+        [
+            lambda: jnp.int32(STREET_PREFLOP),  # PHASE_PREFLOP
+            lambda: jnp.int32(STREET_DISCARD),  # PHASE_DISCARD_OOP
+            lambda: jnp.int32(STREET_DISCARD),  # PHASE_DISCARD_DLR
+            lambda: jnp.int32(STREET_FLOP),     # PHASE_FLOP
+            lambda: jnp.int32(STREET_TURN),     # PHASE_TURN
+            lambda: jnp.int32(STREET_RIVER),    # PHASE_RIVER
+            lambda: jnp.int32(STREET_RIVER),    # PHASE_SHOWDOWN (unused)
+        ],
+    )
+
+
+@jax.jit
+def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> chex.Array:
+    """Build a 7-field action token from the current state and action."""
+    is_p0 = state.current_player == 0
+
+    cur_stack = jnp.where(is_p0, state.p0_stack, state.p1_stack).astype(jnp.float32)
+    cur_bet = jnp.where(is_p0, state.p0_bet, state.p1_bet).astype(jnp.float32)
+    opp_stack = jnp.where(is_p0, state.p1_stack, state.p0_stack).astype(jnp.float32)
+    opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet).astype(jnp.float32)
+
+    to_call = (opp_bet - cur_bet).astype(jnp.float32)
+    pot_base = (state.pot + state.p0_bet + state.p1_bet).astype(jnp.float32) + to_call
+
+    eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
+
+    street_id = phase_to_street(state.phase).astype(jnp.float32)
+
+    token = jnp.array(
+        [
+            state.current_player.astype(jnp.float32),
+            action.astype(jnp.float32),
+            street_id,
+            time_id.astype(jnp.float32),
+            to_call,
+            pot_base,
+            eff_cap,
+        ],
+        dtype=jnp.float32,
+    )
+    return token
+
+
 @chex.dataclass(frozen=True)
 class AuxState:
     """Extra per-env state to build action history tensors.
     
-    Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (30, 18)
-    Each action entry contains:
-      - player_id (1): which player took the action
-      - legal_mask (13): which actions were legal
-      - action_done (1): index of action taken
-      - pot (1): pot size at that moment
-      - round (1): which betting round (0-4)
-      - pos_in_round (1): position within the round (0-5)
+        Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (30, 7)
+        Each action entry contains:
+            [0] actor_id          int {0,1}
+            [1] event_type        int {0..12}
+            [2] street_id         int {0..4}
+            [3] time_id           int
+            [4] to_call           float
+            [5] pot_base          float
+            [6] effective_stack   float
     """
-    action_tensor: chex.Array  # (30, 18)
+    action_tensor: chex.Array  # (30, 7)
     action_ptr: chex.Array     # Current position in action history
     round_idx: chex.Array      # Current round index
     slot_idx: chex.Array       # Position within current round
@@ -185,42 +243,14 @@ def aux_maybe_advance_round(aux: AuxState, phase: chex.Array) -> AuxState:
 @jax.jit
 def aux_record_action(
     aux: AuxState,
-    player_id: chex.Array,
+    state: State,
     action: chex.Array,
-    pot: chex.Array,
-    legal_mask: chex.Array,
 ) -> AuxState:
     """Record an action into the action history tensor.
-    
-    Action tensor format (18 features):
-      [0]: player_id (0 or 1)
-      [1:14]: legal action mask (13 actions)
-      [14]: action taken (0-12)
-      [15]: pot size (normalized by stack)
-      [16]: round index (0-4)
-      [17]: position in round (0-5)
     """
-    # Build the action entry
-    action_entry = jnp.zeros(ACTION_INPUT_DIM, dtype=jnp.float32)
-    
-    # Player ID
-    action_entry = action_entry.at[0].set(player_id.astype(jnp.float32))
-    
-    # Legal mask (13 actions)
-    action_entry = action_entry.at[1:14].set(legal_mask.astype(jnp.float32))
-    
-    # Action taken
-    action_entry = action_entry.at[14].set(action.astype(jnp.float32))
-    
-    # Pot (normalized by 2x stack for reasonable scale)
-    pot_normalized = pot.astype(jnp.float32) / (2.0 * STACK_SIZE)
-    action_entry = action_entry.at[15].set(pot_normalized)
-    
-    # Round index
-    action_entry = action_entry.at[16].set(aux.round_idx.astype(jnp.float32))
-    
-    # Position in round
-    action_entry = action_entry.at[17].set(aux.slot_idx.astype(jnp.float32))
+
+    time_id = aux.action_ptr.astype(jnp.int32)
+    action_entry = make_action_token(state, action, time_id)
     
     # Write to action tensor (circular buffer behavior if > 30 actions)
     write_idx = aux.action_ptr % ACTION_SEQ_LEN
@@ -301,16 +331,16 @@ def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
 
 @jax.jit
 def encode_actions(aux: AuxState, player_id: chex.Array) -> Tuple[chex.Array, chex.Array]:
-    """Encode action history into (30, 18) tensor with ego-relative player IDs.
+    """Encode action history into (30, 7) tensor with ego-relative player IDs.
     
     Returns:
-        action_tensor: (30, 18) action history
+        action_tensor: (30, 7) action history
         action_mask: (30,) boolean mask for valid actions
     """
     action_tensor = aux.action_tensor
     
     # Make player IDs ego-relative (0 = self, 1 = opponent)
-    # Original: player_id in action_tensor[..., 0]
+    # Original: actor_id in action_tensor[..., 0]
     # If we're player 0: keep as-is (0=self, 1=opp)
     # If we're player 1: swap (0->1, 1->0)
     def swap_player_ids(tensor, pid):
@@ -339,7 +369,7 @@ def encode_obs(
     
     Returns:
         card_tensor: (8, 2) int32
-        action_tensor: (30, 18) float32
+        action_tensor: (30, 7) float32
         action_mask: (30,) bool
         legal_mask: (NUM_ACTIONS,) bool
     """
@@ -359,10 +389,10 @@ def encode_obs(
 class Transition:
     """Single transition for training."""
     card: chex.Array        # (8, 2) int32 - card tensor
-    action_hist: chex.Array # (30, 18) float32 - action history
+    action_hist: chex.Array # (30, 7) float32 - action history
     action_mask: chex.Array # (30,) bool - action history mask
     card_v: chex.Array      # (8, 2) - critic view cards
-    action_hist_v: chex.Array  # (30, 18) - critic view actions
+    action_hist_v: chex.Array  # (30, 7) - critic view actions
     action_mask_v: chex.Array  # (30,) - critic view action mask
     legal: chex.Array       # (13,) bool - legal actions
     action: chex.Array      # int32 - action taken
@@ -380,7 +410,7 @@ class Transition:
 class ReplayBuffer:
     """Off-policy replay buffer with fixed capacity."""
     card: chex.Array        # (cap, 8, 2)
-    action_hist: chex.Array # (cap, 30, 18)
+    action_hist: chex.Array # (cap, 30, 7)
     action_mask: chex.Array # (cap, 30)
     card_v: chex.Array
     action_hist_v: chex.Array
@@ -1072,10 +1102,7 @@ def collect_rollout(
         logp_old = jnp.where(is_learner_turn, logp, jnp.float32(0.0))
         
         # Record action
-        pot = s.pot + s.p0_bet + s.p1_bet
-        aux2 = jax.vmap(aux_record_action)(
-            aux, s.current_player.astype(jnp.int32), action, pot, legal_a_b
-        )
+        aux2 = jax.vmap(aux_record_action)(aux, s, action)
         
         # Step environment
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
@@ -1217,9 +1244,7 @@ def play_one_hand(
         pid = s.current_player.astype(jnp.int32)
         params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
         a, _, _, key = policy_act(params, s, aux, key)
-        legal = ENV.get_legal_actions(s)
-        pot = s.pot + s.p0_bet + s.p1_bet
-        aux2 = aux_record_action(aux, pid, a, pot, legal)
+        aux2 = aux_record_action(aux, s, a)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
         return (s2, aux2, key)
