@@ -563,4 +563,4 @@ def count_parameters(params: dict) -> int:
     Returns:
         Total number of parameters
     """
-    return sum(x.size for x in jax.tree_util.tree_leaves(params))
+    return sum(x.size for x in jax.tree_util.tree_leaves(params)) 
