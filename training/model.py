@@ -39,8 +39,6 @@ PROCESSING_DIM = 256
 # =============================================================================
 
 class MultiHeadAttention(nn.Module):
-    """Multi-head attention with optional masking."""
-    
     num_heads: int
     head_dim: int
     
@@ -52,75 +50,30 @@ class MultiHeadAttention(nn.Module):
         value: chex.Array,
         mask: Optional[chex.Array] = None,
     ) -> chex.Array:
-        """
-        Args:
-            query: (B, Q, D)
-            key: (B, K, D)
-            value: (B, K, D)
-            mask: (B, K) boolean mask where True = valid, False = padding
-            
-        Returns:
-            output: (B, Q, D)
-        """
-        batch_size = query.shape[0]
-        q_len = query.shape[1]
+        batch_size, q_len, input_dim = query.shape
         kv_len = key.shape[1]
+        projection_dim = self.num_heads * self.head_dim
         
-        # Project to multi-head
-        q = nn.Dense(
-            self.num_heads * self.head_dim,
-            use_bias=False,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(query)
-        k = nn.Dense(
-            self.num_heads * self.head_dim,
-            use_bias=False,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(key)
-        v = nn.Dense(
-            self.num_heads * self.head_dim,
-            use_bias=False,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(value)
+        q = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(query)
+        k = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(key)
+        v = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(value)
         
-        # Reshape to (B, num_heads, seq_len, head_dim)
-        q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim)
-        q = q.transpose(0, 2, 1, 3)  # (B, H, Q, D)
+        q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         
-        k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
-        k = k.transpose(0, 2, 1, 3)  # (B, H, K, D)
-        
-        v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
-        v = v.transpose(0, 2, 1, 3)  # (B, H, K, D)
-        
-        # Scaled dot-product attention
-        scale = jnp.sqrt(self.head_dim).astype(q.dtype)
+        scale = jnp.sqrt(jnp.float32(self.head_dim))
         attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) / scale
         
-        # Apply mask if provided
         if mask is not None:
-            # mask: (B, K) -> (B, 1, 1, K)
             mask = mask[:, None, None, :]
             attn_weights = jnp.where(mask, attn_weights, jnp.finfo(jnp.bfloat16).min)
         
         attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        
-        # Apply attention to values
         attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
         
-        # Reshape back to (B, Q, num_heads * head_dim)
-        attn_output = attn_output.transpose(0, 2, 1, 3)
-        attn_output = attn_output.reshape(batch_size, q_len, self.num_heads * self.head_dim)
-        
-        # Output projection
-        output = nn.Dense(
-            self.num_heads * self.head_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(attn_output)
+        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, q_len, projection_dim)
+        output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(attn_output)
         
         return output
 
