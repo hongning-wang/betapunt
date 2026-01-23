@@ -232,7 +232,13 @@ def _assert_card_tensor(card_tensor: chex.Array) -> None:
 
     card[...,0] in {-1} ∪ [0, 51]
     card[...,1] in {-1} ∪ [0, 8]
+    
+    Note: This function is designed to be jittable. Assertions only execute
+    when JAX debug mode is enabled via JAX_DEBUG_NANS or JAX_DISABLE_JIT.
     """
+    if not CFG.debug_asserts:
+        return
+        
     card_idx = card_tensor[..., 0]
     type_id = card_tensor[..., 1]
 
@@ -244,7 +250,14 @@ def _assert_card_tensor(card_tensor: chex.Array) -> None:
 
 
 def _assert_legal_action(legal_mask: chex.Array, action: chex.Array) -> None:
-    """Sanity check: sampled action must be legal."""
+    """Sanity check: sampled action must be legal.
+    
+    Note: This function is designed to be jittable. Assertions only execute
+    when JAX debug mode is enabled via JAX_DEBUG_NANS or JAX_DISABLE_JIT.
+    """
+    if not CFG.debug_asserts:
+        return
+        
     chosen = jnp.take_along_axis(legal_mask, action[:, None], axis=-1)[:, 0]
     jax_debug.assert_(jnp.all(chosen), "Sampled illegal action")
 
@@ -1304,9 +1317,9 @@ def collect_rollout(
         card_b, action_hist_b, action_mask_b, legal_b = jax.vmap(encode_obs)(
             s, aux, learner_pid
         )
-        # Optional debug assertions (disable for performance)
-        if CFG.debug_asserts:
-            _assert_card_tensor(card_b)
+        # Debug assertions are jittable and become no-ops in production mode
+        # Removed Python if statement for better jittability
+        _assert_card_tensor(card_b)
 
         # For action selection, we need current player's perspective
         pid_cur = s.current_player.astype(jnp.int32)
@@ -1344,9 +1357,9 @@ def collect_rollout(
         neg_inf = -1e9
         masked_logits = jnp.where(legal_cur_b, logits, neg_inf)
         action = jnp.argmax(masked_logits + g, axis=-1).astype(jnp.int32)
-        # Optional debug assertions (disable for performance)
-        if CFG.debug_asserts:
-            _assert_legal_action(legal_cur_b, action)
+        # Debug assertions are jittable and become no-ops in production mode
+        # Removed Python if statement for better jittability
+        _assert_legal_action(legal_cur_b, action)
 
         # Compute behavior policy log prob (logp_mu) - only meaningful on learner turns
         # For non-learner turns, we store 0 and mask later
