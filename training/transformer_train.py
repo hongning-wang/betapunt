@@ -169,7 +169,10 @@ def phase_to_street(phase: chex.Array) -> chex.Array:
 
 @jax.jit
 def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> chex.Array:
-    """Build a 7-field action token from the current state and action."""
+    """Build a 7-field action token from the current state and action.
+
+    time_id is per-street (slot index within the current round).
+    """
     is_p0 = state.current_player == 0
 
     cur_stack = jnp.where(is_p0, state.p0_stack, state.p1_stack).astype(jnp.float32)
@@ -249,7 +252,7 @@ def aux_record_action(
     """Record an action into the action history tensor.
     """
 
-    time_id = aux.action_ptr.astype(jnp.int32)
+    time_id = aux.slot_idx.astype(jnp.int32)
     action_entry = make_action_token(state, action, time_id)
     
     # Write to action tensor (circular buffer behavior if > 30 actions)
