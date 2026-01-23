@@ -104,8 +104,8 @@ class Config:
     # Note: Actual capacity is max(16, replay_capacity // (rollout_len * num_envs)) unrolls
     # With default settings: max(16, 500k // 262k) = 16 unrolls ≈ 4.2M transitions
     replay_capacity: int = 200_000  # Target transition capacity (see note above)
-    num_minibatches: int = 8  # More minibatches for more gradient steps
-    update_epochs: int = 2  # Multiple epochs safe with V-trace importance weighting
+    num_minibatches: int = 4 # More minibatches for more gradient steps
+    update_epochs: int = 1  # Multiple epochs safe with V-trace importance weighting
     warmup_steps: int = 100_000  # Shorter warmup (in transitions)
 
     # Short replay window (key for V-trace) - only sample from recent data
