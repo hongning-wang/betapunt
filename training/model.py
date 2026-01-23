@@ -23,7 +23,7 @@ import chex
 
 NUM_ACTIONS = 13
 CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
-ACTION_SEQ_LEN = 40
+ACTION_SEQ_LEN = 32
 NUM_CARD_TYPES = 9
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
@@ -57,9 +57,13 @@ class MultiHeadAttention(nn.Module):
         kv_len = key.shape[1]
         projection_dim = self.num_heads * self.head_dim
 
-        q = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(query)
-        k = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(key)
-        v = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(value)
+        query = query.astype(jnp.bfloat16)
+        key = key.astype(jnp.bfloat16)
+        value = value.astype(jnp.bfloat16)
+
+        q = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(query)
+        k = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(key)
+        v = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(value)
 
         q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
@@ -76,7 +80,7 @@ class MultiHeadAttention(nn.Module):
         attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, q_len, projection_dim)
-        output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.float32)(attn_output)
+        output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(attn_output)
 
         return output
 
@@ -102,20 +106,21 @@ class TransformerBlock(nn.Module):
         Returns:
             output: (B, S, D)
         """
+        x = x.astype(jnp.bfloat16)
         head_dim = self.emb_dim // self.num_heads
         
         # Pre-norm self-attention
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
         x = residual + x
 
         # Pre-norm FFN
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
-        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = nn.gelu(x)
-        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = residual + x
 
         return x
@@ -143,6 +148,8 @@ class TransformerEncoder(nn.Module):
         Returns:
             output: (B, S, D)
         """
+        x = x.astype(jnp.bfloat16)
+
         # Use explicit layer names for better jittability
         for layer_idx in range(self.num_layers):
             x = TransformerBlock(
@@ -153,7 +160,7 @@ class TransformerEncoder(nn.Module):
             )(x, mask)
 
         # Final layer norm
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
 
         return x
 
@@ -181,11 +188,13 @@ class CrossAttentionBlock(nn.Module):
         Returns:
             output: (B, Q, D)
         """
+        query_tokens = query_tokens.astype(jnp.bfloat16)
+        context = context.astype(jnp.bfloat16)
         head_dim = self.emb_dim // self.num_heads
 
         # === Cross-Attention Sub-block ===
-        attn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(query_tokens)
-        context_normed = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(context)
+        attn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(query_tokens)
+        context_normed = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(context)
 
         attn_output = MultiHeadAttention(
             num_heads=self.num_heads,
@@ -195,19 +204,19 @@ class CrossAttentionBlock(nn.Module):
         post_attn = query_tokens + attn_output
 
         # === FFN Sub-block ===
-        ffn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(post_attn)
+        ffn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(post_attn)
 
         ffn_hidden = nn.Dense(
             self.ffn_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(ffn_input)
         ffn_hidden = nn.gelu(ffn_hidden)
 
         ffn_out = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(ffn_hidden)
 
         output = post_attn + ffn_out
@@ -303,21 +312,21 @@ class CardEncoder(nn.Module):
             num_embeddings=14,  # 13 ranks + invalid
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(rank_safe)  # (B, 9, component_emb_dim)
 
         suit_emb = nn.Embed(
             num_embeddings=5,   # 4 suits + invalid
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(suit_safe)  # (B, 9, component_emb_dim)
 
         type_emb = nn.Embed(
             num_embeddings=NUM_CARD_TYPES + 1,  # 9 types + invalid
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(type_safe)  # (B, 9, component_emb_dim)
 
         # Concatenate and project to emb_dim
@@ -325,7 +334,7 @@ class CardEncoder(nn.Module):
         card_repr = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(concat)  # (B, 9, emb_dim)
 
         return card_repr, valid_mask
@@ -367,6 +376,8 @@ class ActionEncoder(nn.Module):
         Returns:
             action_representation: (B, 40, emb_dim)
         """
+        action_tensor = action_tensor.astype(jnp.bfloat16)
+
         # === Extract components ===
         actor_id = action_tensor[..., 0].astype(jnp.int32)
         event_type = action_tensor[..., 1].astype(jnp.int32)
@@ -381,21 +392,21 @@ class ActionEncoder(nn.Module):
             num_embeddings=2,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(actor_id)  # (B, 30, component_emb_dim)
 
         event_emb = nn.Embed(
             num_embeddings=13,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(event_type)  # (B, 30, component_emb_dim)
 
         street_emb = nn.Embed(
             num_embeddings=5,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(street_id)  # (B, 30, component_emb_dim)
 
         time_mod = jnp.mod(time_id, jnp.int32(ACTION_SEQ_LEN))
@@ -403,11 +414,11 @@ class ActionEncoder(nn.Module):
             num_embeddings=ACTION_SEQ_LEN,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(time_mod)  # (B, 30, component_emb_dim)
 
         # === Continuous Features Projection ===
-        eps = jnp.float32(1e-6)
+        eps = jnp.bfloat16(1e-6)
         pot_base_safe = jnp.maximum(pot_base, eps)
         cont1 = jnp.log1p(to_call / pot_base_safe)
         cont2 = jnp.log1p(pot_base_safe)
@@ -416,8 +427,8 @@ class ActionEncoder(nn.Module):
         continuous_emb = nn.Dense(
             32,  # Project continuous features to 32 dims
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(continuous.astype(jnp.float32))  # (B, 30, 32)
+            param_dtype=jnp.bfloat16,
+        )(continuous)  # (B, 30, 32)
 
         # === CONCATENATE all embeddings (not add) ===
         concat = jnp.concatenate(
@@ -429,7 +440,7 @@ class ActionEncoder(nn.Module):
         combined = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(concat)  # (B, 30, emb_dim)
 
         # === Transformer ===
@@ -488,6 +499,7 @@ class TossHoldemModel(nn.Module):
             value: (B,) - estimated state value
         """
         batch_size = card_tensor.shape[0]
+        action_tensor = action_tensor.astype(jnp.bfloat16)
 
         # =================================================================
         # 1. Encode cards and actions
@@ -528,6 +540,7 @@ class TossHoldemModel(nn.Module):
             'query_tokens',
             nn.initializers.normal(stddev=0.02),
             (self.num_query_tokens, self.emb_dim),
+            jnp.bfloat16,
         )
 
         # Broadcast to batch dimension: (Q, D) -> (B, Q, D)
@@ -547,7 +560,7 @@ class TossHoldemModel(nn.Module):
             )(fused, context, context_mask)  # (B, 6, 128)
 
         # Final layer norm after cross-attention
-        fused = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(fused)
+        fused = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(fused)
 
         # =================================================================
         # 4. Processing MLP
@@ -560,7 +573,7 @@ class TossHoldemModel(nn.Module):
         processed = nn.Dense(
             512,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(flat)
         processed = nn.relu(processed)
 
@@ -568,7 +581,7 @@ class TossHoldemModel(nn.Module):
         processed = nn.Dense(
             self.processing_dim,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
         )(processed)
         processed = nn.relu(processed)
 
@@ -580,14 +593,14 @@ class TossHoldemModel(nn.Module):
         policy_hidden = nn.Dense(
             128,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
             name='policy_hidden',
         )(processed)
         policy_hidden = nn.relu(policy_hidden)
         policy_logits = nn.Dense(
             self.num_actions,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
             name='policy_out',
         )(policy_hidden)
 
@@ -597,14 +610,14 @@ class TossHoldemModel(nn.Module):
         value_hidden = nn.Dense(
             128,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
             name='value_hidden',
         )(value_input)
         value_hidden = nn.relu(value_hidden)
         value = nn.Dense(
             1,
             dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
+            param_dtype=jnp.bfloat16,
             name='value_out',
         )(value_hidden)
         value = value.squeeze(-1)
@@ -670,7 +683,7 @@ def init_model(key: chex.PRNGKey) -> Tuple[TossHoldemModel, dict]:
 
     # Create dummy inputs for initialization
     dummy_cards = jnp.zeros((1, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32)
-    dummy_actions = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32)
+    dummy_actions = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.bfloat16)
     dummy_action_mask = jnp.ones((1, ACTION_SEQ_LEN), dtype=jnp.bool_)
 
     params = model.init(key, dummy_cards, dummy_actions, dummy_action_mask)
