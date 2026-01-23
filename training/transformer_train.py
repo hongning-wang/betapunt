@@ -61,6 +61,8 @@ from game import (
     PHASE_RIVER,
 )
 
+ACTION_INPUT_DIM = 18
+
 
 # =============================================================================
 # 1) Configuration
@@ -1352,7 +1354,7 @@ def collect_rollout(
 
         # Record action
         pot_committed = s.pot + s.p0_bet + s.p1_bet
-        aux2 = jax.vmap(aux_record_action)(aux, s, action, pot_committed, legal_cur_b)
+        aux2 = jax.vmap(aux_record_action)(aux, pid_cur, action, pot_committed, legal_cur_b)
 
         # Step environment
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
@@ -1484,7 +1486,7 @@ def play_one_hand(
         a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
         pot_committed = s.pot + s.p0_bet + s.p1_bet
         legal_mask = ENV.get_legal_actions(s)
-        aux2 = aux_record_action(aux, s, a, pot_committed, legal_mask)
+        aux2 = aux_record_action(aux, pid, a, pot_committed, legal_mask)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
         return (s2, aux2, key)
