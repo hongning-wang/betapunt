@@ -28,8 +28,8 @@ NUM_CARD_TYPES = 9
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
-EMB_DIM = 128
-NUM_HEADS = 4
+EMB_DIM = 256
+NUM_HEADS = 2
 FFN_DIM = 512
 NUM_TRANSFORMER_LAYERS = 2
 NUM_CROSS_ATTENTION_LAYERS = 2
