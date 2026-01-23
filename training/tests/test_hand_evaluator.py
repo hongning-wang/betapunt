@@ -8,7 +8,7 @@ import pkrbot
 import itertools
 
 # from training.game import evaluate_best_hand
-from training.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards_batch
+from training.hand_evaluator.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards_batch
 
 
 _RANKS = "23456789TJQKA"

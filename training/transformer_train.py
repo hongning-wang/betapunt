@@ -27,7 +27,6 @@ from functools import partial
 import os
 from typing import Any, Dict, Tuple
 
-import numpy as np
 import chex
 import distrax
 import flax.linen as nn
