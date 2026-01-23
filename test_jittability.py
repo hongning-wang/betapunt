@@ -129,12 +129,14 @@ def test_jit_patterns():
     print("  ✓ Static argument pattern works")
     
     # Test 3: Verify assertion pattern
+    DEBUG_ENABLED = False  # Compile-time constant for debug mode
+    
     @jax.jit
     def with_assertion(x):
-        # This pattern is OK: early return in function
-        if not True:  # Static check
+        # This pattern is OK: early return based on compile-time constant
+        if not DEBUG_ENABLED:
             return x
-        # Do computation
+        # Do computation with debug checks
         jax.debug.callback(lambda: None)  # Simulate assertion
         return x * 2
     

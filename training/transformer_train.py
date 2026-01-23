@@ -233,8 +233,8 @@ def _assert_card_tensor(card_tensor: chex.Array) -> None:
     card[...,0] in {-1} ∪ [0, 51]
     card[...,1] in {-1} ∪ [0, 8]
     
-    Note: This function is designed to be jittable. Assertions only execute
-    when JAX debug mode is enabled via JAX_DEBUG_NANS or JAX_DISABLE_JIT.
+    Note: This function is designed to be jittable. When CFG.debug_asserts is False,
+    this function returns early before any assertions are evaluated.
     """
     if not CFG.debug_asserts:
         return
@@ -252,8 +252,8 @@ def _assert_card_tensor(card_tensor: chex.Array) -> None:
 def _assert_legal_action(legal_mask: chex.Array, action: chex.Array) -> None:
     """Sanity check: sampled action must be legal.
     
-    Note: This function is designed to be jittable. Assertions only execute
-    when JAX debug mode is enabled via JAX_DEBUG_NANS or JAX_DISABLE_JIT.
+    Note: This function is designed to be jittable. When CFG.debug_asserts is False,
+    this function returns early before any assertions are evaluated.
     """
     if not CFG.debug_asserts:
         return
