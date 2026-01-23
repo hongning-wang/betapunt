@@ -121,7 +121,6 @@ class Config:
     # Runtime
     seed: int = 0
     total_updates: int = 20_000
-    debug_asserts: bool = False  # Enable expensive assertions (for debugging only)
 
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
@@ -222,40 +221,6 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
     )
     return token
 
-
-def _assert_card_tensor(card_tensor: chex.Array) -> None:
-    """Sanity check card tensor contract.
-
-    card[...,0] in {-1} ∪ [0, 51]
-    card[...,1] in {-1} ∪ [0, 8]
-    
-    Note: This function is designed to be jittable. When CFG.debug_asserts is False,
-    this function returns early before any assertions are evaluated.
-    """
-    if not CFG.debug_asserts:
-        return
-        
-    card_idx = card_tensor[..., 0]
-    type_id = card_tensor[..., 1]
-
-    ok_idx = (card_idx == -1) | ((card_idx >= 0) & (card_idx <= 51))
-    ok_type = (type_id == -1) | ((type_id >= 0) & (type_id <= 8))
-
-    jax_debug.assert_(jnp.all(ok_idx), "Invalid card_index in card_tensor")
-    jax_debug.assert_(jnp.all(ok_type), "Invalid type_id in card_tensor")
-
-
-def _assert_legal_action(legal_mask: chex.Array, action: chex.Array) -> None:
-    """Sanity check: sampled action must be legal.
-    
-    Note: This function is designed to be jittable. When CFG.debug_asserts is False,
-    this function returns early before any assertions are evaluated.
-    """
-    if not CFG.debug_asserts:
-        return
-        
-    chosen = jnp.take_along_axis(legal_mask, action[:, None], axis=-1)[:, 0]
-    jax_debug.assert_(jnp.all(chosen), "Sampled illegal action")
 
 
 @chex.dataclass(frozen=True)
@@ -1342,9 +1307,6 @@ def collect_rollout(
         card_b, action_hist_b, action_mask_b, legal_b = jax.vmap(encode_obs)(
             s, aux, learner_pid
         )
-        # Debug assertions are jittable and become no-ops in production mode
-        # Removed Python if statement for better jittability
-        _assert_card_tensor(card_b)
 
         # For action selection, we need current player's perspective
         pid_cur = s.current_player.astype(jnp.int32)
@@ -1381,9 +1343,6 @@ def collect_rollout(
         neg_inf = -1e9
         masked_logits = jnp.where(legal_cur_b, logits, neg_inf)
         action = jnp.argmax(masked_logits + g, axis=-1).astype(jnp.int32)
-        # Debug assertions are jittable and become no-ops in production mode
-        # Removed Python if statement for better jittability
-        _assert_legal_action(legal_cur_b, action)
 
         # Compute behavior policy log prob (logp_mu) - only meaningful on learner turns
         # For non-learner turns, we store 0 and mask later
