@@ -79,8 +79,6 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerBlock(nn.Module):
-    """Single transformer encoder block with pre-norm."""
-    
     emb_dim: int
     num_heads: int
     ffn_dim: int
@@ -91,39 +89,21 @@ class TransformerBlock(nn.Module):
         x: chex.Array,
         mask: Optional[chex.Array] = None,
     ) -> chex.Array:
-        """
-        Args:
-            x: (B, S, D)
-            mask: (B, S) boolean mask where True = valid
-            
-        Returns:
-            output: (B, S, D)
-        """
+        assert self.emb_dim % self.num_heads == 0, "emb_dim must be divisible by num_heads"
         head_dim = self.emb_dim // self.num_heads
         
-        # Pre-norm self-attention
+        # Self-attention block
         residual = x
         x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
-        x = MultiHeadAttention(
-            num_heads=self.num_heads,
-            head_dim=head_dim,
-        )(x, x, x, mask)
+        x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
         x = residual + x
         
-        # Pre-norm FFN
+        # FFN block
         residual = x
         x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
-        x = nn.Dense(
-            self.ffn_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(x)
+        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = nn.gelu(x)
-        x = nn.Dense(
-            self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(x)
+        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
         x = residual + x
         
         return x
@@ -165,8 +145,6 @@ class TransformerEncoder(nn.Module):
 
 
 class CrossAttentionBlock(nn.Module):
-    """Cross-attention block where queries attend to context, followed by FFN."""
-    
     emb_dim: int
     num_heads: int
     ffn_dim: int
@@ -178,47 +156,23 @@ class CrossAttentionBlock(nn.Module):
         context: chex.Array,
         context_mask: Optional[chex.Array] = None,
     ) -> chex.Array:
-        """
-        Args:
-            query_tokens: (B, Q, D) learnable query tokens
-            context: (B, C, D) concatenated card + action representations
-            context_mask: (B, C) boolean mask where True = valid
-            
-        Returns:
-            output: (B, Q, D)
-        """
         head_dim = self.emb_dim // self.num_heads
         
-        # === Cross-Attention Sub-block ===
-        attn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(query_tokens)
-        context_normed = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(context)
+        # Cross-attention
+        residual = query_tokens
+        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(query_tokens)
+        x = MultiHeadAttention(self.num_heads, head_dim)(x, context, context, context_mask)
+        x = residual + x
         
-        attn_output = MultiHeadAttention(
-            num_heads=self.num_heads,
-            head_dim=head_dim,
-        )(attn_input, context_normed, context_normed, context_mask)
+        # FFN
+        residual = x
+        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = nn.gelu(x)
+        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.float32)(x)
+        x = residual + x
         
-        post_attn = query_tokens + attn_output
-        
-        # === FFN Sub-block ===
-        ffn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.float32)(post_attn)
-        
-        ffn_hidden = nn.Dense(
-            self.ffn_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(ffn_input)
-        ffn_hidden = nn.gelu(ffn_hidden)
-        
-        ffn_out = nn.Dense(
-            self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.float32,
-        )(ffn_hidden)
-        
-        output = post_attn + ffn_out
-        
-        return output
+        return x
 
 
 # =============================================================================
@@ -258,20 +212,18 @@ class CardEncoder(nn.Module):
             card_representation: (B, 8, emb_dim)
             valid_mask: (B, 8) boolean mask where True = valid card
         """
-        batch_size = card_tensor.shape[0]
         seq_len = card_tensor.shape[1]  # 8
         
         # === Card Index Embedding ===
         # 0-51 valid cards, -1 invalid -> mapped to 52
         card_indices = card_tensor[..., 1]
-        card_indices_safe = jnp.where(card_indices >= 0, card_indices, 52)
         
         card_emb = nn.Embed(
             num_embeddings=53,  # 52 cards + 1 invalid
             features=self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(card_indices_safe)  # (B, 8, emb_dim)
+        )(card_indices)  # (B, 8, emb_dim)
         
         # === Dealer ID Embedding ===
         # 0 = non-dealer, 1 = dealer, 2 = community, -1 invalid -> mapped to 3
@@ -311,17 +263,16 @@ class CardEncoder(nn.Module):
         
         return encoded, valid_mask
 
-
+!!! Need to merge
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
     
-    Input: (B, 30, 18) where each action entry contains:
+    Input: (B, 30, 5) where each action entry contains:
         [0]: player_id (0 or 1) - categorical
-        [1:14]: legal action mask (13 floats) - continuous/binary
-        [14]: action taken (0-12) - categorical
-        [15]: pot size (normalized) - continuous
-        [16]: round index (0-4) - categorical
-        [17]: position in round (0-5) - categorical
+        [1]: action taken (0-12) - categorical
+        [2]: pot size (normalized) - continuous
+        [3]: round index (0-4) - categorical
+        [4]: position in round (0-5) - categorical
     
     Output: (B, 30, emb_dim)
     """
@@ -339,7 +290,7 @@ class ActionEncoder(nn.Module):
     ) -> chex.Array:
         """
         Args:
-            action_tensor: (B, 30, 18) float32 tensor
+            action_tensor: (B, 30, 5) float32 tensor
             action_mask: (B, 30) boolean mask where True = valid action
             
         Returns:
@@ -347,11 +298,10 @@ class ActionEncoder(nn.Module):
         """
         # === Extract components ===
         player_id = action_tensor[..., 0].astype(jnp.int32)
-        legal_mask = action_tensor[..., 1:14]
-        action_taken = action_tensor[..., 14].astype(jnp.int32)
-        pot = action_tensor[..., 15:16]
-        round_idx = action_tensor[..., 16].astype(jnp.int32)
-        pos_in_round = action_tensor[..., 17].astype(jnp.int32)
+        action_taken = action_tensor[..., 1].astype(jnp.int32)
+        pot = action_tensor[..., 2]
+        round_idx = action_tensor[..., 3].astype(jnp.int32)
+        pos_in_round = action_tensor[..., 4].astype(jnp.int32)
         
         # === Categorical Embeddings ===
         player_emb = nn.Embed(
@@ -383,12 +333,11 @@ class ActionEncoder(nn.Module):
         )(pos_in_round)  # (B, 30, emb_dim)
         
         # === Continuous Features Projection ===
-        continuous = jnp.concatenate([legal_mask, pot], axis=-1)  # (B, 30, 14)
         continuous_emb = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(continuous.astype(jnp.float32))  # (B, 30, emb_dim)
+        )(pot.astype(jnp.float32))  # (B, 30, emb_dim)
         
         # === Combine: additive ===
         combined = player_emb + action_emb + round_emb + pos_emb + continuous_emb
