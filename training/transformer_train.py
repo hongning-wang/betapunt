@@ -799,20 +799,12 @@ def ppo_loss_and_metrics(
         var = jnp.sum(((x - mean) ** 2) * w) / denom
         return mean, jnp.sqrt(var + 1e-8)
 
-    # Forward pass for policy (actor view)
-    logits, _ = forward_apply(
+    # Single forward pass (actor view) for both policy logits and value
+    logits, value = forward_apply(
         state.params,
         batch.card,
         batch.action_hist,
         batch.action_mask,
-    )
-
-    # Forward pass for value (critic view)
-    _, value = forward_apply(
-        state.params,
-        batch.card_v,
-        batch.action_hist_v,
-        batch.action_mask_v,
     )
 
     # Policy loss
@@ -830,7 +822,7 @@ def ppo_loss_and_metrics(
     # Value loss
     target = trinal_clip_value_target(batch.ret, batch.contrib_self, batch.contrib_opp)
     v_loss = (target - value) ** 2
-    value_loss = jnp.mean(v_loss)
+    value_loss = jnp.sum(v_loss * valid_f) / denom
 
     # Entropy bonus
     ent = dist.entropy()
@@ -1135,22 +1127,8 @@ def collect_rollout(
         # Select logits based on whose turn it is
         logits = jnp.where(is_learner_turn[:, None], logits_main_b, logits_opp_b)
 
-        # Forward #3: Value from learner perspective (only needed for opponent turns)
-        # Reuse current-player value when learner is acting; compute learner view
-        # only if any opponent turns exist in the batch.
-        card_learner_b, action_hist_learner_b, action_mask_learner_b, _ = jax.vmap(encode_obs)(
-            s, aux, learner_pid
-        )
-        _assert_card_tensor(card_learner_b)
-        need_learner_value = jnp.any(~is_learner_turn)
-
-        def compute_learner_value():
-            return forward_apply(
-                main_params, card_learner_b, action_hist_learner_b, action_mask_learner_b
-            )[1]
-
-        value_learner_b = jax.lax.cond(need_learner_value, compute_learner_value, lambda: value_main_b)
-        value = jnp.where(is_learner_turn, value_main_b, value_learner_b).astype(jnp.float32)
+        # Use current-player value for all steps (no extra forward)
+        value = value_main_b.astype(jnp.float32)
         
         # Sample actions
         def _mk_key(k, eid, salt):
@@ -1200,9 +1178,9 @@ def collect_rollout(
             "card": card_cur_b,
             "action_hist": action_hist_cur_b,
             "action_mask": action_mask_cur_b,
-            "card_v": card_learner_b,
-            "action_hist_v": action_hist_learner_b,
-            "action_mask_v": action_mask_learner_b,
+            "card_v": card_cur_b,
+            "action_hist_v": action_hist_cur_b,
+            "action_mask_v": action_mask_cur_b,
             "legal": legal_a_b,
             "action": action,
             "logp_old": logp_old,
@@ -1241,8 +1219,8 @@ def collect_rollout(
     values = traj["value"].astype(jnp.float32)
     dones = traj["done"]
     
-    # Last value prediction
-    last_pid = jnp.where(vec2.main_is_p0, jnp.int32(0), jnp.int32(1))
+    # Last value prediction (current player view)
+    last_pid = vec2.env_state.current_player.astype(jnp.int32)
     last_card_b, last_action_hist_b, last_action_mask_b, _ = jax.vmap(encode_obs)(
         vec2.env_state, vec2.aux, last_pid
     )
