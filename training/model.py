@@ -2,7 +2,7 @@
 
 Architecture:
 - Card Encoder: (B, 8, 2) -> Embeddings -> Transformer -> (B, 8, 128)
-- Action Encoder: (B, 30, 7) -> Embeddings + Dense -> Transformer -> (B, 30, 128)
+- Action Encoder: (B, 40, 7) -> Embeddings + Dense -> Transformer -> (B, 40, 128)
 - Cross-Attention Fusion: Learnable queries attend to concatenated context
 - Output Heads: Policy (13), Value (1)
 
@@ -22,7 +22,7 @@ import chex
 
 NUM_ACTIONS = 13
 CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
-ACTION_SEQ_LEN = 30
+ACTION_SEQ_LEN = 40
 NUM_CARD_TYPES = 9
 CARD_INPUT_DIM = 2      # [dealer_id, card_index]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
@@ -183,7 +183,7 @@ class CrossAttentionBlock(nn.Module):
 class CardEncoder(nn.Module):
     """Encodes card tensor using embeddings and transformer.
     
-    Input: (B, 8, 2) where each entry is [card_index, type_id]. 
+    Input: (B, 9, 2) where each entry is [card_index, type_id]. 
     
     Position semantics:
         0-1: Player's hole cards
@@ -193,7 +193,7 @@ class CardEncoder(nn.Module):
         6: Turn
         7: River
     
-    Output: (B, 8, emb_dim)
+    Output: (B, 9, emb_dim)
     """
     
     emb_dim: int = EMB_DIM
@@ -290,11 +290,10 @@ class CardEncoder(nn.Module):
 
         return encoded, valid_mask
 
-!!! Need to merge
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
     
-    Input: (B, 30, 7) where each action entry contains:
+    Input: (B, 40, 7) where each action entry contains:
         [0]: actor_id (0 or 1) - categorical
         [1]: event_type (0-12) - categorical
         [2]: street_id (0-4) - categorical
@@ -303,7 +302,7 @@ class ActionEncoder(nn.Module):
         [5]: pot_base - continuous
         [6]: effective_stack - continuous
     
-    Output: (B, 30, emb_dim)
+    Output: (B, 40, emb_dim)
     """
     
     emb_dim: int = EMB_DIM
@@ -319,11 +318,11 @@ class ActionEncoder(nn.Module):
     ) -> chex.Array:
         """
         Args:
-            action_tensor: (B, 30, 7) float32 tensor
-            action_mask: (B, 30) boolean mask where True = valid action
+            action_tensor: (B, 40, 7) float32 tensor
+            action_mask: (B, 40) boolean mask where True = valid action
             
         Returns:
-            action_representation: (B, 30, emb_dim)
+            action_representation: (B, 40, emb_dim)
         """
         # === Extract components ===
         actor_id = action_tensor[..., 0].astype(jnp.int32)
@@ -340,21 +339,21 @@ class ActionEncoder(nn.Module):
             features=self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(actor_id)  # (B, 30, emb_dim)
+        )(actor_id)  # (B, 40, emb_dim)
 
         event_emb = nn.Embed(
             num_embeddings=13,
             features=self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(event_type)  # (B, 30, emb_dim)
+        )(event_type)  # (B, 40, emb_dim)
 
         street_emb = nn.Embed(
             num_embeddings=5,
             features=self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(street_id)  # (B, 30, emb_dim)
+        )(street_id)  # (B, 40, emb_dim)
 
         time_mod = jnp.mod(time_id, jnp.int32(ACTION_SEQ_LEN))
         time_emb = nn.Embed(
@@ -362,7 +361,7 @@ class ActionEncoder(nn.Module):
             features=self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(time_mod)  # (B, 30, emb_dim)
+        )(time_mod)  # (B, 40, emb_dim)
 
         # === Continuous Features Projection ===
         eps = jnp.float32(1e-6)
@@ -370,12 +369,12 @@ class ActionEncoder(nn.Module):
         cont1 = jnp.log1p(to_call / pot_base_safe)
         cont2 = jnp.log1p(pot_base_safe)
         cont3 = jnp.log1p(eff_stack / pot_base_safe)
-        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 30, 3)
+        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 40, 3)
         continuous_emb = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.float32,
-        )(continuous.astype(jnp.float32))  # (B, 30, emb_dim)
+        )(continuous.astype(jnp.float32))  # (B, 40, emb_dim)
 
         # === Combine: additive ===
         combined = actor_emb + event_emb + street_emb + time_emb + continuous_emb
@@ -399,9 +398,9 @@ class TossHoldemModel(nn.Module):
     """Full transformer-based model for Toss or Hold'em.
     
     Architecture:
-        1. Card Encoder: (B, 8, 2) -> (B, 8, 128) with embeddings
-        2. Action Encoder: (B, 30, 7) -> (B, 30, 128) with embeddings
-        3. Concatenate: (B, 38, 128)
+        1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings
+        2. Action Encoder: (B, 40, 7) -> (B, 40, 128) with embeddings
+        3. Concatenate: (B, 49, 128)
         4. Cross-Attention Fusion with learnable queries: (B, 8, 128)
         5. Processing MLP: Flatten -> Dense -> ReLU -> (B, 256)
         6. Output Heads:
@@ -422,13 +421,13 @@ class TossHoldemModel(nn.Module):
         self,
         card_tensor: chex.Array,
         action_tensor: chex.Array,
-        action_mask: Optional[chex.Array] = None,
+        action_mask: chex.Array,
     ) -> Tuple[chex.Array, chex.Array]:
         """
         Args:
-            card_tensor: (B, 8, 2) int32 - [dealer_id, card_index]
-            action_tensor: (B, 30, 7) float32 - action history features
-            action_mask: (B, 30) boolean - True for valid actions, False for padding
+            card_tensor: (B, 9, 2) int32 - [dealer_id, card_index]
+            action_tensor: (B, 40, 7) float32 - action history features
+            action_mask: (B, 40) boolean - True for valid actions, False for padding
             
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
@@ -445,29 +444,23 @@ class TossHoldemModel(nn.Module):
             num_heads=self.num_heads,
             ffn_dim=self.ffn_dim,
             num_layers=self.num_layers,
-        )(card_tensor)  # (B, 8, 128), (B, 8)
+        )(card_tensor)  # (B, 9, 128), (B, 9)
         
         action_repr = ActionEncoder(
             emb_dim=self.emb_dim,
             num_heads=self.num_heads,
             ffn_dim=self.ffn_dim,
             num_layers=self.num_layers,
-        )(action_tensor, action_mask)  # (B, 30, 128)
+        )(action_tensor, action_mask)  # (B, 40, 128)
         
         # =================================================================
         # 2. Concatenate to form context
         # =================================================================
         
-        context = jnp.concatenate([card_repr, action_repr], axis=1)  # (B, 38, 128)
+        context = jnp.concatenate([card_repr, action_repr], axis=1)  # (B, 49, 128)
         
         # Build context mask: use card valid mask + action mask
-        if action_mask is not None:
-            context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 38)
-        else:
-            context_mask = jnp.concatenate([
-                card_valid_mask,
-                jnp.ones((batch_size, ACTION_SEQ_LEN), dtype=jnp.bool_)
-            ], axis=1)
+        context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 49)
         
         # =================================================================
         # 3. Learnable query tokens + Cross-attention fusion
@@ -539,41 +532,6 @@ class TossHoldemModel(nn.Module):
 # Utility Functions
 # =============================================================================
 
-def create_action_mask(action_tensor: chex.Array) -> chex.Array:
-    """Create a boolean mask for valid actions in the action tensor.
-    
-    An action is considered valid if any of its features are non-zero.
-    
-    Args:
-        action_tensor: (B, 30, 7) action history tensor
-        
-    Returns:
-        mask: (B, 30) boolean mask where True = valid action
-    """
-    # Sum across features - if any feature is non-zero, the action is valid
-    feature_sum = jnp.sum(jnp.abs(action_tensor), axis=-1)  # (B, 30)
-    mask = feature_sum > 0
-    return mask
-
-
-def apply_legal_action_mask(
-    policy_logits: chex.Array,
-    legal_mask: chex.Array,
-) -> chex.Array:
-    """Apply legal action masking to policy logits.
-    
-    Args:
-        policy_logits: (B, 13) raw policy logits
-        legal_mask: (B, 13) boolean mask where True = legal action
-        
-    Returns:
-        masked_logits: (B, 13) logits with illegal actions set to -inf
-    """
-    neg_inf = jnp.finfo(jnp.float32).min
-    masked_logits = jnp.where(legal_mask, policy_logits, neg_inf)
-    return masked_logits
-
-
 def init_model(key: chex.PRNGKey) -> Tuple[TossHoldemModel, dict]:
     """Initialize the model and return parameters.
     
@@ -606,65 +564,3 @@ def count_parameters(params: dict) -> int:
         Total number of parameters
     """
     return sum(x.size for x in jax.tree_util.tree_leaves(params))
-
-
-# =============================================================================
-# Example Usage / Testing
-# =============================================================================
-
-if __name__ == "__main__":
-    # Test model initialization and forward pass
-    key = jax.random.PRNGKey(42)
-    
-    print("Initializing model...")
-    model, params = init_model(key)
-    
-    num_params = count_parameters(params)
-    print(f"Total parameters: {num_params:,}")
-    
-    # Test forward pass
-    batch_size = 4
-    
-    # Create dummy inputs
-    key, k1, k2 = jax.random.split(key, 3)
-    cards = jax.random.randint(k1, (batch_size, CARD_SEQ_LEN, CARD_INPUT_DIM), -1, 52)
-    actions = jax.random.normal(k2, (batch_size, ACTION_SEQ_LEN, ACTION_INPUT_DIM))
-    action_mask = create_action_mask(actions)
-    
-    print(f"\nInput shapes:")
-    print(f"  Cards: {cards.shape}")
-    print(f"  Actions: {actions.shape}")
-    print(f"  Action mask: {action_mask.shape}")
-    
-    # Forward pass
-    policy_logits, value = model.apply(params, cards, actions, action_mask)
-    
-    print(f"\nOutput shapes:")
-    print(f"  Policy logits: {policy_logits.shape}")
-    print(f"  Value: {value.shape}")
-    
-    # Test legal action masking
-    legal_mask = jax.random.bernoulli(key, 0.5, (batch_size, NUM_ACTIONS))
-    masked_policy = apply_legal_action_mask(policy_logits, legal_mask)
-    print(f"\nMasked policy logits: {masked_policy.shape}")
-    
-    # Test JIT compilation
-    print("\nTesting JIT compilation...")
-    
-    @jax.jit
-    def forward(params, cards, actions, action_mask):
-        return model.apply(params, cards, actions, action_mask)
-    
-    # Warm-up JIT
-    _ = forward(params, cards, actions, action_mask)
-    
-    # Timed run
-    import time
-    start = time.time()
-    for _ in range(100):
-        _ = forward(params, cards, actions, action_mask)
-    jax.block_until_ready(_)
-    elapsed = time.time() - start
-    
-    print(f"100 forward passes: {elapsed:.3f}s ({elapsed/100*1000:.2f}ms per pass)")
-    print("\nModel test complete!")
