@@ -1351,7 +1351,8 @@ def collect_rollout(
         logp_mu = jnp.where(is_learner_turn, logp, jnp.float32(0.0))
 
         # Record action
-        aux2 = jax.vmap(aux_record_action)(aux, s, action)
+        pot_committed = s.pot + s.p0_bet + s.p1_bet
+        aux2 = jax.vmap(aux_record_action)(aux, s, action, pot_committed, legal_cur_b)
 
         # Step environment
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
@@ -1481,7 +1482,9 @@ def play_one_hand(
         params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
         # Use deterministic=True for stable ELO evaluation
         a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
-        aux2 = aux_record_action(aux, s, a)
+        pot_committed = s.pot + s.p0_bet + s.p1_bet
+        legal_mask = ENV.get_legal_actions(s)
+        aux2 = aux_record_action(aux, s, a, pot_committed, legal_mask)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
         return (s2, aux2, key)
