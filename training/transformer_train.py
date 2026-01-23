@@ -104,8 +104,8 @@ class Config:
     # Note: Actual capacity is max(16, replay_capacity // (rollout_len * num_envs)) unrolls
     # With default settings: max(16, 500k // 262k) = 16 unrolls ≈ 4.2M transitions
     replay_capacity: int = 200_000  # Target transition capacity (see note above)
-    num_minibatches: int = 4
-    update_epochs: int = 1  # Single epoch per update (more on-policy)
+    num_minibatches: int = 8  # More minibatches for more gradient steps
+    update_epochs: int = 2  # Multiple epochs safe with V-trace importance weighting
     warmup_steps: int = 100_000  # Shorter warmup (in transitions)
 
     # Short replay window (key for V-trace) - only sample from recent data
@@ -722,9 +722,11 @@ def clip_value_target(
     """Clip value target to chip contribution bounds for stability.
 
     In poker, max loss = chips contributed, max gain = opponent's contribution.
+    Both ret and bounds are normalized by STACK_SIZE.
     """
-    d2 = contrib_self.astype(jnp.float32)
-    d3 = contrib_opp.astype(jnp.float32)
+    # Normalize bounds to match normalized returns
+    d2 = contrib_self.astype(jnp.float32) / jnp.float32(STACK_SIZE)
+    d3 = contrib_opp.astype(jnp.float32) / jnp.float32(STACK_SIZE)
     return jnp.clip(ret, -d2, d3)
 
 
@@ -1177,7 +1179,7 @@ def compute_vtrace(
     """Compute V-trace targets and advantages for off-policy learning.
 
     V-trace (from IMPALA) provides theoretically sound off-policy corrections
-    by clipping importance weights to bound variance. This allows learning
+    by a importance weights to bound variance. This allows learning
     from stale data collected by different policy versions.
 
     Reference: Espeholt et al. "IMPALA: Scalable Distributed Deep-RL with
@@ -1346,10 +1348,12 @@ def collect_rollout(
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
         s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)
 
-        # Compute rewards
+        # Compute rewards (normalized by STACK_SIZE for stable training)
+        # This puts rewards in ~[-1, +1] range so policy and value losses are comparable
         r0, r1 = terminal_rewards(s_next)
         rew_term = jnp.where(main_is_p0, r0, r1)
         rew = jnp.where(done, rew_term, jnp.float32(0.0))
+        rew = rew / jnp.float32(STACK_SIZE)  # Normalize rewards
 
         # Chip contributions for value clipping
         contrib_p0_pre = (STACK_SIZE - s.p0_stack).astype(jnp.int32)
