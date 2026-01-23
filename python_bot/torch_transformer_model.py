@@ -3,8 +3,8 @@
 This mirrors the JAX/Flax model from model.py for inference.
 
 Architecture:
-- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Projection -> (B, 9, 128)
-- Action Encoder: (B, 40, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 40, 128)
+- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Projection -> (B, 9, 256)
+- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 32, 256)
 - Cross-Attention Fusion: Multiple layers of learnable queries attending to context
 - Separate Output Heads: Policy (13), Value (1)
 """
@@ -29,13 +29,13 @@ class TossHoldemTransformerConfig:
     """Configuration matching the JAX model."""
     num_actions: int = 13
     card_seq_len: int = 9
-    action_seq_len: int = 40
+    action_seq_len: int = 32
     num_card_types: int = 9
     card_input_dim: int = 2
     action_input_dim: int = 7
 
-    emb_dim: int = 128
-    num_heads: int = 4
+    emb_dim: int = 256
+    num_heads: int = 2
     ffn_dim: int = 512
     num_transformer_layers: int = 2
     num_cross_attention_layers: int = 2
@@ -282,11 +282,11 @@ class ActionEncoder(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            action_tensor: (B, 40, 7) float32 tensor
-            action_mask: (B, 40) boolean mask
+            action_tensor: (B, 32, 7) float32 tensor
+            action_mask: (B, 32) boolean mask
 
         Returns:
-            action_representation: (B, 40, emb_dim)
+            action_representation: (B, 32, emb_dim)
         """
         # Extract components
         actor_id = action_tensor[..., 0].long()
@@ -377,8 +377,8 @@ class TossHoldemTransformerTorch(nn.Module):
         """
         Args:
             card_tensor: (B, 9, 2) int32 - card tensor
-            action_tensor: (B, 40, 7) float32 - action history
-            action_mask: (B, 40) boolean - action history mask
+            action_tensor: (B, 32, 7) float32 - action history
+            action_mask: (B, 32) boolean - action history mask
 
         Returns:
             policy_logits: (B, 13)
@@ -388,11 +388,11 @@ class TossHoldemTransformerTorch(nn.Module):
 
         # 1. Encode cards and actions
         card_repr, card_valid_mask = self.card_encoder(card_tensor)  # (B, 9, 128), (B, 9)
-        action_repr = self.action_encoder(action_tensor, action_mask)  # (B, 40, 128)
+        action_repr = self.action_encoder(action_tensor, action_mask)  # (B, 32, 256)
 
         # 2. Concatenate to form context
-        context = torch.cat([card_repr, action_repr], dim=1)  # (B, 49, 128)
-        context_mask = torch.cat([card_valid_mask, action_mask], dim=1)  # (B, 49)
+        context = torch.cat([card_repr, action_repr], dim=1)  # (B, 41, 256)
+        context_mask = torch.cat([card_valid_mask, action_mask], dim=1)  # (B, 41)
 
         # 3. Cross-attention with learnable queries
         fused = self.query_tokens.unsqueeze(0).expand(batch_size, -1, -1)  # (B, 6, 128)

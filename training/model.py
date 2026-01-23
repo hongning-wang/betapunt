@@ -3,7 +3,7 @@
 Architecture:
 - Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Projection -> (B, 9, 128)
   (No transformer - card positions have fixed semantics)
-- Action Encoder: (B, 30, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 30, 128)
+- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 32, 128)
 - Cross-Attention Fusion: Multiple layers of learnable queries attending to context
 - Separate Output Heads: Policy (13), Value (1) with independent final layers
 
@@ -342,7 +342,7 @@ class CardEncoder(nn.Module):
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
 
-    Input: (B, 30, 7) where each action entry contains:
+    Input: (B, 32, 7) where each action entry contains:
         [0]: actor_id (0 or 1) - categorical
         [1]: event_type (0-12) - categorical
         [2]: street_id (0-4) - categorical

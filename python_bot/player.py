@@ -44,10 +44,15 @@ ACT_DISCARD_2 = 12
 
 # Tensor dimensions
 CARD_SEQ_LEN = 9
-ACTION_SEQ_LEN = 40
+ACTION_SEQ_LEN = 32
 CARD_INPUT_DIM = 2
 ACTION_INPUT_DIM = 7
 NUM_ACTIONS = 13
+
+# Paths
+BOT_DIR = os.path.dirname(__file__)
+DEFAULT_MODEL_PATH = os.path.join(BOT_DIR, "model.pt")
+DEFAULT_CHECKPOINT_DIR = os.path.join(BOT_DIR, "step_14000")
 
 # Street IDs for action history
 STREET_PREFLOP = 0
@@ -96,7 +101,7 @@ def skeleton_street_to_model_street(street: int) -> int:
     """
     if street == 0:
         return STREET_PREFLOP
-    elif street in (2, 3):  # Discard phases
+    elif street == 2:  # Discard phase
         return STREET_DISCARD
     elif street == 3:
         return STREET_FLOP
@@ -232,7 +237,7 @@ class StateEncoder:
         return card_tensor
     
     def encode_actions(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Encode action history into (40, 7) tensor with mask."""
+        """Encode action history into (32, 7) tensor with mask."""
         action_tensor = torch.zeros((ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=torch.float32)
         
         n_actions = min(len(self.action_history), ACTION_SEQ_LEN)
@@ -268,9 +273,22 @@ class Player(Bot):
         self.model = None
         self.encoder = StateEncoder()
         self.device = "cpu"
-        
-        # Try to load model
-        model_path = os.environ.get("MODEL_PATH", "model.pt")
+
+        self._load_model()
+
+    def _load_model(self) -> None:
+        model_path = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)
+        checkpoint_dir = os.environ.get("CHECKPOINT_DIR", DEFAULT_CHECKPOINT_DIR)
+
+        if os.path.isdir(model_path):
+            checkpoint_dir = model_path
+            model_path = DEFAULT_MODEL_PATH
+
+        if not os.path.exists(model_path) and os.path.isdir(checkpoint_dir):
+            exported = self._export_checkpoint(checkpoint_dir, model_path)
+            if not exported:
+                print(f"Warning: Model export failed from {checkpoint_dir}")
+
         if os.path.exists(model_path):
             try:
                 self.model = load_exported_transformer_model(model_path, device=self.device)
@@ -280,6 +298,39 @@ class Player(Bot):
                 self.model = None
         else:
             print(f"Warning: Model file not found at {model_path}")
+
+    def _export_checkpoint(self, checkpoint_dir: str, output_path: str) -> bool:
+        """Export a JAX/Flax checkpoint to a Torch model file."""
+        try:
+            from export_checkpoint_to_torch import (
+                restore_checkpoint_to_cpu,
+                load_flax_params_into_torch,
+            )
+            from torch_transformer_model import (
+                TossHoldemTransformerConfig,
+                TossHoldemTransformerTorch,
+            )
+        except Exception as exc:
+            print(f"Warning: Could not import exporter dependencies: {exc}")
+            return False
+
+        try:
+            print(f"Exporting checkpoint from {checkpoint_dir} to {output_path}...")
+            restored = restore_checkpoint_to_cpu(checkpoint_dir)
+            params = restored["params"] if isinstance(restored, dict) and "params" in restored else restored
+
+            cfg = TossHoldemTransformerConfig()
+            model = TossHoldemTransformerTorch(cfg)
+            load_flax_params_into_torch(model, params)
+            model.eval()
+
+            payload = {"config": cfg.__dict__, "state_dict": model.state_dict()}
+            torch.save(payload, output_path)
+            print("Export complete.")
+            return True
+        except Exception as exc:
+            print(f"Warning: Failed to export checkpoint: {exc}")
+            return False
     
     def handle_new_round(self, game_state, round_state, active):
         """Called when a new round starts."""
@@ -320,7 +371,7 @@ class Player(Bot):
         # Build tensors
         card_tensor = self.encoder.encode_cards(
             my_cards,
-            list(round_state.deck),  # board cards
+            list(round_state.board),
             self.encoder.is_dealer,
         ).unsqueeze(0)
         
@@ -368,7 +419,7 @@ class Player(Bot):
         # Build tensors
         card_tensor = self.encoder.encode_cards(
             my_cards,
-            list(round_state.deck),
+            list(round_state.board),
             self.encoder.is_dealer,
         ).unsqueeze(0)
         

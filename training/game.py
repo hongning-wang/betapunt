@@ -581,7 +581,10 @@ class TossHoldemEnv:
         def _goto_showdown(s):
             result = get_showdown_result(s.replace(pot=new_pot))
             winner_idx = jnp.select([result == 1.0, result == -1.0], [0, 1], default=2)
-            return s.replace(pot=new_pot, phase=PHASE_SHOWDOWN, done=True, winner=winner_idx)
+            # Zero out bets to prevent double-counting in terminal_rewards
+            # (pot already includes the final street's bets via new_pot)
+            return s.replace(pot=new_pot, phase=PHASE_SHOWDOWN, done=True, winner=winner_idx,
+                           p0_bet=0, p1_bet=0)
         
         def _goto_noop(s):
             return s

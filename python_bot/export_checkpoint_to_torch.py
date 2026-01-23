@@ -28,7 +28,10 @@ from python_bot.torch_transformer_model import (
 
 def _as_numpy(x: Any) -> np.ndarray:
     """Convert JAX array to numpy."""
-    return np.array(x, copy=True)
+    arr = np.array(x, copy=True)
+    if getattr(arr.dtype, "name", "") == "bfloat16":
+        return arr.astype(np.float32)
+    return arr
 
 
 def restore_checkpoint_to_cpu(ckpt_dir: str) -> Dict[str, Any]:
