@@ -143,11 +143,13 @@ class TransformerEncoder(nn.Module):
         Returns:
             output: (B, S, D)
         """
-        for _ in range(self.num_layers):
+        # Use explicit layer names for better jittability
+        for layer_idx in range(self.num_layers):
             x = TransformerBlock(
                 emb_dim=self.emb_dim,
                 num_heads=self.num_heads,
                 ffn_dim=self.ffn_dim,
+                name=f'layer_{layer_idx}',
             )(x, mask)
 
         # Final layer norm
@@ -685,66 +687,4 @@ def count_parameters(params: dict) -> int:
     Returns:
         Total number of parameters
     """
-    return sum(x.size for x in jax.tree_util.tree_leaves(params))
-
-
-# =============================================================================
-# Example Usage / Testing
-# =============================================================================
-
-if __name__ == "__main__":
-    # Test model initialization and forward pass
-    key = jax.random.PRNGKey(42)
-
-    print("Initializing model...")
-    model, params = init_model(key)
-
-    num_params = count_parameters(params)
-    print(f"Total parameters: {num_params:,}")
-
-    # Test forward pass
-    batch_size = 4
-
-    # Create dummy inputs
-    key, k1, k2 = jax.random.split(key, 3)
-    cards = jax.random.randint(k1, (batch_size, CARD_SEQ_LEN, CARD_INPUT_DIM), -1, 52)
-    actions = jax.random.normal(k2, (batch_size, ACTION_SEQ_LEN, ACTION_INPUT_DIM))
-    action_mask = create_action_mask(actions)
-
-    print(f"\nInput shapes:")
-    print(f"  Cards: {cards.shape}")
-    print(f"  Actions: {actions.shape}")
-    print(f"  Action mask: {action_mask.shape}")
-
-    # Forward pass
-    policy_logits, value = model.apply(params, cards, actions, action_mask)
-
-    print(f"\nOutput shapes:")
-    print(f"  Policy logits: {policy_logits.shape}")
-    print(f"  Value: {value.shape}")
-
-    # Test legal action masking
-    legal_mask = jax.random.bernoulli(key, 0.5, (batch_size, NUM_ACTIONS))
-    masked_policy = apply_legal_action_mask(policy_logits, legal_mask)
-    print(f"\nMasked policy logits: {masked_policy.shape}")
-
-    # Test JIT compilation
-    print("\nTesting JIT compilation...")
-
-    @jax.jit
-    def forward(params, cards, actions, action_mask):
-        return model.apply(params, cards, actions, action_mask)
-
-    # Warm-up JIT
-    _ = forward(params, cards, actions, action_mask)
-
-    # Timed run
-    import time
-    start = time.time()
-    for _ in range(100):
-        _ = forward(params, cards, actions, action_mask)
-    jax.block_until_ready(_)
-    elapsed = time.time() - start
-
-    print(f"100 forward passes: {elapsed:.3f}s ({elapsed/100*1000:.2f}ms per pass)")
-    print("\nModel test complete!")
+    return sum(x.size for x in jax.tree_util.tree_leaves(params)) 
