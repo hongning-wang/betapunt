@@ -143,11 +143,13 @@ class TransformerEncoder(nn.Module):
         Returns:
             output: (B, S, D)
         """
-        for _ in range(self.num_layers):
+        # Use explicit layer names for better jittability
+        for layer_idx in range(self.num_layers):
             x = TransformerBlock(
                 emb_dim=self.emb_dim,
                 num_heads=self.num_heads,
                 ffn_dim=self.ffn_dim,
+                name=f'layer_{layer_idx}',
             )(x, mask)
 
         # Final layer norm
