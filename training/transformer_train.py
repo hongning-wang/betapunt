@@ -114,7 +114,7 @@ class Config:
     # Runtime
     seed: int = 0
     total_updates: int = 20_000
-    block_size: int = 50  # Number of collect+update steps per scan block (reduces host-device sync)
+    block_size: int = 100  # Number of collect+update steps per scan block (reduces host-device sync)
 
     # Checkpointing
     checkpoint_dir: str = "./checkpoints"
@@ -171,8 +171,8 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
     opp_bet = jnp.where(is_p0, state.p1_bet, state.p0_bet).astype(jnp.float32)
 
     to_call = (opp_bet - cur_bet).astype(jnp.float32)
-    # FIX: Use consistent pot size (chips already committed to the middle)
-    pot_committed = (state.pot + state.p0_bet + state.p1_bet).astype(jnp.float32)
+    # pot_base: pot after calling, matches game.py's raise sizing definition
+    pot_base = (state.pot + state.p0_bet + state.p1_bet + to_call).astype(jnp.float32)
 
     eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
 
@@ -185,7 +185,7 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
             street_id,
             time_id.astype(jnp.float32),
             to_call,
-            pot_committed,
+            pot_base,
             eff_cap,
         ],
         dtype=jnp.float32,
@@ -205,7 +205,7 @@ class AuxState:
         [2] street_id         int {0..4}
         [3] time_id           int (monotonic action counter)
         [4] to_call           float
-        [5] pot_committed     float (chips already in middle)
+        [5] pot_base          float (pot after calling, for raise sizing)
         [6] effective_stack   float
     """
     action_tensor: chex.Array  # (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7)
@@ -234,7 +234,7 @@ def aux_record_action(
       [2]: street_id (0-4)
       [3]: time_id (monotonic action counter)
       [4]: to_call
-      [5]: pot_committed
+      [5]: pot_base
       [6]: effective_stack
     """
     # Build the 7-feature action token using existing make_action_token

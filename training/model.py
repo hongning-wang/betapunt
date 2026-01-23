@@ -69,15 +69,16 @@ class MultiHeadAttention(nn.Module):
         k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
         v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        scale = jnp.sqrt(jnp.float32(self.head_dim))
-        attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) / scale
-
         if mask is not None:
             mask = mask[:, None, None, :]
-            attn_weights = jnp.where(mask, attn_weights, -1e9)
 
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+        attn_output = jax.nn.dot_product_attention(
+            q,
+            k,
+            v,
+            mask=mask,
+            dtype=jnp.bfloat16,
+        )
 
         attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, q_len, projection_dim)
         output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(attn_output)
