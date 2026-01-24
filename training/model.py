@@ -227,11 +227,11 @@ class CrossAttentionBlock(nn.Module):
 # =============================================================================
 
 class CardEncoder(nn.Module):
-    """Encodes card tensor using embeddings (no transformer needed).
+    """Encodes card tensor using embeddings and transformer.
 
     Input: (B, 9, 2) where each entry is [card_index, type_id].
 
-    Position semantics (fixed, not learned):
+    Position semantics:
         0-2: Hero's private cards
         3-4: Flop (community)
         5: Hero's discard
@@ -241,14 +241,16 @@ class CardEncoder(nn.Module):
 
     Output: (B, 9, emb_dim)
 
-    No transformer needed because:
-    - Card positions have fixed semantics
-    - Order within groups is irrelevant
-    - Cross-attention handles fusion with actions
+    Uses transformer to learn card relationships (flush/straight patterns).
     """
 
     emb_dim: int = EMB_DIM
-    component_emb_dim: int = 48  # 48 * 3 = 144 -> project to emb_dim
+    rank_emb_dim: int = 48
+    suit_emb_dim: int = 32
+    position_emb_dim: int = 48  # 48 + 32 + 48 = 128
+    num_heads: int = NUM_HEADS
+    ffn_dim: int = 256
+    num_layers: int = 1
 
     @nn.compact
     def __call__(
@@ -286,57 +288,63 @@ class CardEncoder(nn.Module):
         # -----------------------------
         # Safe / derived categorical ids
         # -----------------------------
-        # Map invalid card_index (-1) to a safe placeholder 52 for computations
         card_index_safe = jnp.where(card_index >= 0, card_index, 52).astype(jnp.int32)
 
-        # Derive rank/suit for valid cards
-        # rank: 0-12, suit: 0-3
         rank = (card_index_safe % 13).astype(jnp.int32)
         suit = (card_index_safe // 13).astype(jnp.int32)
 
-        # Use dedicated "invalid" buckets for embeddings:
-        # rank_invalid = 13, suit_invalid = 4
         is_invalid = card_index < 0
-        rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)  # 0-12 + 13 invalid
-        suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)   # 0-3 + 4 invalid
-
-        # Type embedding: 0-8 + 9 invalid
+        rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)
+        suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)
         type_safe = jnp.where(type_id >= 0, type_id, NUM_CARD_TYPES).astype(jnp.int32)
 
         # -----------------------------
-        # Embeddings: CONCATENATE rank, suit, type (not add)
+        # Embeddings: rank(48) + suit(32) + position(48) = 128
         # -----------------------------
         rank_emb = nn.Embed(
             num_embeddings=14,  # 13 ranks + invalid
-            features=self.component_emb_dim,
+            features=self.rank_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(rank_safe)  # (B, 9, component_emb_dim)
+        )(rank_safe)  # (B, 9, 48)
 
         suit_emb = nn.Embed(
             num_embeddings=5,   # 4 suits + invalid
-            features=self.component_emb_dim,
+            features=self.suit_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(suit_safe)  # (B, 9, component_emb_dim)
+        )(suit_safe)  # (B, 9, 32)
 
-        type_emb = nn.Embed(
-            num_embeddings=NUM_CARD_TYPES + 1,  # 9 types + invalid
-            features=self.component_emb_dim,
+        position_emb = nn.Embed(
+            num_embeddings=NUM_CARD_TYPES + 1,  # 9 positions + invalid
+            features=self.position_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(type_safe)  # (B, 9, component_emb_dim)
+        )(type_safe)  # (B, 9, 48)
 
-        # Concatenate and project to emb_dim
-        concat = jnp.concatenate([rank_emb, suit_emb, type_emb], axis=-1)  # (B, 9, 3*component_emb_dim)
+        # Concatenate: (B, 9, 128)
+        concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
+
+        # -----------------------------
+        # Transformer to learn card relationships
+        # -----------------------------
+        transformer_dim = self.rank_emb_dim + self.suit_emb_dim + self.position_emb_dim  # 128
+        card_repr = TransformerEncoder(
+            emb_dim=transformer_dim,
+            num_heads=self.num_heads,
+            ffn_dim=self.ffn_dim,
+            num_layers=self.num_layers,
+        )(concat, valid_mask)  # (B, 9, 128)
+
+        # Project to emb_dim
         card_repr = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(concat)  # (B, 9, emb_dim)
+        )(card_repr)  # (B, 9, 256)
 
         return card_repr, valid_mask
-
+    
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
 
