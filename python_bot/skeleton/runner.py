@@ -5,7 +5,7 @@ import argparse
 import socket
 from .actions import FoldAction, CallAction, CheckAction, RaiseAction, DiscardAction
 from .states import GameState, TerminalState, RoundState
-from .states import STARTING_STACK, BIG_BLIND, SMALL_BLIND
+from .states import STARTING_STACK, BIG_BLIND, SMALL_BLIND, NUM_ROUNDS
 from .bot import Bot
 
 
@@ -44,6 +44,13 @@ class Runner():
             code = 'R' + str(action.amount)
         self.socketfile.write(code + '\n')
         self.socketfile.flush()
+
+    def should_autofold(self, game_state):
+        '''
+        Returns True if the bot should auto-fold based on remaining hands and bankroll lead.
+        '''
+        remaining_hands = max(0, NUM_ROUNDS - game_state.round_num + 1)
+        return (1.5 * remaining_hands) < (game_state.bankroll - 1)
 
     def run(self):
         '''
@@ -117,8 +124,11 @@ class Runner():
                 self.send(CheckAction())
             else:
                 ##assert active == round_state.button % 2
-                action = self.pokerbot.get_action(game_state, round_state, active)
-                self.send(action)
+                if self.should_autofold(game_state):
+                    self.send(FoldAction())
+                else:
+                    action = self.pokerbot.get_action(game_state, round_state, active)
+                    self.send(action)
 
 
 def parse_args():

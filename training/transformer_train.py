@@ -645,8 +645,9 @@ def pool_select_opponent(
     """Select opponent using diversity-aware sampling.
 
     Sampling distribution (when pool has enough agents):
-    - 67% from top 4 by ELO (hard opponents)
-    - 33% from 2 most style-diverse agents
+    - 50% from top 4 by ELO (hard opponents)
+    - 25% from 2 most style-diverse agents
+    - 25% from 2 most recently added agents
 
     This prevents monoculture while maintaining challenge.
     """
@@ -654,9 +655,9 @@ def pool_select_opponent(
     size = pool.size
     valid_mask = jnp.arange(CFG.pool_max) < size
 
-    # Category selection: 0=top, 1=diverse
-    # Probabilities: 67%, 33%
-    category = jax.random.choice(k_category, 2, p=jnp.array([0.67, 0.33]))
+    # Category selection: 0=top, 1=diverse, 2=recent
+    # Probabilities: 50%, 25%, 25%
+    category = jax.random.choice(k_category, 3, p=jnp.array([0.50, 0.25, 0.25]))
 
     # === Category 0: Top by ELO (top 4) ===
     valid_elo = jnp.where(valid_mask, pool.elo, -1e9)
@@ -681,12 +682,20 @@ def pool_select_opponent(
     diverse_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_diverse, 1))
     idx_diverse = diverse_idx[diverse_pick]
 
+    # === Category 2: Most recent (top 2 by add_order) ===
+    valid_add_order = jnp.where(valid_mask, pool.add_order, -1)
+    _, recent_idx = jax.lax.top_k(valid_add_order, k=2)
+    n_recent = jnp.minimum(size, jnp.int32(2))
+    recent_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_recent, 1))
+    idx_recent = recent_idx[recent_pick]
+
     # Select based on category
     idx = jax.lax.switch(
         category,
         [
             lambda: idx_top,
             lambda: idx_diverse,
+            lambda: idx_recent,
         ],
     )
 
@@ -1665,6 +1674,8 @@ def eval_and_update_pool(
     # Diversity-aware retention: keep pool_max=6 agents
     # - 4 top by ELO (performance)
     # - 2 style-diverse (behavioral diversity)
+    # - 2 most recent (recency)
+    # Note: Categories can overlap, final count capped at pool_max
     # =========================================================================
     size_curr = pool.size
     valid_mask_final = jnp.arange(pool_max) < size_curr
@@ -1698,6 +1709,16 @@ def eval_and_update_pool(
     diverse_keep_mask = (jnp.arange(2) < n_diverse_keep)
     keep_mask = keep_mask.at[diverse_idx].set(
         keep_mask[diverse_idx] | diverse_keep_mask
+    )
+
+    # === Select 2 most recent (by add_order, excluding already kept) ===
+    valid_add_order_final = jnp.where(valid_mask_final & ~keep_mask, pool.add_order, -1)
+    _, recent_idx = jax.lax.top_k(valid_add_order_final, k=2)
+    n_remaining_for_recent = jnp.sum((valid_mask_final & ~keep_mask).astype(jnp.int32))
+    n_recent_keep = jnp.minimum(n_remaining_for_recent, jnp.int32(2))
+    recent_keep_mask = (jnp.arange(2) < n_recent_keep)
+    keep_mask = keep_mask.at[recent_idx].set(
+        keep_mask[recent_idx] | recent_keep_mask
     )
 
     # Gather indices of agents to keep (up to pool_max)

@@ -96,19 +96,19 @@ def card_string_to_index(card_str: str) -> int:
 
 def skeleton_street_to_model_street(street: int) -> int:
     """Convert skeleton street to model street ID.
-    
-    Skeleton streets: 0=preflop, 2=discard?, 3=flop, 4=turn, 5=river
+
+    Skeleton streets: 0=preflop, 2=discard(OOP), 3=discard(dealer), 4=flop, 5=turn, 6=river
     Model streets: 0=preflop, 1=discard, 2=flop, 3=turn, 4=river
     """
     if street == 0:
         return STREET_PREFLOP
-    elif street == 2:  # Discard phase
+    elif street in (2, 3):  # Both discard phases
         return STREET_DISCARD
-    elif street == 3:
-        return STREET_FLOP
     elif street == 4:
-        return STREET_TURN
+        return STREET_FLOP
     elif street == 5:
+        return STREET_TURN
+    elif street == 6:
         return STREET_RIVER
     else:
         return STREET_PREFLOP
@@ -160,6 +160,7 @@ class StateEncoder:
         my_cards: List[str],
         board: List[str],
         is_dealer: bool,
+        discarded_idx: int,
     ) -> torch.Tensor:
         """Encode cards into (9, 2) tensor.
         
@@ -176,8 +177,10 @@ class StateEncoder:
         """
         card_tensor = torch.full((CARD_SEQ_LEN, CARD_INPUT_DIM), -1, dtype=torch.long)
         
-        # Hero's hole cards (positions 0-2)
+        # Hero's hole cards (positions 0-2) in original order.
         for i, card_str in enumerate(my_cards[:3]):
+            if i == discarded_idx:
+                continue
             card_idx = card_string_to_index(card_str)
             if card_idx >= 0:
                 card_tensor[i, 0] = card_idx
@@ -274,6 +277,7 @@ class Player(Bot):
         self.model = None
         self.encoder = StateEncoder()
         self.device = "cpu"
+        self._last_round_state = None
 
         self._load_model()
 
@@ -372,19 +376,24 @@ class Player(Bot):
         
         # Store our hole cards
         self.encoder.my_hole_cards = list(round_state.hands[active])
+        self._last_round_state = round_state
     
     def handle_round_over(self, game_state, terminal_state, active):
         """Called when a round ends."""
-        pass
+        self._last_round_state = None
     
     def get_action(self, game_state, round_state, active):
         """Get action from the model."""
+        self._sync_action_history(round_state, active)
         legal_actions = round_state.legal_actions()
         street = round_state.street
         
         # Handle discard phase
         if DiscardAction in legal_actions:
             return self._get_discard_action(game_state, round_state, active, legal_actions)
+        if street in (2, 3):
+            # Discard rounds: the non-discarding player should only check.
+            return CheckAction()
         
         # Handle betting phase
         return self._get_betting_action(game_state, round_state, active, legal_actions)
@@ -400,9 +409,10 @@ class Player(Bot):
         
         # Build tensors
         card_tensor = self.encoder.encode_cards(
-            my_cards,
+            self.encoder.my_hole_cards,
             list(round_state.board),
             self.encoder.is_dealer,
+            self.encoder.my_discarded_idx,
         ).unsqueeze(0)
         
         action_tensor, action_mask = self.encoder.encode_actions()
@@ -433,9 +443,12 @@ class Player(Bot):
         else:
             # Fallback
             discard_idx = 0
+
+        self.encoder.my_discarded_idx = discard_idx
         
         # Record the action
         self._record_my_action(round_state, active, action_idx)
+        self._advance_last_state(round_state, DiscardAction(discard_idx))
         
         return DiscardAction(discard_idx)
     
@@ -446,11 +459,18 @@ class Player(Bot):
         if self.model is None:
             return self._fallback_action(round_state, legal_actions)
         
+        to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+        if to_call == 0 and FoldAction in legal_actions:
+            # Never fold for free; treat fold as illegal when checking is possible.
+            legal_actions = set(legal_actions)
+            legal_actions.discard(FoldAction)
+
         # Build tensors
         card_tensor = self.encoder.encode_cards(
-            my_cards,
+            self.encoder.my_hole_cards,
             list(round_state.board),
             self.encoder.is_dealer,
+            self.encoder.my_discarded_idx,
         ).unsqueeze(0)
         
         action_tensor, action_mask = self.encoder.encode_actions()
@@ -473,6 +493,7 @@ class Player(Bot):
         
         # Record the action
         self._record_my_action(round_state, active, action_idx)
+        self._advance_last_state(round_state, skeleton_action)
         
         return skeleton_action
     
@@ -557,58 +578,168 @@ class Player(Bot):
         elif action_idx in (ACT_RAISE_MIN, ACT_RAISE_33, ACT_RAISE_50, ACT_RAISE_75, ACT_RAISE_125, ACT_RAISE_200, ACT_ALLIN):
             if RaiseAction not in legal_actions:
                 return CallAction() if CallAction in legal_actions else CheckAction()
-            
-            min_raise, max_raise = self._raise_bounds_training(round_state, active)
-            to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
-            total_committed = (STARTING_STACK * 2) - (round_state.stacks[0] + round_state.stacks[1])
-            pot_base = total_committed + to_call
-            last_raise_amt = self._last_raise_amt(round_state)
-            
-            # Calculate target raise amount
-            if action_idx == ACT_RAISE_MIN:
-                amount = round_state.pips[active] + to_call + last_raise_amt
-            elif action_idx == ACT_RAISE_33:
-                amount = round_state.pips[active] + to_call + (pot_base // 3)
-            elif action_idx == ACT_RAISE_50:
-                amount = round_state.pips[active] + to_call + (pot_base // 2)
-            elif action_idx == ACT_RAISE_75:
-                amount = round_state.pips[active] + to_call + ((pot_base * 3) // 4)
-            elif action_idx == ACT_RAISE_125:
-                amount = round_state.pips[active] + to_call + ((pot_base * 5) // 4)
-            elif action_idx == ACT_RAISE_200:
-                amount = round_state.pips[active] + to_call + (pot_base * 2)
-            elif action_idx == ACT_ALLIN:
-                amount = max_raise
-            else:
-                amount = min_raise
-            
-            # Clamp to valid range
-            amount = max(min_raise, min(amount, max_raise))
+
+            amount = self._compute_raise_amount(round_state, active, action_idx)
             return RaiseAction(amount)
+
+        # Fallback for unexpected indices (e.g., discard actions during betting)
+        if CheckAction in legal_actions:
+            return CheckAction()
+        return CallAction() if CallAction in legal_actions else FoldAction()
         
     
     def _record_my_action(self, round_state, active, action_idx: int):
         """Record our action in the history."""
-        # Calculate betting context
+        self._record_action(round_state, active, 0, action_idx)
+
+    def _record_action(self, round_state, active, actor_id: int, action_idx: int):
+        """Record any action (self or opponent) in the history."""
         my_pip = round_state.pips[active]
         opp_pip = round_state.pips[1 - active]
         my_stack = round_state.stacks[active]
         opp_stack = round_state.stacks[1 - active]
-        
+
         to_call = max(0, opp_pip - my_pip)
-        pot_committed = my_pip + opp_pip
+        total_committed = (STARTING_STACK * 2) - (round_state.stacks[0] + round_state.stacks[1])
+        pot_base = total_committed + to_call
         eff_stack = min(my_stack, opp_stack + to_call)
-        
+
         street = skeleton_street_to_model_street(round_state.street)
-        
+
         self.encoder.record_action(
-            actor_id=0,  # 0 = self (ego-relative)
+            actor_id=actor_id,
             event_type=action_idx,
             street=street,
             to_call=float(to_call),
-            pot_committed=float(pot_committed),
+            pot_committed=float(pot_base),
             eff_stack=float(eff_stack),
         )
+
+    def _compute_raise_amount(self, round_state, active: int, action_idx: int) -> int:
+        min_raise, max_raise = self._raise_bounds_training(round_state, active)
+        to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+        total_committed = (STARTING_STACK * 2) - (round_state.stacks[0] + round_state.stacks[1])
+        pot_base = total_committed + to_call
+        last_raise_amt = self._last_raise_amt(round_state)
+
+        if action_idx == ACT_RAISE_MIN:
+            amount = round_state.pips[active] + to_call + last_raise_amt
+        elif action_idx == ACT_RAISE_33:
+            amount = round_state.pips[active] + to_call + (pot_base // 3)
+        elif action_idx == ACT_RAISE_50:
+            amount = round_state.pips[active] + to_call + (pot_base // 2)
+        elif action_idx == ACT_RAISE_75:
+            amount = round_state.pips[active] + to_call + ((pot_base * 3) // 4)
+        elif action_idx == ACT_RAISE_125:
+            amount = round_state.pips[active] + to_call + ((pot_base * 5) // 4)
+        elif action_idx == ACT_RAISE_200:
+            amount = round_state.pips[active] + to_call + (pot_base * 2)
+        elif action_idx == ACT_ALLIN:
+            amount = max_raise
+        else:
+            amount = min_raise
+
+        return int(max(min_raise, min(amount, max_raise)))
+
+    def _sync_action_history(self, round_state, active):
+        """Record any actions since the last observed state."""
+        if self._last_round_state is None:
+            self._last_round_state = round_state
+            return
+
+        states = []
+        cursor = round_state
+        while cursor is not None and cursor is not self._last_round_state:
+            states.append(cursor)
+            cursor = cursor.previous_state
+
+        if cursor is None:
+            self.encoder.reset()
+            self.encoder.is_dealer = (active == 0)
+            self.encoder.my_hole_cards = list(round_state.hands[active])
+            self._last_round_state = round_state
+            return
+
+        for state in reversed(states):
+            prev = state.previous_state
+            if prev is None:
+                continue
+            action_idx = self._infer_action_index(prev, state, active)
+            actor = prev.button % 2
+            actor_id = 0 if actor == active else 1
+            if action_idx is None:
+                continue
+            if action_idx in (ACT_DISCARD_0, ACT_DISCARD_1, ACT_DISCARD_2) and actor == active:
+                self.encoder.my_discarded_idx = action_idx - ACT_DISCARD_0
+            self._record_action(prev, active, actor_id, action_idx)
+
+        self._last_round_state = round_state
+
+    def _infer_action_index(self, prev_state, next_state, active) -> Optional[int]:
+        """Infer model action index from a state transition."""
+        if isinstance(next_state, TerminalState):
+            continue_cost = prev_state.pips[1 - (prev_state.button % 2)] - prev_state.pips[prev_state.button % 2]
+            if continue_cost > 0:
+                return ACT_FOLD
+            return None
+
+        actor = prev_state.button % 2
+        prev_hands = prev_state.hands[actor]
+        next_hands = next_state.hands[actor]
+
+        if len(next_state.board) > len(prev_state.board):
+            if len(prev_hands) == len(next_hands) + 1:
+                discarded_card = next(set(prev_hands) - set(next_hands), None)
+                if discarded_card is not None and discarded_card in prev_hands:
+                    discard_idx = prev_hands.index(discarded_card)
+                    return ACT_DISCARD_0 + discard_idx
+
+        # Skip check actions during discard phases (streets 2, 3)
+        # Training environment doesn't have these - only the discarding player acts
+        # Street 2: player 1 (OOP) discards, player 0 checks
+        # Street 3: player 0 (dealer) discards, player 1 checks
+        # Skip if actor is the non-discarding player (actor == street % 2)
+        if prev_state.street in (2, 3) and actor == (prev_state.street % 2):
+            return None
+
+        continue_cost = prev_state.pips[1 - actor] - prev_state.pips[actor]
+        if next_state.street == prev_state.street and next_state.pips[actor] > prev_state.pips[actor]:
+            if next_state.pips[actor] > next_state.pips[1 - actor]:
+                amount = next_state.pips[actor]
+                return self._map_raise_amount_to_action_idx(prev_state, actor, amount)
+            if continue_cost > 0:
+                return ACT_CALL
+
+        if continue_cost > 0:
+            return ACT_CALL
+        return ACT_CHECK
+
+    def _map_raise_amount_to_action_idx(self, round_state, active: int, amount: int) -> int:
+        """Map an observed raise amount to the closest model action index."""
+        candidates = [
+            ACT_RAISE_MIN,
+            ACT_RAISE_33,
+            ACT_RAISE_50,
+            ACT_RAISE_75,
+            ACT_RAISE_125,
+            ACT_RAISE_200,
+            ACT_ALLIN,
+        ]
+        amounts = {idx: self._compute_raise_amount(round_state, active, idx) for idx in candidates}
+        for idx in candidates:
+            if amounts[idx] == amount:
+                return idx
+        best = min(candidates, key=lambda idx: (abs(amounts[idx] - amount), idx))
+        return best
+
+    def _advance_last_state(self, round_state, action):
+        """Advance internal pointer to keep action sync consistent.
+
+        NOTE: We do NOT call proceed() here because it mutates shared state
+        (hands/board lists). The runner will process the engine's response
+        and update state correctly. We just mark current state as seen.
+        """
+        self._last_round_state = round_state
     
     def _fallback_action(self, round_state, legal_actions):
         """Fallback action when model is not available."""

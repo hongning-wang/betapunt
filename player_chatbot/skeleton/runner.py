@@ -5,7 +5,7 @@ import argparse
 import socket
 from .actions import FoldAction, CallAction, CheckAction, RaiseAction, DiscardAction
 from .states import GameState, TerminalState, RoundState
-from .states import STARTING_STACK, BIG_BLIND, SMALL_BLIND
+from .states import STARTING_STACK, BIG_BLIND, SMALL_BLIND, NUM_ROUNDS
 from .bot import Bot
 
 
@@ -109,7 +109,7 @@ class Runner():
                     deltas[active] = delta
                     round_state = TerminalState(deltas, round_state.previous_state)
                     self.pokerbot.handle_round_over(game_state, round_state, active)
-                    game_state = GameState(game_state.bankroll + delta, game_state.game_clock, game_state.round_num)
+                    game_state = GameState(game_state.bankroll + delta, game_state.game_clock, game_state.round_num + 1)
                     round_flag = True
                 elif clause[0] == 'Q':
                     return
@@ -117,7 +117,12 @@ class Runner():
                 self.send(CheckAction())
             else:
                 ##assert active == round_state.button % 2
-                action = self.pokerbot.get_action(game_state, round_state, active)
+                remaining_hands = max(0, NUM_ROUNDS - game_state.round_num + 1)
+                should_auto_fold = (3 / 2) * remaining_hands < (game_state.bankroll + 1)
+                if should_auto_fold and FoldAction in round_state.legal_actions():
+                    action = FoldAction()
+                else:
+                    action = self.pokerbot.get_action(game_state, round_state, active)
                 self.send(action)
 
 
