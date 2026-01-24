@@ -83,7 +83,7 @@ class Config:
     vf_coef: float = 0.5
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.02
+    ent_coef_init: float = 0.01
     ent_coef_final: float = 0.001
     ent_decay_steps: int = 15_000
 
