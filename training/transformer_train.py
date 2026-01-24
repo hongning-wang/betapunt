@@ -79,11 +79,11 @@ class Config:
     rho_bar: float = 1.0   # Importance weight clip for value target (ρ̂)
     c_bar: float = 1.0     # Trace cutting coefficient (c)
     pg_rho_bar: float = 1.0  # Policy gradient importance weight clip
-    vf_coef: float = 0.5
+    vf_coef: float = 0.25
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.02
-    ent_coef_final: float = 0.001
+    ent_coef_init: float = 0.01
+    ent_coef_final: float = 0.005
     ent_decay_steps: int = 15_000
 
     # Optimization with schedule
@@ -105,11 +105,11 @@ class Config:
     recent_window_transitions: int = 500_000  # Sample only from recent N transitions (0 = no limit)
 
     # League training (K-best self-play)
-    k_best: int = 5
     pool_max: int = 8
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
     elo_k: float = 32.0
+    elo_tau: float = eval_hands  # Temperature for EV-soft sigmoid scoring (chip units)
 
     # Runtime
     seed: int = 0
@@ -1499,9 +1499,15 @@ def eval_and_update_pool(
     avg_top_elo = jnp.sum(topk_vals * topk_mask) / denom
     
     entry_elo = jnp.where(pool.size > 0, avg_top_elo, 0.0)
-    pool = pool_add(pool, main_state.params, entry_elo)
-    
-    # Trim to K-best
+    pool = pool_add(pool, main_state.params, entry_elo, main_style_stats)
+
+    # =========================================================================
+    # Diversity-aware retention: keep pool_max=8 agents
+    # - 4 top by ELO (performance)
+    # - 2 style-diverse (behavioral diversity)
+    # - 2 most recent (recency)
+    # Note: Categories can overlap, final count capped at pool_max
+    # =========================================================================
     size_curr = pool.size
     valid_mask_final = jnp.arange(pool_max) < size_curr
     valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)

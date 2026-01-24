@@ -6,7 +6,7 @@ Architecture:
 - Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Projection -> (B, 9, 256)
 - Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 32, 256)
 - Cross-Attention Fusion: Multiple layers of learnable queries attending to context
-- Separate Output Heads: Policy (13), Value (1)
+- Separate Output Heads: Betting Policy (10), Discard Policy (3), Value (1)
 """
 
 from __future__ import annotations
@@ -28,6 +28,8 @@ import torch.nn.functional as F
 class TossHoldemTransformerConfig:
     """Configuration matching the JAX model."""
     num_actions: int = 13
+    num_betting_actions: int = 10
+    num_discard_actions: int = 3
     card_seq_len: int = 9
     action_seq_len: int = 32
     num_card_types: int = 9
@@ -360,9 +362,13 @@ class TossHoldemTransformerTorch(nn.Module):
         self.processing_fc1 = nn.Linear(flat_dim, 512)
         self.processing_fc2 = nn.Linear(512, cfg.processing_dim)
 
-        # Policy head
-        self.policy_hidden = nn.Linear(cfg.processing_dim, 128)
-        self.policy_out = nn.Linear(128, cfg.num_actions)
+        # Betting policy head (actions 0-9)
+        self.betting_hidden = nn.Linear(cfg.processing_dim, 128)
+        self.betting_out = nn.Linear(128, cfg.num_betting_actions)
+
+        # Discard policy head (actions 10-12)
+        self.discard_hidden = nn.Linear(cfg.processing_dim, 128)
+        self.discard_out = nn.Linear(128, cfg.num_discard_actions)
 
         # Value head
         self.value_hidden = nn.Linear(cfg.processing_dim, 128)
@@ -408,8 +414,13 @@ class TossHoldemTransformerTorch(nn.Module):
         processed = F.relu(self.processing_fc2(processed))  # (B, 256)
 
         # 5. Output heads
-        policy_h = F.relu(self.policy_hidden(processed))
-        policy_logits = self.policy_out(policy_h)  # (B, 13)
+        betting_h = F.relu(self.betting_hidden(processed))
+        betting_logits = self.betting_out(betting_h)  # (B, 10)
+
+        discard_h = F.relu(self.discard_hidden(processed))
+        discard_logits = self.discard_out(discard_h)  # (B, 3)
+
+        policy_logits = torch.cat([betting_logits, discard_logits], dim=-1)  # (B, 13)
 
         value_h = F.relu(self.value_hidden(processed))
         value = self.value_out(value_h).squeeze(-1)  # (B,)

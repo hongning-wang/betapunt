@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import orbax.checkpoint as ocp
 
-from python_bot.torch_transformer_model import (
+from python_bot_new.torch_transformer_model import (
     TossHoldemTransformerConfig,
     TossHoldemTransformerTorch,
 )
@@ -228,8 +228,10 @@ def load_flax_params_into_torch(
     # =========================================================================
     # Output heads
     # =========================================================================
-    put_linear_dict(flax_params["policy_hidden"], model.policy_hidden)
-    put_linear_dict(flax_params["policy_out"], model.policy_out)
+    put_linear_dict(flax_params["betting_hidden"], model.betting_hidden)
+    put_linear_dict(flax_params["betting_out"], model.betting_out)
+    put_linear_dict(flax_params["discard_hidden"], model.discard_hidden)
+    put_linear_dict(flax_params["discard_out"], model.discard_out)
     put_linear_dict(flax_params["value_hidden"], model.value_hidden)
     put_linear_dict(flax_params["value_out"], model.value_out)
 
