@@ -113,7 +113,7 @@ class Config:
 
     # Runtime
     seed: int = 0
-    total_updates: int = 20_000
+    total_updates: int = 40_000
     block_size: int = 100  # Number of collect+update steps per scan block (reduces host-device sync)
 
     # Checkpointing
