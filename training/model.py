@@ -295,16 +295,11 @@ class CardEncoder(nn.Module):
         # -----------------------------
         # Safe / derived categorical ids
         # -----------------------------
-        # Map invalid card_index (-1) to a safe placeholder 52 for computations
         card_index_safe = jnp.where(card_index >= 0, card_index, 52).astype(jnp.int32)
 
-        # Derive rank/suit for valid cards
-        # rank: 0-12, suit: 0-3
         rank = (card_index_safe % 13).astype(jnp.int32)
         suit = (card_index_safe // 13).astype(jnp.int32)
 
-        # Use dedicated "invalid" buckets for embeddings:
-        # rank_invalid = 13, suit_invalid = 4
         is_invalid = card_index < 0
         rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)  # 0-12 + 13 invalid
         suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)   # 0-3 + 4 invalid
@@ -357,7 +352,7 @@ class CardEncoder(nn.Module):
         )(hidden)  # (B, 9, emb_dim)
 
         return card_repr, valid_mask
-
+    
 class ActionEncoder(nn.Module):
     """Encodes action history tensor using embeddings and transformer.
 
