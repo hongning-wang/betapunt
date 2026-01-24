@@ -105,6 +105,7 @@ class Config:
 
     # League training (K-best self-play)
     pool_max: int = 8
+    k_best: int = 4  # Number of top agents to keep by ELO
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
     elo_k: float = 32.0
@@ -423,8 +424,8 @@ def encode_obs(
 
     Returns:
         card_tensor: (CARD_SEQ_LEN, CARD_INPUT_DIM) = (9, 2) int32
-        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7) float32
-        action_mask: (ACTION_SEQ_LEN,) = (40,) bool
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7) float32
+        action_mask: (ACTION_SEQ_LEN,) = (32,) bool
         legal_mask: (NUM_ACTIONS,) = (13,) bool
     """
     card_tensor = encode_cards(state, player_id)
@@ -615,6 +616,8 @@ class AgentPool:
     """Pool of historical agent parameters for self-play."""
     params: Any              # Stacked params along axis 0
     elo: chex.Array          # (pool_max,) ELO ratings
+    style_stats: chex.Array  # (pool_max, 3) style statistics [raise_rate, fold_rate, call_rate]
+    add_order: chex.Array    # (pool_max,) incremental counter for recency tracking
     size: chex.Array         # Current number of agents
 
 
@@ -622,30 +625,36 @@ def pool_init(dummy_params: Any) -> AgentPool:
     """Initialize empty agent pool."""
     def _zeros_like(p):
         return jnp.zeros((CFG.pool_max,) + p.shape, dtype=p.dtype)
-    
+
     params = jax.tree_util.tree_map(_zeros_like, dummy_params)
     elo = jnp.zeros((CFG.pool_max,), dtype=jnp.float32)
-    return AgentPool(params=params, elo=elo, size=jnp.int32(0))
+    style_stats = jnp.zeros((CFG.pool_max, 3), dtype=jnp.float32)
+    add_order = jnp.zeros((CFG.pool_max,), dtype=jnp.int32)
+    return AgentPool(params=params, elo=elo, style_stats=style_stats, add_order=add_order, size=jnp.int32(0))
 
 
 @jax.jit
-def pool_add(pool: AgentPool, new_params: Any, initial_elo: chex.Array) -> AgentPool:
+def pool_add(pool: AgentPool, new_params: Any, initial_elo: chex.Array, new_style_stats: chex.Array) -> AgentPool:
     """Add a new agent to the pool."""
     size = pool.size
     can_append = size < CFG.pool_max
-    
+
     # If pool is full, replace worst agent
     worst = jnp.argmin(jnp.where(jnp.arange(CFG.pool_max) < size, pool.elo, 1e9))
     write_idx = jnp.where(can_append, size, worst)
-    
+
     def _write_leaf(pool_leaf, new_leaf):
         return pool_leaf.at[write_idx].set(new_leaf)
-    
+
     params = jax.tree_util.tree_map(_write_leaf, pool.params, new_params)
     elo = pool.elo.at[write_idx].set(initial_elo)
+    style_stats = pool.style_stats.at[write_idx].set(new_style_stats)
+    # add_order tracks insertion order: max existing + 1
+    next_order = jnp.max(pool.add_order) + 1
+    add_order = pool.add_order.at[write_idx].set(next_order)
     size2 = jnp.where(can_append, size + 1, size)
-    
-    return pool.replace(params=params, elo=elo, size=size2)
+
+    return pool.replace(params=params, elo=elo, style_stats=style_stats, add_order=add_order, size=size2)
 
 
 def elo_expected(ra: chex.Array, rb: chex.Array) -> chex.Array:
@@ -1630,57 +1639,64 @@ def eval_and_update_pool(
     eval_hands = CFG.eval_hands
     k_best = CFG.k_best
     elo_k = CFG.elo_k
-    
+    elo_tau = CFG.elo_tau
+
     # Generate keys for matches
     key, sub = jax.random.split(key)
     keys_grid = jax.random.split(sub, pool_max * eval_hands).reshape((pool_max, eval_hands, -1))
-    
+
     valid_mask = jnp.arange(pool_max) < pool.size
     valid_f = valid_mask.astype(jnp.float32)
     n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
-    
+
     # Play matches - half as P0, half as P1 to eliminate position bias
     def play_vs_one_opp(opp_params, keys_n):
         half = eval_hands // 2
         # First half: main as P0
-        scores_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
+        chip_delta_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
             main_state.params, opp_params, keys_n[:half]
         )
-        # Second half: main as P1 (swap params, invert score)
-        scores_p1_raw, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
+        # Second half: main as P1 (swap params, negate chip delta)
+        chip_delta_p1_raw, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
             opp_params, main_state.params, keys_n[half:]
         )
-        scores_p1 = 1.0 - scores_p1_raw  # Invert: P1 win -> main win
-        scores = jnp.concatenate([scores_p0, scores_p1])
-        return jnp.mean(scores)
-    
+        chip_delta_p1 = -chip_delta_p1_raw  # Main's chip delta = -opponent's chip delta
+        chip_deltas = jnp.concatenate([chip_delta_p0, chip_delta_p1])
+        # Convert to ELO score via sigmoid: maps chip delta to [0, 1]
+        avg_delta = jnp.mean(chip_deltas)
+        return 1.0 / (1.0 + jnp.exp(-avg_delta / elo_tau))
+
     scores_pool = jax.vmap(play_vs_one_opp, in_axes=(0, 0))(pool.params, keys_grid)
-    scores_pool = jnp.where(valid_mask, scores_pool, 0.0)
-    
+    scores_pool = jnp.where(valid_mask, scores_pool, 0.5)  # 0.5 = draw for invalid
+
     # Update ELOs
     ea_pool = elo_expected(main_elo, pool.elo)
     eb_pool = 1.0 - ea_pool
-    
+
     delta_main = elo_k * (scores_pool - ea_pool)
     delta_opp = elo_k * ((1.0 - scores_pool) - eb_pool)
-    
+
     main_change = jnp.sum(delta_main * valid_f) / n_valid
     main_elo_next = main_elo + main_change
-    
+
     pool_elo_next = pool.elo + jnp.where(valid_mask, delta_opp, 0.0)
     pool = pool.replace(elo=pool_elo_next)
-    
+
+    # Compute main agent's style stats
+    key, k_style = jax.random.split(key)
+    main_style_stats, _ = compute_style_stats(main_state.params, k_style)
+
     # Add main to pool
     valid_elos = jnp.where(valid_mask, pool.elo, -1e9)
     _, topk_idx = jax.lax.top_k(valid_elos, k=k_best)
-    
+
     k_eff = jnp.minimum(pool.size, jnp.int32(k_best))
     topk_mask = (jnp.arange(k_best) < k_eff).astype(jnp.float32)
-    
+
     topk_vals = pool.elo[topk_idx]
     denom = jnp.maximum(1.0, jnp.sum(topk_mask))
     avg_top_elo = jnp.sum(topk_vals * topk_mask) / denom
-    
+
     entry_elo = jnp.where(pool.size > 0, avg_top_elo, 0.0)
     pool = pool_add(pool, main_state.params, entry_elo, main_style_stats)
 
@@ -1694,10 +1710,10 @@ def eval_and_update_pool(
     size_curr = pool.size
     valid_mask_final = jnp.arange(pool_max) < size_curr
     valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)
-    
+
     _, keep_idx = jax.lax.top_k(valid_elos_final, k=k_best)
     n_keep = jnp.minimum(size_curr, jnp.int32(k_best))
-    
+
     def _gather_pad(x):
         picked = x[keep_idx]
         mask = (jnp.arange(k_best) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
@@ -1705,18 +1721,28 @@ def eval_and_update_pool(
         pad_len = pool_max - k_best
         pad = jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype)
         return jnp.concatenate([picked, pad], axis=0)
-    
+
     new_params = jax.tree_util.tree_map(_gather_pad, pool.params)
-    
+
     picked_elo = pool.elo[keep_idx]
     picked_elo = picked_elo * (jnp.arange(k_best) < n_keep).astype(jnp.float32)
     new_elo = jnp.concatenate(
         [picked_elo, jnp.zeros(pool_max - k_best, dtype=pool.elo.dtype)],
         axis=0,
     )
-    
-    pool_final = pool.replace(params=new_params, elo=new_elo, size=n_keep)
-    
+
+    # Also retain style_stats and add_order for kept agents
+    new_style_stats = _gather_pad(pool.style_stats)
+    new_add_order = _gather_pad(pool.add_order)
+
+    pool_final = pool.replace(
+        params=new_params,
+        elo=new_elo,
+        style_stats=new_style_stats,
+        add_order=new_add_order,
+        size=n_keep,
+    )
+
     return pool_final, main_elo_next, key
 
 
@@ -1896,7 +1922,9 @@ def main() -> None:
 
     # Initialize pool with initial agent
     pool = pool_init(ts.params)
-    pool = pool_add(pool, ts.params, jnp.float32(0.0))
+    # Initial style stats: use zeros (will be updated on first pool evaluation)
+    init_style_stats = jnp.zeros(3, dtype=jnp.float32)
+    pool = pool_add(pool, ts.params, jnp.float32(0.0), init_style_stats)
     main_elo = jnp.float32(0.0)
 
     # Initialize environment
