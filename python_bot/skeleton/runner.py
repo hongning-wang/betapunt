@@ -123,7 +123,7 @@ class Runner():
             if round_flag or isinstance(round_state, TerminalState):  # ack the engine
                 self.send(CheckAction())
             else:
-                ##assert active == round_state.button % 2
+                assert active == round_state.button % 2
                 if self.should_autofold(game_state):
                     self.send(FoldAction())
                 else:
