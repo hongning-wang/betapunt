@@ -22,6 +22,8 @@ import chex
 # =============================================================================
 
 NUM_ACTIONS = 13
+NUM_BETTING_ACTIONS = 10  # Actions 0-9: Fold, Check, Call, raises, All-in
+NUM_DISCARD_ACTIONS = 3   # Actions 10-12: Discard card 0, 1, or 2
 CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
 ACTION_SEQ_LEN = 32
 NUM_CARD_TYPES = 9
@@ -65,21 +67,17 @@ class MultiHeadAttention(nn.Module):
         k = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(key)
         v = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(value)
 
-        q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim)
+        k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
+        v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
 
-        scale = jnp.sqrt(jnp.float32(self.head_dim))
-        attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) / scale
+        # Convert boolean mask to bias: True (valid) -> 0, False (invalid) -> -1e9
+        # Shape: (B, kv_len) -> (B, 1, 1, kv_len) for broadcasting
+        bias = jnp.where(mask[:, None, None, :], 0.0, -1e9)
 
-        if mask is not None:
-            mask = mask[:, None, None, :]
-            attn_weights = jnp.where(mask, attn_weights, -1e9)
+        attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias)
 
-        attn_weights = jax.nn.softmax(attn_weights, axis=-1)
-        attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
-
-        attn_output = attn_output.transpose(0, 2, 1, 3).reshape(batch_size, q_len, projection_dim)
+        attn_output = attn_output.reshape(batch_size, q_len, projection_dim)
         output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(attn_output)
 
         return output
@@ -589,20 +587,38 @@ class TossHoldemModel(nn.Module):
         # 5. SEPARATE Output heads (policy and value have independent MLPs)
         # =================================================================
 
-        # --- Policy head: Independent MLP ---
-        policy_hidden = nn.Dense(
+        # --- Betting Policy head (actions 0-9) ---
+        betting_hidden = nn.Dense(
             128,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-            name='policy_hidden',
+            name='betting_hidden',
         )(processed)
-        policy_hidden = nn.relu(policy_hidden)
-        policy_logits = nn.Dense(
-            self.num_actions,
+        betting_hidden = nn.relu(betting_hidden)
+        betting_logits = nn.Dense(
+            NUM_BETTING_ACTIONS,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-            name='policy_out',
-        )(policy_hidden)
+            name='betting_out',
+        )(betting_hidden)
+
+        # --- Discard Policy head (actions 10-12) ---
+        discard_hidden = nn.Dense(
+            128,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='discard_hidden',
+        )(processed)
+        discard_hidden = nn.relu(discard_hidden)
+        discard_logits = nn.Dense(
+            NUM_DISCARD_ACTIONS,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='discard_out',
+        )(discard_hidden)
+
+        # Concatenate for backward compatibility: (B, 10) + (B, 3) -> (B, 13)
+        policy_logits = jnp.concatenate([betting_logits, discard_logits], axis=-1)
 
         # --- Value head: Independent MLP ---
         # Allow value gradients to flow into the shared representation

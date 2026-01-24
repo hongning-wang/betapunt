@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 import os
+import shutil
 from typing import Any, Dict, Tuple
 
 import chex
@@ -105,7 +106,7 @@ class Config:
     recent_window_transitions: int = 2 * num_envs * rollout_len # Sample only from recent N transitions (0 = no limit)
 
     # League training (K-best self-play)
-    pool_max: int = 8
+    pool_max: int = 6
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
     elo_k: float = 32.0
@@ -119,7 +120,7 @@ class Config:
     # Checkpointing
     checkpoint_dir: str = "/content/drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
-    log_every: int = 50
+    log_every: int = 2 * block_size
 
 
 CFG = Config()
@@ -493,40 +494,27 @@ def unroll_buffer_sample(
     key: chex.PRNGKey,
     batch_size: int,
 ) -> Tuple[Unroll, chex.PRNGKey]:
-    """Sample batch_size unrolls from the buffer.
-
-    Returns unrolls with shape (batch_size, T, E, ...).
-    """
+    """Sample batch_size unrolls from the buffer using O(1) direct indexing."""
     key, sub = jax.random.split(key)
     cap = buf.card.shape[0]
 
-    # Use recent window for sampling (convert transitions to unrolls)
-    # Each unroll contains rollout_len * num_envs transitions
-    # Use ceiling division to ensure at least 1 unroll when window > 0
+    # Calculate how many recent unrolls are available for sampling
     transitions_per_unroll = CFG.rollout_len * CFG.num_envs
-    # Ceiling division: (a + b - 1) // b, with minimum of 1
     recent_window_unrolls = jnp.where(
         CFG.recent_window_transitions > 0,
         jnp.maximum(1, jnp.int32((CFG.recent_window_transitions + transitions_per_unroll - 1) // transitions_per_unroll)),
         cap,
     )
+    # The number of valid items we can sample from (e.g., min(200k, 16))
     available = jnp.minimum(buf.size, recent_window_unrolls)
 
-    # Sample from available unrolls
-    age = (buf.ptr - 1 - jnp.arange(cap, dtype=jnp.int32)) % cap
-    eligible = jnp.where(available > 0, age < available, jnp.zeros_like(age, dtype=jnp.bool_))
-    elig_w = eligible.astype(jnp.float32)
-    elig_sum = jnp.sum(elig_w)
+    # OPTIMIZATION: Sample indices directly from range [0, available)
+    # This avoids creating a 200,000-element mask every step
+    sample_indices = jax.random.randint(sub, (batch_size,), 0, available)
 
-    def _sample():
-        p = jnp.where(
-            elig_sum > 0,
-            elig_w / elig_sum,
-            jnp.ones((cap,), dtype=jnp.float32) / jnp.float32(cap)
-        )
-        return jax.random.choice(sub, cap, shape=(batch_size,), replace=True, p=p)
-
-    idx = _sample()
+    # Map these "relative ages" back to actual buffer indices
+    # index = (current_ptr - 1 - relative_age) % capacity
+    idx = (buf.ptr - 1 - sample_indices) % cap
 
     unroll = Unroll(
         card=buf.card[idx],
@@ -559,7 +547,6 @@ class AgentPool:
 
     Retains agents based on:
     - Top 4 by ELO (performance)
-    - 2 most recent snapshots (recency)
     - 2 style-diverse agents (behavioral diversity via raise/fold/call rates)
     """
     params: Any              # Stacked params along axis 0
@@ -658,9 +645,8 @@ def pool_select_opponent(
     """Select opponent using diversity-aware sampling.
 
     Sampling distribution (when pool has enough agents):
-    - 50% from near-top by ELO (hard opponents)
-    - 25% from most recent snapshots
-    - 25% from style-diverse/weak tails
+    - 67% from top 4 by ELO (hard opponents)
+    - 33% from 2 most style-diverse agents
 
     This prevents monoculture while maintaining challenge.
     """
@@ -668,9 +654,9 @@ def pool_select_opponent(
     size = pool.size
     valid_mask = jnp.arange(CFG.pool_max) < size
 
-    # Category selection: 0=top, 1=recent, 2=diverse
-    # Probabilities: 50%, 25%, 25%
-    category = jax.random.choice(k_category, 3, p=jnp.array([0.5, 0.25, 0.25]))
+    # Category selection: 0=top, 1=diverse
+    # Probabilities: 67%, 33%
+    category = jax.random.choice(k_category, 2, p=jnp.array([0.67, 0.33]))
 
     # === Category 0: Top by ELO (top 4) ===
     valid_elo = jnp.where(valid_mask, pool.elo, -1e9)
@@ -679,14 +665,7 @@ def pool_select_opponent(
     top_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_top, 1))
     idx_top = top_idx[top_pick]
 
-    # === Category 1: Most recent (top 2 by add_order) ===
-    valid_order = jnp.where(valid_mask, pool.add_order, -1)
-    _, recent_idx = jax.lax.top_k(valid_order, k=2)
-    n_recent = jnp.minimum(size, jnp.int32(2))
-    recent_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_recent, 1))
-    idx_recent = recent_idx[recent_pick]
-
-    # === Category 2: Style-diverse (maximize distance from mean style) ===
+    # === Category 1: Style-diverse (maximize distance from mean style) ===
     # Compute mean style across valid agents
     valid_f = valid_mask.astype(jnp.float32)
     n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
@@ -707,7 +686,6 @@ def pool_select_opponent(
         category,
         [
             lambda: idx_top,
-            lambda: idx_recent,
             lambda: idx_diverse,
         ],
     )
@@ -1684,9 +1662,8 @@ def eval_and_update_pool(
     pool = pool_add(pool, main_state.params, entry_elo, main_style_stats)
 
     # =========================================================================
-    # Diversity-aware retention: keep pool_max=8 agents
+    # Diversity-aware retention: keep pool_max=6 agents
     # - 4 top by ELO (performance)
-    # - 2 most recent (recency)
     # - 2 style-diverse (behavioral diversity)
     # =========================================================================
     size_curr = pool.size
@@ -1703,15 +1680,6 @@ def eval_and_update_pool(
     elo_keep_mask = (jnp.arange(4) < n_elo_keep)
     keep_mask = keep_mask.at[elo_top_idx].set(
         keep_mask[elo_top_idx] | elo_keep_mask
-    )
-
-    # === Select 2 most recent (by add_order) ===
-    valid_order = jnp.where(valid_mask_final, pool.add_order, -1)
-    _, recent_idx = jax.lax.top_k(valid_order, k=2)
-    n_recent_keep = jnp.minimum(size_curr, jnp.int32(2))
-    recent_keep_mask = (jnp.arange(2) < n_recent_keep)
-    keep_mask = keep_mask.at[recent_idx].set(
-        keep_mask[recent_idx] | recent_keep_mask
     )
 
     # === Select 2 style-diverse (furthest from mean style, excluding already kept) ===
@@ -2039,6 +2007,8 @@ def main() -> None:
         # Checkpointing
         if end_step % CFG.checkpoint_every == 0:
             save_path = f"{ckpt_dir}/step_{end_step}"
+            if os.path.exists(save_path):
+                shutil.rmtree(save_path)
             ckpter.save(save_path, ts, save_args=save_args)
             print(f"Saved checkpoint to {save_path}")
 

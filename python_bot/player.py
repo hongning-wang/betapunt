@@ -301,6 +301,32 @@ class Player(Bot):
         else:
             print(f"Warning: Model file not found at {model_path}")
 
+    def _last_raise_amt(self, round_state) -> int:
+        """Infer last raise increment within the current street."""
+        last_raise = BIG_BLIND
+        state = round_state
+        while state.previous_state is not None and state.previous_state.street == state.street:
+            prev = state.previous_state
+            active = prev.button % 2
+            prev_opp_pip = prev.pips[1 - active]
+            new_active_pip = state.pips[active]
+            if new_active_pip > prev_opp_pip:
+                last_raise = new_active_pip - prev_opp_pip
+            state = prev
+        return int(last_raise)
+
+    def _raise_bounds_training(self, round_state, active: int) -> Tuple[int, int]:
+        """Compute raise bounds using training env rules."""
+        to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+        cur_stack = round_state.stacks[active]
+        opp_stack = round_state.stacks[1 - active]
+        last_raise_amt = self._last_raise_amt(round_state)
+        max_contribution = min(cur_stack, opp_stack + to_call)
+        min_contribution = min(max_contribution, to_call + max(to_call, last_raise_amt))
+        min_raise = round_state.pips[active] + min_contribution
+        max_raise = round_state.pips[active] + max_contribution
+        return int(min_raise), int(max_raise)
+
     def _export_checkpoint(self, checkpoint_dir: str, output_path: str) -> bool:
         """Export a JAX/Flax checkpoint to a Torch model file."""
         try:
@@ -454,6 +480,12 @@ class Player(Bot):
         """Build legal action mask for betting."""
         mask = torch.zeros(NUM_ACTIONS, dtype=torch.bool)
         to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+        total_committed = (STARTING_STACK * 2) - (round_state.stacks[0] + round_state.stacks[1])
+        pot_base = total_committed + to_call
+        cur_stack = round_state.stacks[active]
+        opp_stack = round_state.stacks[1 - active]
+        eff_cap = min(cur_stack, opp_stack + to_call)
+        last_raise_amt = self._last_raise_amt(round_state)
         
         # Basic actions
         if FoldAction in legal_actions and to_call > 0:
@@ -465,8 +497,7 @@ class Player(Bot):
         
         # Raise actions
         if RaiseAction in legal_actions:
-            min_raise, max_raise = round_state.raise_bounds()
-            pot = round_state.pips[0] + round_state.pips[1]  # Total in pot
+            min_raise, max_raise = self._raise_bounds_training(round_state, active)
             
             # Calculate raise amounts for each action
             # ACT_RAISE_MIN = min raise
@@ -474,25 +505,34 @@ class Player(Bot):
                 mask[ACT_RAISE_MIN] = True
             
             # Pot-based raises
-            raise_33 = int(pot * 0.33)
-            raise_50 = int(pot * 0.5)
-            raise_75 = int(pot * 0.75)
-            raise_125 = int(pot * 1.25)
-            raise_200 = int(pot * 2.0)
+            inc_33 = pot_base // 3
+            inc_50 = pot_base // 2
+            inc_75 = (pot_base * 3) // 4
+            inc_125 = (pot_base * 5) // 4
+            inc_200 = pot_base * 2
+
+            raise_33 = round_state.pips[active] + to_call + inc_33
+            raise_50 = round_state.pips[active] + to_call + inc_50
+            raise_75 = round_state.pips[active] + to_call + inc_75
+            raise_125 = round_state.pips[active] + to_call + inc_125
+            raise_200 = round_state.pips[active] + to_call + inc_200
             
-            if raise_33 >= min_raise and raise_33 <= max_raise:
+            if inc_33 >= last_raise_amt and min_raise <= raise_33 <= max_raise:
                 mask[ACT_RAISE_33] = True
-            if raise_50 >= min_raise and raise_50 <= max_raise:
+            if inc_50 >= last_raise_amt and min_raise <= raise_50 <= max_raise:
                 mask[ACT_RAISE_50] = True
-            if raise_75 >= min_raise and raise_75 <= max_raise:
+            if inc_75 >= last_raise_amt and min_raise <= raise_75 <= max_raise:
                 mask[ACT_RAISE_75] = True
-            if raise_125 >= min_raise and raise_125 <= max_raise:
+            if inc_125 >= last_raise_amt and min_raise <= raise_125 <= max_raise:
                 mask[ACT_RAISE_125] = True
-            if raise_200 >= min_raise and raise_200 <= max_raise:
+            if inc_200 >= last_raise_amt and min_raise <= raise_200 <= max_raise:
                 mask[ACT_RAISE_200] = True
             
             # All-in is always legal if raise is legal
-            mask[ACT_ALLIN] = True
+            can_bet_when_checked = (to_call == 0) and (cur_stack > 0) and (opp_stack > 0)
+            can_all_in = (to_call > 0) or can_bet_when_checked
+            if can_all_in and eff_cap > 0:
+                mask[ACT_ALLIN] = True
         
         return mask
     
@@ -518,22 +558,25 @@ class Player(Bot):
             if RaiseAction not in legal_actions:
                 return CallAction() if CallAction in legal_actions else CheckAction()
             
-            min_raise, max_raise = round_state.raise_bounds()
-            pot = round_state.pips[0] + round_state.pips[1]
+            min_raise, max_raise = self._raise_bounds_training(round_state, active)
+            to_call = max(0, round_state.pips[1 - active] - round_state.pips[active])
+            total_committed = (STARTING_STACK * 2) - (round_state.stacks[0] + round_state.stacks[1])
+            pot_base = total_committed + to_call
+            last_raise_amt = self._last_raise_amt(round_state)
             
             # Calculate target raise amount
             if action_idx == ACT_RAISE_MIN:
-                amount = min_raise
+                amount = round_state.pips[active] + to_call + last_raise_amt
             elif action_idx == ACT_RAISE_33:
-                amount = int(pot * 0.33)
+                amount = round_state.pips[active] + to_call + (pot_base // 3)
             elif action_idx == ACT_RAISE_50:
-                amount = int(pot * 0.5)
+                amount = round_state.pips[active] + to_call + (pot_base // 2)
             elif action_idx == ACT_RAISE_75:
-                amount = int(pot * 0.75)
+                amount = round_state.pips[active] + to_call + ((pot_base * 3) // 4)
             elif action_idx == ACT_RAISE_125:
-                amount = int(pot * 1.25)
+                amount = round_state.pips[active] + to_call + ((pot_base * 5) // 4)
             elif action_idx == ACT_RAISE_200:
-                amount = int(pot * 2.0)
+                amount = round_state.pips[active] + to_call + (pot_base * 2)
             elif action_idx == ACT_ALLIN:
                 amount = max_raise
             else:
