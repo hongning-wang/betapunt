@@ -30,7 +30,6 @@ from typing import Any, Dict, Tuple
 
 import chex
 import distrax
-import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import optax
@@ -251,25 +250,64 @@ def aux_record_action(
     )
 
 
+def _canonize_suits(cards: chex.Array) -> chex.Array:
+    """Canonize suits based on order of first appearance.
+
+    The first suit seen becomes 0, second becomes 1, etc.
+    This ensures suit-isomorphic hands have identical representations.
+
+    Args:
+        cards: (N,) array of card indices (0-51), -1 for invalid
+
+    Returns:
+        (N,) array of card indices with canonized suits
+    """
+    valid = cards >= 0
+    ranks = jnp.where(valid, cards % 13, 0).astype(jnp.int32)
+    suits = jnp.where(valid, cards // 13, 0).astype(jnp.int32)
+
+    def scan_fn(carry, x):
+        suit, is_valid = x
+        mapping, next_canonical = carry
+
+        # Check if we've seen this suit before
+        current_canonical = mapping[suit]
+        is_new = is_valid & (current_canonical < 0)
+
+        # Update mapping if this is a new suit
+        new_mapping = jnp.where(is_new, mapping.at[suit].set(next_canonical), mapping)
+        new_next = jnp.where(is_new, next_canonical + 1, next_canonical)
+
+        return (new_mapping, new_next), None
+
+    init = (jnp.full(4, -1, dtype=jnp.int32), jnp.int32(0))
+    (final_mapping, _), _ = jax.lax.scan(scan_fn, init, (suits, valid))
+
+    # Apply mapping: canonical_suit * 13 + rank
+    canonical_suits = jnp.take(final_mapping, suits, axis=0)
+    new_cards = jnp.where(valid, canonical_suits * 13 + ranks, -1)
+    return new_cards
+
+
 @jax.jit
 def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
     """Encode cards into (9, 2) tensor matching model.py CardEncoder format.
 
     Output format: (CARD_SEQ_LEN, CARD_INPUT_DIM) = (9, 2)
     Each card entry: [card_index, type_id]
-      - card_index: 0-51 valid cards, -1 for undealt/invalid
-      - type_id: 0-8 for slot type, -1 for invalid
+      - card_index: 0-51 valid cards (with canonized suits), -1 for undealt/invalid
+      - type_id: 0-5 for slot type, -1 for invalid
 
-    Card positions (matching model.py):
-      0: heropriv0 (type_id=0)
-      1: heropriv1 (type_id=1)
-      2: heropriv2 (type_id=2)
-      3: flop0 (type_id=3)
-      4: flop1 (type_id=4)
-      5: herodiscard (type_id=5)
-      6: villaindiscard (type_id=6)
-      7: turn (type_id=7)
-      8: river (type_id=8)
+    Cards are sorted within groups (hero hand, flop) by rank.
+    Suits are canonized based on order of first appearance.
+
+    Card positions and type_ids:
+      0-2: hero private cards (sorted by rank, type_id=0)
+      3-4: flop cards (sorted by rank, type_id=1)
+      5: herodiscard (type_id=2)
+      6: villaindiscard (type_id=3)
+      7: turn (type_id=4)
+      8: river (type_id=5)
     """
     is_p0 = player_id == 0
 
@@ -277,40 +315,59 @@ def encode_cards(state: State, player_id: chex.Array) -> chex.Array:
     hero_hole = jnp.where(is_p0, state.p0_hole, state.p1_hole)  # (3,)
     hero_active = jnp.where(is_p0, state.p0_active_mask, state.p1_active_mask)  # (3,)
 
+    # Sort hero cards by rank (primary), then suit (secondary)
+    hero_rank = hero_hole % 13
+    hero_suit = hero_hole // 13
+    hero_sort_keys = jnp.where(hero_active, hero_rank * 4 + hero_suit, jnp.int32(999))
+    hero_sorted_idx = jnp.argsort(hero_sort_keys)
+    hero_sorted = hero_hole[hero_sorted_idx]
+    hero_active_sorted = hero_active[hero_sorted_idx]
+
     # Determine discard indices based on dealer position
     # OOP discards to board[2], dealer discards to board[3]
     hero_is_dealer = jnp.where(is_p0, state.is_dealer_p0, jnp.logical_not(state.is_dealer_p0))
     hero_discard_idx = jnp.where(hero_is_dealer, 3, 2)
     villain_discard_idx = jnp.where(hero_is_dealer, 2, 3)
 
-    # Build all card indices in one array (9 cards)
-    # Positions: [hero0, hero1, hero2, flop0, flop1, hero_discard, villain_discard, turn, river]
-    card_indices = jnp.array([
-        jnp.where(hero_active[0], hero_hole[0], -1),
-        jnp.where(hero_active[1], hero_hole[1], -1),
-        jnp.where(hero_active[2], hero_hole[2], -1),
-        state.board[0],  # flop0
-        state.board[1],  # flop1
-        state.board[hero_discard_idx],   # hero discard
-        state.board[villain_discard_idx], # villain discard
+    # Sort flop cards by rank (primary), then suit (secondary)
+    flop_cards = jnp.array([state.board[0], state.board[1]], dtype=jnp.int32)
+    flop_valid = flop_cards >= 0
+    flop_rank = flop_cards % 13
+    flop_suit = flop_cards // 13
+    flop_sort_keys = jnp.where(flop_valid, flop_rank * 4 + flop_suit, jnp.int32(999))
+    flop_sorted_idx = jnp.argsort(flop_sort_keys)
+    flop_sorted = flop_cards[flop_sorted_idx]
+
+    # Build all card indices in order (for suit canonization)
+    # Order: hero cards (sorted), flop (sorted), hero_discard, villain_discard, turn, river
+    card_indices_raw = jnp.array([
+        jnp.where(hero_active_sorted[0], hero_sorted[0], -1),
+        jnp.where(hero_active_sorted[1], hero_sorted[1], -1),
+        jnp.where(hero_active_sorted[2], hero_sorted[2], -1),
+        flop_sorted[0],
+        flop_sorted[1],
+        state.board[hero_discard_idx],
+        state.board[villain_discard_idx],
         state.board[4],  # turn
         state.board[5],  # river
     ], dtype=jnp.int32)
 
-    # Type IDs: valid cards get their position index, invalid get -1
-    # For hero cards, validity is determined by hero_active
-    # For board cards, validity is determined by card_index >= 0
-    type_ids_raw = jnp.arange(CARD_SEQ_LEN, dtype=jnp.int32)
+    # Canonize suits based on order of first appearance
+    card_indices = _canonize_suits(card_indices_raw)
+
+    # Type IDs: simplified to 6 types
+    # 0 = hero private, 1 = flop, 2 = hero discard, 3 = villain discard, 4 = turn, 5 = river
+    type_ids_raw = jnp.array([0, 0, 0, 1, 1, 2, 3, 4, 5], dtype=jnp.int32)
     valid_mask = jnp.array([
-        hero_active[0],
-        hero_active[1],
-        hero_active[2],
-        card_indices[3] >= 0,  # flop0
-        card_indices[4] >= 0,  # flop1
-        card_indices[5] >= 0,  # hero discard
-        card_indices[6] >= 0,  # villain discard
-        card_indices[7] >= 0,  # turn
-        card_indices[8] >= 0,  # river
+        hero_active_sorted[0],
+        hero_active_sorted[1],
+        hero_active_sorted[2],
+        card_indices[3] >= 0,
+        card_indices[4] >= 0,
+        card_indices[5] >= 0,
+        card_indices[6] >= 0,
+        card_indices[7] >= 0,
+        card_indices[8] >= 0,
     ])
     type_ids = jnp.where(valid_mask, type_ids_raw, -1)
 
@@ -645,25 +702,25 @@ def pool_select_opponent(
     """Select opponent using diversity-aware sampling.
 
     Sampling distribution (when pool has enough agents):
-    - 50% from top 4 by ELO (hard opponents)
-    - 25% from 2 most style-diverse agents
-    - 25% from 2 most recently added agents
+    - 60% from top 4 by ELO (hard opponents)
+    - 10% from 2 most style-diverse agents
+    - 30% from 2 most recently added agents
 
     This prevents monoculture while maintaining challenge.
     """
-    key, k_category, k_pick = jax.random.split(key, 3)
+    key, k_category, k_top, k_diverse, k_recent = jax.random.split(key, 5)
     size = pool.size
     valid_mask = jnp.arange(CFG.pool_max) < size
 
     # Category selection: 0=top, 1=diverse, 2=recent
-    # Probabilities: 50%, 25%, 25%
-    category = jax.random.choice(k_category, 3, p=jnp.array([0.50, 0.25, 0.25]))
+    # Probabilities: 60%, 10%, 30%
+    category = jax.random.choice(k_category, 3, p=jnp.array([0.60, 0.10, 0.30]))
 
     # === Category 0: Top by ELO (top 4) ===
     valid_elo = jnp.where(valid_mask, pool.elo, -1e9)
     _, top_idx = jax.lax.top_k(valid_elo, k=4)
     n_top = jnp.minimum(size, jnp.int32(4))
-    top_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_top, 1))
+    top_pick = jax.random.randint(k_top, (), 0, jnp.maximum(n_top, 1))
     idx_top = top_idx[top_pick]
 
     # === Category 1: Style-diverse (maximize distance from mean style) ===
@@ -679,14 +736,14 @@ def pool_select_opponent(
     # Pick from top 2 most diverse
     _, diverse_idx = jax.lax.top_k(style_dist, k=2)
     n_diverse = jnp.minimum(size, jnp.int32(2))
-    diverse_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_diverse, 1))
+    diverse_pick = jax.random.randint(k_diverse, (), 0, jnp.maximum(n_diverse, 1))
     idx_diverse = diverse_idx[diverse_pick]
 
     # === Category 2: Most recent (top 2 by add_order) ===
     valid_add_order = jnp.where(valid_mask, pool.add_order, -1)
     _, recent_idx = jax.lax.top_k(valid_add_order, k=2)
     n_recent = jnp.minimum(size, jnp.int32(2))
-    recent_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_recent, 1))
+    recent_pick = jax.random.randint(k_recent, (), 0, jnp.maximum(n_recent, 1))
     idx_recent = recent_idx[recent_pick]
 
     # Select based on category
@@ -886,10 +943,19 @@ def compute_vtrace_on_unroll(
     flat_legal = unroll.legal.reshape(T * E, *unroll.legal.shape[2:])
     flat_action = unroll.action.reshape(T * E)
 
-    # Forward pass to get current policy logits and values
-    logits, values_flat = forward_apply(
-        params, flat_card, flat_action_hist, flat_action_mask
-    )
+    # OPTIMIZATION: Single forward pass for both main batch and bootstrap
+    # Concatenate main (T*E,) with bootstrap (E,) -> (T*E + E,)
+    all_card = jnp.concatenate([flat_card, unroll.bootstrap_card], axis=0)
+    all_action_hist = jnp.concatenate([flat_action_hist, unroll.bootstrap_action_hist], axis=0)
+    all_action_mask = jnp.concatenate([flat_action_mask, unroll.bootstrap_action_mask], axis=0)
+
+    # Single forward pass for all samples
+    all_logits, all_values = forward_apply(params, all_card, all_action_hist, all_action_mask)
+
+    # Split outputs back into main and bootstrap
+    logits = all_logits[:T * E]
+    values_flat = all_values[:T * E]
+    bootstrap_values = all_values[T * E:]  # (E,)
 
     # Compute current policy log probs
     neg_inf = -1e9
@@ -905,16 +971,7 @@ def compute_vtrace_on_unroll(
     # On opponent steps (valid=False), logp_mu=0 and we should set log_rho=0 too
     log_rhos = jnp.where(unroll.valid, logp_pi_te - unroll.logp_mu, 0.0)
 
-    # Bootstrap value: V(s_T) - the value of the state AFTER the last transition
-    # Use the stored bootstrap observation to compute this properly
-    _, bootstrap_values = forward_apply(
-        params,
-        unroll.bootstrap_card,      # (E, CARD_SEQ_LEN, CARD_INPUT_DIM)
-        unroll.bootstrap_action_hist,  # (E, ACTION_SEQ_LEN, ACTION_INPUT_DIM)
-        unroll.bootstrap_action_mask,  # (E, ACTION_SEQ_LEN)
-    )
-    # Zero out bootstrap where the last transition was terminal
-    # bootstrap = (1 - done_last) * V(s_T)
+    # Bootstrap value: V(s_T) - zero out where the last transition was terminal
     last_value = jnp.where(unroll.bootstrap_done, 0.0, bootstrap_values)  # (E,)
 
     # Run V-trace per environment with BOTH rho_bar and pg_rho_bar
@@ -1318,19 +1375,16 @@ def collect_rollout(
         )
 
         # For storage: need learner's perspective
-        # Avoid computing learner encodings when learner == current player
-        def _select_learner_obs(s_i, aux_i, pid_cur_i, learner_pid_i, card_cur_i, action_hist_cur_i, action_mask_cur_i):
-            def _use_cur(_):
-                return card_cur_i, action_hist_cur_i, action_mask_cur_i
+        # When learner == current player, reuse encoding; otherwise compute learner's view
+        def _get_learner_obs(s_i, aux_i, pid_cur_i, learner_pid_i, card_cur_i, ahist_cur_i, amask_cur_i):
+            return jax.lax.cond(
+                pid_cur_i == learner_pid_i,
+                lambda _: (card_cur_i, ahist_cur_i, amask_cur_i),
+                lambda _: (encode_cards(s_i, learner_pid_i), *encode_actions(aux_i, learner_pid_i)),
+                operand=None,
+            )
 
-            def _use_learner(_):
-                card_l = encode_cards(s_i, learner_pid_i)
-                action_hist_l, action_mask_l = encode_actions(aux_i, learner_pid_i)
-                return card_l, action_hist_l, action_mask_l
-
-            return jax.lax.cond(pid_cur_i == learner_pid_i, _use_cur, _use_learner, operand=None)
-
-        card_b, action_hist_b, action_mask_b = jax.vmap(_select_learner_obs)(
+        card_b, action_hist_b, action_mask_b = jax.vmap(_get_learner_obs)(
             s, aux, pid_cur, learner_pid, card_cur_b, action_hist_cur_b, action_mask_cur_b
         )
 
@@ -1548,7 +1602,7 @@ def play_one_hand_with_action_counts(
         # Track actions for player 0 only
         # Action classification: 0=fold, 1-2=check/call, 3+=raise
         is_p0 = pid == 0
-        is_raise = (a >= 3).astype(jnp.float32)
+        is_raise = ((a >= 3) & (a <= 9)).astype(jnp.float32)
         is_fold = (a == 0).astype(jnp.float32)
         is_call = ((a == 1) | (a == 2)).astype(jnp.float32)
         p0_mask = is_p0.astype(jnp.float32)

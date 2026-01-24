@@ -24,9 +24,9 @@ import chex
 NUM_ACTIONS = 13
 NUM_BETTING_ACTIONS = 10  # Actions 0-9: Fold, Check, Call, raises, All-in
 NUM_DISCARD_ACTIONS = 3   # Actions 10-12: Discard card 0, 1, or 2
-CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
+CARD_SEQ_LEN = 9        # [heropriv (x3), flop (x2), herodiscard, villaindiscard, turn, river]
 ACTION_SEQ_LEN = 32
-NUM_CARD_TYPES = 9
+NUM_CARD_TYPES = 6      # heropriv=0, flop=1, herodiscard=2, villaindiscard=3, turn=4, river=5
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
@@ -37,6 +37,9 @@ NUM_TRANSFORMER_LAYERS = 2
 NUM_CROSS_ATTENTION_LAYERS = 2
 NUM_QUERY_TOKENS = 6
 PROCESSING_DIM = 256
+
+# Compute dtype - change this to jnp.float32 for full precision training
+COMPUTE_DTYPE = jnp.bfloat16
 
 
 # =============================================================================
@@ -59,13 +62,13 @@ class MultiHeadAttention(nn.Module):
         kv_len = key.shape[1]
         projection_dim = self.num_heads * self.head_dim
 
-        query = query.astype(jnp.bfloat16)
-        key = key.astype(jnp.bfloat16)
-        value = value.astype(jnp.bfloat16)
+        query = query.astype(COMPUTE_DTYPE)
+        key = key.astype(COMPUTE_DTYPE)
+        value = value.astype(COMPUTE_DTYPE)
 
-        q = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(query)
-        k = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(key)
-        v = nn.Dense(projection_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(value)
+        q = nn.Dense(projection_dim, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(query)
+        k = nn.Dense(projection_dim, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(key)
+        v = nn.Dense(projection_dim, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(value)
 
         q = q.reshape(batch_size, q_len, self.num_heads, self.head_dim)
         k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
@@ -78,7 +81,7 @@ class MultiHeadAttention(nn.Module):
         attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias)
 
         attn_output = attn_output.reshape(batch_size, q_len, projection_dim)
-        output = nn.Dense(input_dim, use_bias=False, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(attn_output)
+        output = nn.Dense(input_dim, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(attn_output)
 
         return output
 
@@ -104,21 +107,21 @@ class TransformerBlock(nn.Module):
         Returns:
             output: (B, S, D)
         """
-        x = x.astype(jnp.bfloat16)
+        x = x.astype(COMPUTE_DTYPE)
         head_dim = self.emb_dim // self.num_heads
         
         # Pre-norm self-attention
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
         x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
         x = residual + x
 
         # Pre-norm FFN
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
-        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
+        x = nn.Dense(self.ffn_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
         x = nn.gelu(x)
-        x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = nn.Dense(self.emb_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
         x = residual + x
 
         return x
@@ -146,7 +149,7 @@ class TransformerEncoder(nn.Module):
         Returns:
             output: (B, S, D)
         """
-        x = x.astype(jnp.bfloat16)
+        x = x.astype(COMPUTE_DTYPE)
 
         # Use explicit layer names for better jittability
         for layer_idx in range(self.num_layers):
@@ -158,7 +161,7 @@ class TransformerEncoder(nn.Module):
             )(x, mask)
 
         # Final layer norm
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
 
         return x
 
@@ -186,13 +189,13 @@ class CrossAttentionBlock(nn.Module):
         Returns:
             output: (B, Q, D)
         """
-        query_tokens = query_tokens.astype(jnp.bfloat16)
-        context = context.astype(jnp.bfloat16)
+        query_tokens = query_tokens.astype(COMPUTE_DTYPE)
+        context = context.astype(COMPUTE_DTYPE)
         head_dim = self.emb_dim // self.num_heads
 
         # === Cross-Attention Sub-block ===
-        attn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(query_tokens)
-        context_normed = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(context)
+        attn_input = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(query_tokens)
+        context_normed = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(context)
 
         attn_output = MultiHeadAttention(
             num_heads=self.num_heads,
@@ -202,19 +205,19 @@ class CrossAttentionBlock(nn.Module):
         post_attn = query_tokens + attn_output
 
         # === FFN Sub-block ===
-        ffn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(post_attn)
+        ffn_input = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(post_attn)
 
         ffn_hidden = nn.Dense(
             self.ffn_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
         )(ffn_input)
         ffn_hidden = nn.gelu(ffn_hidden)
 
         ffn_out = nn.Dense(
             self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
         )(ffn_hidden)
 
         output = post_attn + ffn_out
@@ -227,28 +230,37 @@ class CrossAttentionBlock(nn.Module):
 # =============================================================================
 
 class CardEncoder(nn.Module):
-    """Encodes card tensor using embeddings (no transformer needed).
+    """Encodes card tensor using embeddings and MLP.
 
     Input: (B, 9, 2) where each entry is [card_index, type_id].
+    - card_index: 0-51 (canonized suits), -1 for invalid
+    - type_id: 0-5, -1 for invalid
 
     Position semantics (fixed, not learned):
-        0-2: Hero's private cards
-        3-4: Flop (community)
-        5: Hero's discard
-        6: Villain's discard
-        7: Turn
-        8: River
+        0-2: Hero's private cards (sorted by rank, all type_id=0)
+        3-4: Flop (sorted by rank, all type_id=1)
+        5: Hero's discard (type_id=2)
+        6: Villain's discard (type_id=3)
+        7: Turn (type_id=4)
+        8: River (type_id=5)
+
+    Cards are sorted by rank within hero hand and flop groups.
+    Suits are canonized (first suit seen = 0, second = 1, etc.).
+
+    Architecture:
+    - Embed rank, suit, type independently
+    - Concatenate embeddings
+    - MLP to project to emb_dim
+    - Cross-attention (downstream) learns card relationships
 
     Output: (B, 9, emb_dim)
-
-    No transformer needed because:
-    - Card positions have fixed semantics
-    - Order within groups is irrelevant
-    - Cross-attention handles fusion with actions
     """
 
     emb_dim: int = EMB_DIM
-    component_emb_dim: int = 48  # 48 * 3 = 144 -> project to emb_dim
+    rank_emb_dim: int = 64
+    suit_emb_dim: int = 16
+    type_emb_dim: int = 48
+    hidden_dim: int = 256
 
     @nn.compact
     def __call__(
@@ -259,17 +271,14 @@ class CardEncoder(nn.Module):
         Args:
             card_tensor: (B, 9, 2) int32 tensor with [card_index, type_id]
 
-            card_index: 0-51 valid cards, -1 invalid/undealt
-            type_id: 0-8 valid types:
-                0 = heropriv0
-                1 = heropriv1
-                2 = heropriv2
-                3 = flop0
-                4 = flop1
-                5 = herodiscard
-                6 = villaindiscard
-                7 = turn
-                8 = river
+            card_index: 0-51 valid cards (canonized suits), -1 invalid/undealt
+            type_id: 0-5 valid types:
+                0 = heropriv (all 3 hero private cards)
+                1 = flop (both flop cards)
+                2 = herodiscard
+                3 = villaindiscard
+                4 = turn
+                5 = river
                 -1 = invalid/unused
 
         Returns:
@@ -300,40 +309,52 @@ class CardEncoder(nn.Module):
         rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)  # 0-12 + 13 invalid
         suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)   # 0-3 + 4 invalid
 
-        # Type embedding: 0-8 + 9 invalid
+        # Type embedding: 0-5 + 6 invalid
         type_safe = jnp.where(type_id >= 0, type_id, NUM_CARD_TYPES).astype(jnp.int32)
 
         # -----------------------------
-        # Embeddings: CONCATENATE rank, suit, type (not add)
+        # Embeddings: CONCATENATE rank, suit, type
+        # Dimensions scaled by information content
         # -----------------------------
         rank_emb = nn.Embed(
             num_embeddings=14,  # 13 ranks + invalid
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(rank_safe)  # (B, 9, component_emb_dim)
+            features=self.rank_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(rank_safe)  # (B, 9, 64)
 
         suit_emb = nn.Embed(
             num_embeddings=5,   # 4 suits + invalid
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(suit_safe)  # (B, 9, component_emb_dim)
+            features=self.suit_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(suit_safe)  # (B, 9, 16)
 
         type_emb = nn.Embed(
-            num_embeddings=NUM_CARD_TYPES + 1,  # 9 types + invalid
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(type_safe)  # (B, 9, component_emb_dim)
+            num_embeddings=NUM_CARD_TYPES + 1,  # 6 types + invalid
+            features=self.type_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(type_safe)  # (B, 9, 48)
 
-        # Concatenate and project to emb_dim
-        concat = jnp.concatenate([rank_emb, suit_emb, type_emb], axis=-1)  # (B, 9, 3*component_emb_dim)
+        # -----------------------------
+        # Concatenate and MLP
+        # -----------------------------
+        concat = jnp.concatenate([rank_emb, suit_emb, type_emb], axis=-1)  # (B, 9, 128)
+
+        # MLP: concat -> hidden -> emb_dim
+        hidden = nn.Dense(
+            self.hidden_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(concat)
+        hidden = nn.gelu(hidden)
+
         card_repr = nn.Dense(
             self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(concat)  # (B, 9, emb_dim)
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(hidden)  # (B, 9, emb_dim)
 
         return card_repr, valid_mask
 
@@ -358,7 +379,11 @@ class ActionEncoder(nn.Module):
     num_heads: int = NUM_HEADS
     ffn_dim: int = FFN_DIM
     num_layers: int = NUM_TRANSFORMER_LAYERS
-    component_emb_dim: int = 24  # 24 * 4 + 32 (continuous) = 128
+    # Embedding dims scaled by information content
+    actor_emb_dim: int = 8      # 2 values (hero/villain)
+    event_emb_dim: int = 48     # 13 action types (high info)
+    street_time_emb_dim: int = 48  # 160 combos (when it happened)
+    continuous_emb_dim: int = 24   # projected continuous features
 
     @nn.compact
     def __call__(
@@ -368,77 +393,87 @@ class ActionEncoder(nn.Module):
     ) -> chex.Array:
         """
         Args:
-            action_tensor: (B, 30, 7) float32 tensor
-            action_mask: (B, 30) boolean mask where True = valid action
+            action_tensor: (B, ACTION_SEQ_LEN, 7) float32 tensor
+            action_mask: (B, ACTION_SEQ_LEN) boolean mask where True = valid action
 
         Returns:
-            action_representation: (B, 40, emb_dim)
+            action_representation: (B, ACTION_SEQ_LEN, emb_dim)
         """
-        action_tensor = action_tensor.astype(jnp.bfloat16)
+        action_tensor = action_tensor.astype(COMPUTE_DTYPE)
 
         # === Extract components ===
         actor_id = action_tensor[..., 0].astype(jnp.int32)
         event_type = action_tensor[..., 1].astype(jnp.int32)
         street_id = action_tensor[..., 2].astype(jnp.int32)
-        time_id = action_tensor[..., 3].astype(jnp.int32)
         to_call = action_tensor[..., 4:5]
         pot_base = action_tensor[..., 5:6]
         eff_stack = action_tensor[..., 6:7]
 
-        # === Categorical Embeddings (smaller, to be concatenated) ===
+        # === Categorical Embeddings (dims scaled by information content) ===
         actor_emb = nn.Embed(
             num_embeddings=2,
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(actor_id)  # (B, 30, component_emb_dim)
+            features=self.actor_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(actor_id)  # (B, 32, 8)
 
         event_emb = nn.Embed(
             num_embeddings=13,
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(event_type)  # (B, 30, component_emb_dim)
+            features=self.event_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(event_type)  # (B, 32, 48)
 
-        street_emb = nn.Embed(
-            num_embeddings=5,
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(street_id)  # (B, 30, component_emb_dim)
+        # Compute position within street (resets to 0 when street changes)
+        seq_len = street_id.shape[-1]
+        indices = jnp.arange(seq_len, dtype=jnp.int32)
 
-        time_mod = jnp.mod(time_id, jnp.int32(ACTION_SEQ_LEN))
-        time_emb = nn.Embed(
-            num_embeddings=ACTION_SEQ_LEN,
-            features=self.component_emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(time_mod)  # (B, 30, component_emb_dim)
+        # Detect street boundaries: where street differs from previous position
+        prev_street = jnp.concatenate([street_id[..., :1] - 1, street_id[..., :-1]], axis=-1)
+        is_new_street = (street_id != prev_street)
+
+        # Mark reset positions with their index, others with -1
+        reset_markers = jnp.where(is_new_street, indices, jnp.int32(-1))
+
+        # Cumulative maximum to propagate the last reset index forward
+        last_reset_idx = jax.lax.associative_scan(jnp.maximum, reset_markers, axis=-1)
+
+        # Position within street = current index - index of last reset
+        position_in_street = indices - last_reset_idx
+
+        # Combined embedding: (street, position_in_street) → unique representation
+        combined_idx = street_id * ACTION_SEQ_LEN + position_in_street
+        street_time_emb = nn.Embed(
+            num_embeddings=5 * ACTION_SEQ_LEN,  # 5 streets × positions per street
+            features=self.street_time_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(combined_idx)  # (B, 32, 48)
 
         # === Continuous Features Projection ===
-        eps = jnp.bfloat16(1e-6)
+        eps = COMPUTE_DTYPE(1e-6)
         pot_base_safe = jnp.maximum(pot_base, eps)
         cont1 = jnp.log1p(to_call / pot_base_safe)
         cont2 = jnp.log1p(pot_base_safe)
         cont3 = jnp.log1p(eff_stack / pot_base_safe)
-        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 40, 3)
+        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 32, 3)
         continuous_emb = nn.Dense(
-            32,  # Project continuous features to 32 dims
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
-        )(continuous)  # (B, 30, 32)
+            self.continuous_emb_dim,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
+        )(continuous)  # (B, 32, 24)
 
         # === CONCATENATE all embeddings (not add) ===
         concat = jnp.concatenate(
-            [actor_emb, event_emb, street_emb, time_emb, continuous_emb],
+            [actor_emb, event_emb, street_time_emb, continuous_emb],
             axis=-1
-        )  # (B, 30, 4*component_emb_dim + 32)
+        )  # (B, 32, 128)
 
         # Project to emb_dim
         combined = nn.Dense(
             self.emb_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
         )(concat)  # (B, 30, emb_dim)
 
         # === Transformer ===
@@ -461,10 +496,10 @@ class TossHoldemModel(nn.Module):
 
     Architecture:
         1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings (concatenated)
-        2. Action Encoder: (B, 30, 7) -> (B, 30, 128) with embeddings (concatenated)
-        3. Concatenate: (B, 39, 128)
+        2. Action Encoder: (B, ACTION_SEQ_LEN, 7) -> (B, ACTION_SEQ_LEN, emb_dim) with embeddings (concatenated)
+        3. Concatenate: (B, CARD_SEQ_LEN + ACTION_SEQ_LEN, emb_dim)
         4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 8, 128)
-        5. Processing MLP: Flatten -> Dense -> ReLU -> Dense -> ReLU -> Dense -> (B, 256)
+        5. Processing MLP: Flatten -> Dense -> gelu -> Dense -> gelu -> Dense -> (B, 256)
         6. Separate Output Heads:
            - Policy: Independent MLP -> (B, 13)
            - Value: Independent MLP with stop_gradient -> (B,)
@@ -489,15 +524,15 @@ class TossHoldemModel(nn.Module):
         """
         Args:
             card_tensor: (B, 9, 2) int32 - [card_index, type_id]
-            action_tensor: (B, 30, 7) float32 - action history features
-            action_mask: (B, 30) boolean - True for valid actions, False for padding
+            action_tensor: (B, ACTION_SEQ_LEN, 7) float32 - action history features
+            action_mask: (B, ACTION_SEQ_LEN) boolean - True for valid actions, False for padding
 
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
             value: (B,) - estimated state value
         """
         batch_size = card_tensor.shape[0]
-        action_tensor = action_tensor.astype(jnp.bfloat16)
+        action_tensor = action_tensor.astype(COMPUTE_DTYPE)
 
         # =================================================================
         # 1. Encode cards and actions
@@ -512,7 +547,7 @@ class TossHoldemModel(nn.Module):
             num_heads=self.num_heads,
             ffn_dim=self.ffn_dim,
             num_layers=self.num_layers,
-        )(action_tensor, action_mask)  # (B, 30, 128)
+        )(action_tensor, action_mask)  # (B, ACTION_SEQ_LEN, emb_dim)
         
         # =================================================================
         # 2. Concatenate to form context
@@ -538,7 +573,7 @@ class TossHoldemModel(nn.Module):
             'query_tokens',
             nn.initializers.normal(stddev=0.02),
             (self.num_query_tokens, self.emb_dim),
-            jnp.bfloat16,
+            COMPUTE_DTYPE,
         )
 
         # Broadcast to batch dimension: (Q, D) -> (B, Q, D)
@@ -546,7 +581,7 @@ class TossHoldemModel(nn.Module):
             query_tokens[None, :, :],
             (batch_size, self.num_query_tokens, self.emb_dim),
         )
-        fused = fused.astype(jnp.bfloat16)
+        fused = fused.astype(COMPUTE_DTYPE)
 
         # Apply multiple cross-attention layers for richer fusion
         for layer_idx in range(self.num_cross_attention_layers):
@@ -558,7 +593,7 @@ class TossHoldemModel(nn.Module):
             )(fused, context, context_mask)  # (B, 6, 128)
 
         # Final layer norm after cross-attention
-        fused = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(fused)
+        fused = nn.LayerNorm(dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(fused)
 
         # =================================================================
         # 4. Processing MLP
@@ -570,18 +605,18 @@ class TossHoldemModel(nn.Module):
         # Layer 1: (B, 768) -> (B, 512)
         processed = nn.Dense(
             512,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
         )(flat)
-        processed = nn.relu(processed)
+        processed = nn.gelu(processed)
 
         # Layer 2: (B, 512) -> (B, 256)
         processed = nn.Dense(
             self.processing_dim,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
         )(processed)
-        processed = nn.relu(processed)
+        processed = nn.gelu(processed)
 
         # =================================================================
         # 5. SEPARATE Output heads (policy and value have independent MLPs)
@@ -590,30 +625,30 @@ class TossHoldemModel(nn.Module):
         # --- Betting Policy head (actions 0-9) ---
         betting_hidden = nn.Dense(
             128,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='betting_hidden',
         )(processed)
-        betting_hidden = nn.relu(betting_hidden)
+        betting_hidden = nn.gelu(betting_hidden)
         betting_logits = nn.Dense(
             NUM_BETTING_ACTIONS,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='betting_out',
         )(betting_hidden)
 
         # --- Discard Policy head (actions 10-12) ---
         discard_hidden = nn.Dense(
             128,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='discard_hidden',
         )(processed)
-        discard_hidden = nn.relu(discard_hidden)
+        discard_hidden = nn.gelu(discard_hidden)
         discard_logits = nn.Dense(
             NUM_DISCARD_ACTIONS,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='discard_out',
         )(discard_hidden)
 
@@ -625,15 +660,15 @@ class TossHoldemModel(nn.Module):
         value_input = processed
         value_hidden = nn.Dense(
             128,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='value_hidden',
         )(value_input)
-        value_hidden = nn.relu(value_hidden)
+        value_hidden = nn.gelu(value_hidden)
         value = nn.Dense(
             1,
-            dtype=jnp.bfloat16,
-            param_dtype=jnp.bfloat16,
+            dtype=COMPUTE_DTYPE,
+            param_dtype=COMPUTE_DTYPE,
             name='value_out',
         )(value_hidden)
         value = value.squeeze(-1)
@@ -651,17 +686,17 @@ class TossHoldemModel(nn.Module):
 
 def create_action_mask(action_tensor: chex.Array) -> chex.Array:
     """Create a boolean mask for valid actions in the action tensor.
-    
+
     An action is considered valid if any of its features are non-zero.
-    
+
     Args:
-        action_tensor: (B, 30, 7) action history tensor
-        
+        action_tensor: (B, ACTION_SEQ_LEN, 7) action history tensor
+
     Returns:
-        mask: (B, 30) boolean mask where True = valid action
+        mask: (B, ACTION_SEQ_LEN) boolean mask where True = valid action
     """
     # Sum across features - if any feature is non-zero, the action is valid
-    feature_sum = jnp.sum(jnp.abs(action_tensor), axis=-1)  # (B, 30)
+    feature_sum = jnp.sum(jnp.abs(action_tensor), axis=-1)  # (B, ACTION_SEQ_LEN)
     mask = feature_sum > 0
     return mask
 
@@ -699,7 +734,7 @@ def init_model(key: chex.PRNGKey) -> Tuple[TossHoldemModel, dict]:
 
     # Create dummy inputs for initialization
     dummy_cards = jnp.zeros((1, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32)
-    dummy_actions = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.bfloat16)
+    dummy_actions = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=COMPUTE_DTYPE)
     dummy_action_mask = jnp.ones((1, ACTION_SEQ_LEN), dtype=jnp.bool_)
 
     params = model.init(key, dummy_cards, dummy_actions, dummy_action_mask)

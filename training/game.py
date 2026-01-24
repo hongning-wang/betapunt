@@ -311,43 +311,43 @@ class TossHoldemEnv:
             # Engine-style "no side pots" cap:
             # max_contribution = min(my_stack, opp_stack + to_call)
             eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
-            
+
             # Initialize Mask (13 actions)
             # 0=Fold, 1=Check, 2=Call, 3-8=Raises, 9=AllIn, 10-12=Discards
             mask_bits = jnp.zeros(13, dtype=bool)
-            
+
             # Fold always legal
             mask_bits = mask_bits.at[ACT_FOLD].set(to_call > 0)
-            
+
             # Check vs Call Logic
             mask_bits = mask_bits.at[ACT_CHECK].set(to_call == 0)
             mask_bits = mask_bits.at[ACT_CALL].set(to_call > 0)
-            
+
             # All-in is:
             # - If facing a bet: a (possibly short) call is always meaningful
             # - If not facing a bet: only legal if both players have chips (engine forbids betting when either is 0)
             can_bet_when_checked = (to_call == 0) & (cur_stack > 0) & (opp_stack > 0)
             can_all_in = (to_call > 0) | can_bet_when_checked
             mask_bits = mask_bits.at[ACT_ALLIN].set(can_all_in)
-            
+
             # --- Min Raise Logic ---
             min_raise_increment = jnp.maximum(to_call, state.last_raise_amt)
             min_total = to_call + min_raise_increment
             can_min_raise = (eff_cap >= min_total) & (opp_stack > 0) & (cur_stack > to_call)
             mask_bits = mask_bits.at[ACT_RAISE_MIN].set(can_min_raise)
-            
+
             # --- Fraction Raises Logic ---
             pot_base = state.pot + state.p0_bet + state.p1_bet + to_call
-            
+
             # Increments
             inc_33 = pot_base // 3
             inc_50 = pot_base // 2
             inc_75 = (pot_base * 3) // 4
             inc_125 = (pot_base * 5) // 4
             inc_200 = pot_base * 2
-            
+
             increments = jnp.array([inc_33, inc_50, inc_75, inc_125, inc_200])
-            
+
             # Valid if: Increment >= last_raise_amt AND (to_call + increment) <= eff_cap
             # Also requires opponent has chips and we can cover the call (otherwise it's a call-all-in, not a raise).
             valid_fracs = (
@@ -356,11 +356,11 @@ class TossHoldemEnv:
                 & (opp_stack > 0)
                 & (cur_stack > to_call)
             )
-            
+
             # Set indices 4,5,6,7,8 (which correspond to ACT_RAISE_33 through 200)
             # Note: ACT_RAISE_33 is index 4 now
             mask_bits = mask_bits.at[4:9].set(valid_fracs)
-            
+
             return mask_bits
 
         return jax.lax.cond(is_discard, _discard_mask, _betting_mask)
@@ -431,7 +431,7 @@ class TossHoldemEnv:
             to_call = opp_bet - cur_bet
             pot_base = s.pot + s.p0_bet + s.p1_bet + to_call
             eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
-            
+
             raise_idx = phase_idx - 3
             target_inc = jax.lax.switch(
                 raise_idx,
@@ -444,7 +444,7 @@ class TossHoldemEnv:
                     lambda: pot_base * 2
                 ]
             )
-            
+
             # Clamp to min raise
             raise_amt = jnp.maximum(target_inc, s.last_raise_amt)
             
