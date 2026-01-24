@@ -25,7 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 import os
-import shutil
 from typing import Any, Dict, Tuple
 
 import chex
@@ -72,7 +71,7 @@ class Config:
     """
 
     # Parallel sampling
-    num_envs: int = 2_048 # parallel environments
+    num_envs: int = 8_192 # parallel environments
     rollout_len: int = 32
 
     # V-trace hyperparameters (IMPALA-style)
@@ -83,7 +82,7 @@ class Config:
     vf_coef: float = 0.5
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.01
+    ent_coef_init: float = 0.02
     ent_coef_final: float = 0.001
     ent_decay_steps: int = 15_000
 
@@ -103,14 +102,14 @@ class Config:
     warmup_steps: int = 100_000  # Shorter warmup (in transitions)
 
     # Short replay window (key for V-trace) - only sample from recent data
-    recent_window_transitions: int = 2 * num_envs * rollout_len # Sample only from recent N transitions (0 = no limit)
+    recent_window_transitions: int = 500_000  # Sample only from recent N transitions (0 = no limit)
 
     # League training (K-best self-play)
-    pool_max: int = 6
+    k_best: int = 5
+    pool_max: int = 8
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
     elo_k: float = 32.0
-    elo_tau: float = 2 * eval_hands  # Temperature for EV-soft sigmoid scoring (chip units)
 
     # Runtime
     seed: int = 0
@@ -118,9 +117,9 @@ class Config:
     block_size: int = 100  # Number of collect+update steps per scan block (reduces host-device sync)
 
     # Checkpointing
-    checkpoint_dir: str = "/content/drive/MyDrive/checkpoints"
+    checkpoint_dir: str = "./checkpoints"
     checkpoint_every: int = 1000
-    log_every: int = 2 * block_size
+    log_every: int = 50
 
 
 CFG = Config()
@@ -325,8 +324,8 @@ def encode_actions(aux: AuxState, player_id: chex.Array) -> Tuple[chex.Array, ch
     """Encode action history into (ACTION_SEQ_LEN, ACTION_INPUT_DIM) tensor with ego-relative player IDs.
 
     Returns:
-        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (40, 7) action history
-        action_mask: (ACTION_SEQ_LEN,) = (40,) boolean mask for valid actions (pointer-based)
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7) action history
+        action_mask: (ACTION_SEQ_LEN,) = (32,) boolean mask for valid actions (pointer-based)
     """
     # Re-center circular buffer so the most recent action is at the end
     # Use gather indices instead of jnp.roll to avoid full memory copy on TPU
@@ -391,8 +390,8 @@ class Unroll:
     across time steps. adv/ret are NOT stored - computed at training time.
     """
     card: chex.Array        # (T, E, 9, 2) int32 - card tensor
-    action_hist: chex.Array # (T, E, 40, 7) float32 - action history
-    action_mask: chex.Array # (T, E, 40) bool - action history mask
+    action_hist: chex.Array # (T, E, 32, 7) float32 - action history
+    action_mask: chex.Array # (T, E, 32) bool - action history mask
     legal: chex.Array       # (T, E, 13) bool - legal actions
     action: chex.Array      # (T, E) int32 - action taken
     logp_mu: chex.Array     # (T, E) float32 - log prob under BEHAVIOR policy
@@ -403,8 +402,8 @@ class Unroll:
     valid: chex.Array       # (T, E) bool - is this a learner turn
     # Bootstrap data for V-trace: observation of state AFTER last transition
     bootstrap_card: chex.Array        # (E, 9, 2) - card tensor for s_T
-    bootstrap_action_hist: chex.Array # (E, 40, 7) - action history for s_T
-    bootstrap_action_mask: chex.Array # (E, 40) - action mask for s_T
+    bootstrap_action_hist: chex.Array # (E, 32, 7) - action history for s_T
+    bootstrap_action_mask: chex.Array # (E, 32) - action mask for s_T
     bootstrap_done: chex.Array        # (E,) - whether last transition was terminal
 
 
@@ -416,8 +415,8 @@ class UnrollBuffer:
     This enables proper importance weight computation across time.
     """
     card: chex.Array        # (cap, T, E, 9, 2)
-    action_hist: chex.Array # (cap, T, E, 40, 7)
-    action_mask: chex.Array # (cap, T, E, 40)
+    action_hist: chex.Array # (cap, T, E, 32, 7)
+    action_mask: chex.Array # (cap, T, E, 32)
     legal: chex.Array       # (cap, T, E, 13)
     action: chex.Array      # (cap, T, E)
     logp_mu: chex.Array     # (cap, T, E) - behavior policy log prob
@@ -428,8 +427,8 @@ class UnrollBuffer:
     valid: chex.Array       # (cap, T, E)
     # Bootstrap data for V-trace
     bootstrap_card: chex.Array        # (cap, E, 9, 2)
-    bootstrap_action_hist: chex.Array # (cap, E, 40, 7)
-    bootstrap_action_mask: chex.Array # (cap, E, 40)
+    bootstrap_action_hist: chex.Array # (cap, E, 32, 7)
+    bootstrap_action_mask: chex.Array # (cap, E, 32)
     bootstrap_done: chex.Array        # (cap, E)
     ptr: chex.Array
     size: chex.Array
@@ -494,27 +493,40 @@ def unroll_buffer_sample(
     key: chex.PRNGKey,
     batch_size: int,
 ) -> Tuple[Unroll, chex.PRNGKey]:
-    """Sample batch_size unrolls from the buffer using O(1) direct indexing."""
+    """Sample batch_size unrolls from the buffer.
+
+    Returns unrolls with shape (batch_size, T, E, ...).
+    """
     key, sub = jax.random.split(key)
     cap = buf.card.shape[0]
 
-    # Calculate how many recent unrolls are available for sampling
+    # Use recent window for sampling (convert transitions to unrolls)
+    # Each unroll contains rollout_len * num_envs transitions
+    # Use ceiling division to ensure at least 1 unroll when window > 0
     transitions_per_unroll = CFG.rollout_len * CFG.num_envs
+    # Ceiling division: (a + b - 1) // b, with minimum of 1
     recent_window_unrolls = jnp.where(
         CFG.recent_window_transitions > 0,
         jnp.maximum(1, jnp.int32((CFG.recent_window_transitions + transitions_per_unroll - 1) // transitions_per_unroll)),
         cap,
     )
-    # The number of valid items we can sample from (e.g., min(200k, 16))
     available = jnp.minimum(buf.size, recent_window_unrolls)
 
-    # OPTIMIZATION: Sample indices directly from range [0, available)
-    # This avoids creating a 200,000-element mask every step
-    sample_indices = jax.random.randint(sub, (batch_size,), 0, available)
+    # Sample from available unrolls
+    age = (buf.ptr - 1 - jnp.arange(cap, dtype=jnp.int32)) % cap
+    eligible = jnp.where(available > 0, age < available, jnp.zeros_like(age, dtype=jnp.bool_))
+    elig_w = eligible.astype(jnp.float32)
+    elig_sum = jnp.sum(elig_w)
 
-    # Map these "relative ages" back to actual buffer indices
-    # index = (current_ptr - 1 - relative_age) % capacity
-    idx = (buf.ptr - 1 - sample_indices) % cap
+    def _sample():
+        p = jnp.where(
+            elig_sum > 0,
+            elig_w / elig_sum,
+            jnp.ones((cap,), dtype=jnp.float32) / jnp.float32(cap)
+        )
+        return jax.random.choice(sub, cap, shape=(batch_size,), replace=True, p=p)
+
+    idx = _sample()
 
     unroll = Unroll(
         card=buf.card[idx],
@@ -543,78 +555,40 @@ def unroll_buffer_sample(
 
 @chex.dataclass(frozen=True)
 class AgentPool:
-    """Pool of historical agent parameters for self-play with diversity tracking.
-
-    Retains agents based on:
-    - Top 4 by ELO (performance)
-    - 2 style-diverse agents (behavioral diversity via raise/fold/call rates)
-    """
+    """Pool of historical agent parameters for self-play."""
     params: Any              # Stacked params along axis 0
     elo: chex.Array          # (pool_max,) ELO ratings
-    add_order: chex.Array    # (pool_max,) monotonic counter when agent was added
-    style_stats: chex.Array  # (pool_max, 3) [raise_rate, fold_rate, call_rate]
     size: chex.Array         # Current number of agents
-    add_counter: chex.Array  # Scalar: next add_order value
 
 
 def pool_init(dummy_params: Any) -> AgentPool:
     """Initialize empty agent pool."""
     def _zeros_like(p):
         return jnp.zeros((CFG.pool_max,) + p.shape, dtype=p.dtype)
-
+    
     params = jax.tree_util.tree_map(_zeros_like, dummy_params)
     elo = jnp.zeros((CFG.pool_max,), dtype=jnp.float32)
-    add_order = jnp.full((CFG.pool_max,), -1, dtype=jnp.int32)  # -1 = not yet added
-    style_stats = jnp.zeros((CFG.pool_max, 3), dtype=jnp.float32)  # [raise, fold, call]
-    return AgentPool(
-        params=params,
-        elo=elo,
-        add_order=add_order,
-        style_stats=style_stats,
-        size=jnp.int32(0),
-        add_counter=jnp.int32(0),
-    )
+    return AgentPool(params=params, elo=elo, size=jnp.int32(0))
 
 
 @jax.jit
-def pool_add(
-    pool: AgentPool,
-    new_params: Any,
-    initial_elo: chex.Array,
-    style_stats: chex.Array,
-) -> AgentPool:
-    """Add a new agent to the pool with style stats.
-
-    Args:
-        pool: Current agent pool
-        new_params: Parameters for the new agent
-        initial_elo: Initial ELO rating
-        style_stats: (3,) array of [raise_rate, fold_rate, call_rate]
-    """
+def pool_add(pool: AgentPool, new_params: Any, initial_elo: chex.Array) -> AgentPool:
+    """Add a new agent to the pool."""
     size = pool.size
     can_append = size < CFG.pool_max
-
-    # If pool is full, replace worst agent by ELO
+    
+    # If pool is full, replace worst agent
     worst = jnp.argmin(jnp.where(jnp.arange(CFG.pool_max) < size, pool.elo, 1e9))
     write_idx = jnp.where(can_append, size, worst)
-
+    
     def _write_leaf(pool_leaf, new_leaf):
         return pool_leaf.at[write_idx].set(new_leaf)
-
+    
     params = jax.tree_util.tree_map(_write_leaf, pool.params, new_params)
     elo = pool.elo.at[write_idx].set(initial_elo)
-    add_order = pool.add_order.at[write_idx].set(pool.add_counter)
-    new_style_stats = pool.style_stats.at[write_idx].set(style_stats)
     size2 = jnp.where(can_append, size + 1, size)
-
-    return pool.replace(
-        params=params,
-        elo=elo,
-        add_order=add_order,
-        style_stats=new_style_stats,
-        size=size2,
-        add_counter=pool.add_counter + 1,
-    )
+    
+    return pool.replace(params=params, elo=elo, size=size2)
 
 
 def elo_expected(ra: chex.Array, rb: chex.Array) -> chex.Array:
@@ -642,63 +616,19 @@ def pool_select_opponent(
     pool: AgentPool,
     key: chex.PRNGKey,
 ) -> Tuple[Any, chex.PRNGKey]:
-    """Select opponent using diversity-aware sampling.
-
-    Sampling distribution (when pool has enough agents):
-    - 50% from top 4 by ELO (hard opponents)
-    - 25% from 2 most style-diverse agents
-    - 25% from 2 most recently added agents
-
-    This prevents monoculture while maintaining challenge.
-    """
-    key, k_category, k_pick = jax.random.split(key, 3)
+    """Select an opponent from the K-best agents in the pool."""
+    key, sub = jax.random.split(key)
     size = pool.size
-    valid_mask = jnp.arange(CFG.pool_max) < size
-
-    # Category selection: 0=top, 1=diverse, 2=recent
-    # Probabilities: 50%, 25%, 25%
-    category = jax.random.choice(k_category, 3, p=jnp.array([0.50, 0.25, 0.25]))
-
-    # === Category 0: Top by ELO (top 4) ===
-    valid_elo = jnp.where(valid_mask, pool.elo, -1e9)
-    _, top_idx = jax.lax.top_k(valid_elo, k=4)
-    n_top = jnp.minimum(size, jnp.int32(4))
-    top_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_top, 1))
-    idx_top = top_idx[top_pick]
-
-    # === Category 1: Style-diverse (maximize distance from mean style) ===
-    # Compute mean style across valid agents
-    valid_f = valid_mask.astype(jnp.float32)
-    n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
-    mean_style = jnp.sum(pool.style_stats * valid_f[:, None], axis=0) / n_valid
-
-    # L2 distance from mean style (style diversity)
-    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=-1)
-    style_dist = jnp.where(valid_mask, style_dist, -1e9)
-
-    # Pick from top 2 most diverse
-    _, diverse_idx = jax.lax.top_k(style_dist, k=2)
-    n_diverse = jnp.minimum(size, jnp.int32(2))
-    diverse_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_diverse, 1))
-    idx_diverse = diverse_idx[diverse_pick]
-
-    # === Category 2: Most recent (top 2 by add_order) ===
-    valid_add_order = jnp.where(valid_mask, pool.add_order, -1)
-    _, recent_idx = jax.lax.top_k(valid_add_order, k=2)
-    n_recent = jnp.minimum(size, jnp.int32(2))
-    recent_pick = jax.random.randint(k_pick, (), 0, jnp.maximum(n_recent, 1))
-    idx_recent = recent_idx[recent_pick]
-
-    # Select based on category
-    idx = jax.lax.switch(
-        category,
-        [
-            lambda: idx_top,
-            lambda: idx_diverse,
-            lambda: idx_recent,
-        ],
-    )
-
+    
+    # Get top-K by ELO
+    valid_elo = jnp.where(jnp.arange(CFG.pool_max) < size, pool.elo, -1e9)
+    _, topk_idx = jax.lax.top_k(valid_elo, k=CFG.k_best)
+    
+    # Randomly select from top-K
+    k_eff = jnp.minimum(size, jnp.int32(CFG.k_best))
+    pick = jax.random.randint(sub, (), 0, jnp.maximum(k_eff, 1))
+    idx = topk_idx[pick]
+    
     opp_params = jax.tree_util.tree_map(lambda p: p[idx], pool.params)
     return opp_params, key
 
@@ -1318,21 +1248,15 @@ def collect_rollout(
         )
 
         # For storage: need learner's perspective
-        # Avoid computing learner encodings when learner == current player
-        def _select_learner_obs(s_i, aux_i, pid_cur_i, learner_pid_i, card_cur_i, action_hist_cur_i, action_mask_cur_i):
-            def _use_cur(_):
-                return card_cur_i, action_hist_cur_i, action_mask_cur_i
+        # When learner == current player, reuse current encoding
+        # Otherwise, encode cards from learner's view and swap action history player IDs
+        card_learner_b = jax.vmap(encode_cards)(s, learner_pid)
+        action_hist_learner_b, action_mask_learner_b = jax.vmap(encode_actions)(aux, learner_pid)
 
-            def _use_learner(_):
-                card_l = encode_cards(s_i, learner_pid_i)
-                action_hist_l, action_mask_l = encode_actions(aux_i, learner_pid_i)
-                return card_l, action_hist_l, action_mask_l
-
-            return jax.lax.cond(pid_cur_i == learner_pid_i, _use_cur, _use_learner, operand=None)
-
-        card_b, action_hist_b, action_mask_b = jax.vmap(_select_learner_obs)(
-            s, aux, pid_cur, learner_pid, card_cur_b, action_hist_cur_b, action_mask_cur_b
-        )
+        # Select: reuse current player encoding when it's learner's turn
+        card_b = jnp.where(is_learner_turn[:, None, None], card_cur_b, card_learner_b)
+        action_hist_b = jnp.where(is_learner_turn[:, None, None], action_hist_cur_b, action_hist_learner_b)
+        action_mask_b = jnp.where(is_learner_turn[:, None], action_mask_cur_b, action_mask_learner_b)
 
         # Forward pass for main agent (learner)
         logits_main_b, _ = forward_apply(
@@ -1484,10 +1408,6 @@ def play_one_hand(
     Uses DETERMINISTIC action selection for stable ELO evaluation.
     This prevents variance in ELO ratings due to sampling randomness.
 
-    Returns:
-        r0: Raw chip delta for player 0 (player A). Positive = A won chips.
-        key: Updated random key.
-
     Uses the global ENV instance.
     """
     key, k_reset = jax.random.split(key)
@@ -1511,87 +1431,8 @@ def play_one_hand(
 
     sT, _, key = jax.lax.while_loop(cond_fn, body_fn, (s, aux, key))
     r0, _ = terminal_rewards(sT)
-    # Return raw chip delta instead of win/loss score
-    return r0, key
-
-
-@jax.jit
-def play_one_hand_with_action_counts(
-    params_a: Any,
-    params_b: Any,
-    key: chex.PRNGKey,
-) -> Tuple[chex.Array, chex.Array, chex.PRNGKey]:
-    """Play one hand and track action counts for player A (P0).
-
-    Returns:
-        r0: Chip delta for player 0
-        action_counts: (3,) array [raise_count, fold_count, call_count] for P0
-        key: Updated random key
-    """
-    key, k_reset = jax.random.split(key)
-    s = ENV.reset(k_reset)
-    aux = aux_reset()
-
-    def cond_fn(carry):
-        s, aux, key, counts = carry
-        return ~s.done
-
-    def body_fn(carry):
-        s, aux, key, counts = carry
-        pid = s.current_player.astype(jnp.int32)
-        params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
-        a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
-        aux2 = aux_record_action(aux, s, a)
-        key, k_step = jax.random.split(key)
-        s2 = ENV.step(s, k_step, a)
-
-        # Track actions for player 0 only
-        # Action classification: 0=fold, 1-2=check/call, 3+=raise
-        is_p0 = pid == 0
-        is_raise = (a >= 3).astype(jnp.float32)
-        is_fold = (a == 0).astype(jnp.float32)
-        is_call = ((a == 1) | (a == 2)).astype(jnp.float32)
-        p0_mask = is_p0.astype(jnp.float32)
-
-        new_counts = counts + p0_mask * jnp.array([is_raise, is_fold, is_call])
-        return (s2, aux2, key, new_counts)
-
-    init_counts = jnp.zeros(3, dtype=jnp.float32)
-    sT, _, key, final_counts = jax.lax.while_loop(
-        cond_fn, body_fn, (s, aux, key, init_counts)
-    )
-    r0, _ = terminal_rewards(sT)
-    return r0, final_counts, key
-
-
-@jax.jit
-def compute_style_stats(
-    params: Any,
-    key: chex.PRNGKey,
-    n_hands: int = 64,
-) -> Tuple[chex.Array, chex.PRNGKey]:
-    """Compute style statistics for an agent by playing hands against itself.
-
-    Returns:
-        style_stats: (3,) array [raise_rate, fold_rate, call_rate]
-        key: Updated random key
-    """
-    key, sub = jax.random.split(key)
-    keys = jax.random.split(sub, n_hands)
-
-    # Play hands with agent as both P0 and P1 (self-play)
-    _, action_counts_all, _ = jax.vmap(
-        play_one_hand_with_action_counts, in_axes=(None, None, 0)
-    )(params, params, keys)
-
-    # Sum counts across all hands
-    total_counts = jnp.sum(action_counts_all, axis=0)  # (3,)
-    total_actions = jnp.sum(total_counts)
-
-    # Compute rates (avoid division by zero)
-    style_stats = total_counts / jnp.maximum(1.0, total_actions)
-
-    return style_stats, key
+    score = jnp.where(r0 > 0, 1.0, jnp.where(r0 < 0, 0.0, 0.5)).astype(jnp.float32)
+    return score, key
 
 
 @jax.jit
@@ -1601,9 +1442,10 @@ def eval_and_update_pool(
     main_elo: jnp.ndarray,
     key: chex.PRNGKey,
 ) -> Tuple[AgentPool, jnp.ndarray, chex.PRNGKey]:
-    """Evaluate main agent against pool and update ELOs with diversity-aware retention."""
+    """Evaluate main agent against pool and update ELOs."""
     pool_max = CFG.pool_max
     eval_hands = CFG.eval_hands
+    k_best = CFG.k_best
     elo_k = CFG.elo_k
     
     # Generate keys for matches
@@ -1615,27 +1457,19 @@ def eval_and_update_pool(
     n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
     
     # Play matches - half as P0, half as P1 to eliminate position bias
-    # Use match-based money metric: sum chip deltas, then apply sigmoid
     def play_vs_one_opp(opp_params, keys_n):
         half = eval_hands // 2
-        # First half: main as P0 - get raw chip deltas for main
-        money_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
+        # First half: main as P0
+        scores_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
             main_state.params, opp_params, keys_n[:half]
         )
-        # Second half: main as P1 (opp is P0)
-        # play_one_hand returns r0 (opp's reward), so main's reward is -r0
-        money_opp_as_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
+        # Second half: main as P1 (swap params, invert score)
+        scores_p1_raw, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
             opp_params, main_state.params, keys_n[half:]
         )
-        money_p1 = -money_opp_as_p0  # Main's money when playing as P1
-
-        # Sum total chip delta over the match
-        R_total = jnp.sum(money_p0) + jnp.sum(money_p1)
-
-        # EV-soft score: sigmoid(R_total / tau)
-        # This gives a score in (0, 1) that reflects the margin of victory
-        score = jax.nn.sigmoid(R_total / CFG.elo_tau)
-        return score
+        scores_p1 = 1.0 - scores_p1_raw  # Invert: P1 win -> main win
+        scores = jnp.concatenate([scores_p0, scores_p1])
+        return jnp.mean(scores)
     
     scores_pool = jax.vmap(play_vs_one_opp, in_axes=(0, 0))(pool.params, keys_grid)
     scores_pool = jnp.where(valid_mask, scores_pool, 0.0)
@@ -1652,101 +1486,48 @@ def eval_and_update_pool(
     
     pool_elo_next = pool.elo + jnp.where(valid_mask, delta_opp, 0.0)
     pool = pool.replace(elo=pool_elo_next)
-
-    # Compute style stats for main agent before adding to pool
-    main_style_stats, key = compute_style_stats(main_state.params, key)
-
-    # Add main to pool with style stats
+    
+    # Add main to pool
     valid_elos = jnp.where(valid_mask, pool.elo, -1e9)
-    _, topk_idx = jax.lax.top_k(valid_elos, k=4)
-
-    k_eff = jnp.minimum(pool.size, jnp.int32(4))
-    topk_mask = (jnp.arange(4) < k_eff).astype(jnp.float32)
-
+    _, topk_idx = jax.lax.top_k(valid_elos, k=k_best)
+    
+    k_eff = jnp.minimum(pool.size, jnp.int32(k_best))
+    topk_mask = (jnp.arange(k_best) < k_eff).astype(jnp.float32)
+    
     topk_vals = pool.elo[topk_idx]
     denom = jnp.maximum(1.0, jnp.sum(topk_mask))
     avg_top_elo = jnp.sum(topk_vals * topk_mask) / denom
-
+    
     entry_elo = jnp.where(pool.size > 0, avg_top_elo, 0.0)
-    pool = pool_add(pool, main_state.params, entry_elo, main_style_stats)
-
-    # =========================================================================
-    # Diversity-aware retention: keep pool_max=6 agents
-    # - 4 top by ELO (performance)
-    # - 2 style-diverse (behavioral diversity)
-    # - 2 most recent (recency)
-    # Note: Categories can overlap, final count capped at pool_max
-    # =========================================================================
+    pool = pool_add(pool, main_state.params, entry_elo)
+    
+    # Trim to K-best
     size_curr = pool.size
     valid_mask_final = jnp.arange(pool_max) < size_curr
-    valid_f_final = valid_mask_final.astype(jnp.float32)
-
-    # Initialize keep mask (will mark which agents to keep)
-    keep_mask = jnp.zeros(pool_max, dtype=jnp.bool_)
-
-    # === Select top 4 by ELO ===
     valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)
-    _, elo_top_idx = jax.lax.top_k(valid_elos_final, k=4)
-    n_elo_keep = jnp.minimum(size_curr, jnp.int32(4))
-    elo_keep_mask = (jnp.arange(4) < n_elo_keep)
-    keep_mask = keep_mask.at[elo_top_idx].set(
-        keep_mask[elo_top_idx] | elo_keep_mask
+    
+    _, keep_idx = jax.lax.top_k(valid_elos_final, k=k_best)
+    n_keep = jnp.minimum(size_curr, jnp.int32(k_best))
+    
+    def _gather_pad(x):
+        picked = x[keep_idx]
+        mask = (jnp.arange(k_best) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
+        picked = picked * mask.astype(picked.dtype)
+        pad_len = pool_max - k_best
+        pad = jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype)
+        return jnp.concatenate([picked, pad], axis=0)
+    
+    new_params = jax.tree_util.tree_map(_gather_pad, pool.params)
+    
+    picked_elo = pool.elo[keep_idx]
+    picked_elo = picked_elo * (jnp.arange(k_best) < n_keep).astype(jnp.float32)
+    new_elo = jnp.concatenate(
+        [picked_elo, jnp.zeros(pool_max - k_best, dtype=pool.elo.dtype)],
+        axis=0,
     )
-
-    # === Select 2 style-diverse (furthest from mean style, excluding already kept) ===
-    # Compute mean style across valid agents
-    n_valid_final = jnp.maximum(1.0, jnp.sum(valid_f_final))
-    mean_style = jnp.sum(pool.style_stats * valid_f_final[:, None], axis=0) / n_valid_final
-
-    # L2 distance from mean style
-    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=-1)
-    # Exclude already-kept agents and invalid slots
-    style_dist_masked = jnp.where(valid_mask_final & ~keep_mask, style_dist, -1e9)
-    _, diverse_idx = jax.lax.top_k(style_dist_masked, k=2)
-    # Only keep if there are remaining valid agents
-    n_remaining = jnp.sum((valid_mask_final & ~keep_mask).astype(jnp.int32))
-    n_diverse_keep = jnp.minimum(n_remaining, jnp.int32(2))
-    diverse_keep_mask = (jnp.arange(2) < n_diverse_keep)
-    keep_mask = keep_mask.at[diverse_idx].set(
-        keep_mask[diverse_idx] | diverse_keep_mask
-    )
-
-    # === Select 2 most recent (by add_order, excluding already kept) ===
-    valid_add_order_final = jnp.where(valid_mask_final & ~keep_mask, pool.add_order, -1)
-    _, recent_idx = jax.lax.top_k(valid_add_order_final, k=2)
-    n_remaining_for_recent = jnp.sum((valid_mask_final & ~keep_mask).astype(jnp.int32))
-    n_recent_keep = jnp.minimum(n_remaining_for_recent, jnp.int32(2))
-    recent_keep_mask = (jnp.arange(2) < n_recent_keep)
-    keep_mask = keep_mask.at[recent_idx].set(
-        keep_mask[recent_idx] | recent_keep_mask
-    )
-
-    # Gather indices of agents to keep (up to pool_max)
-    keep_indices = jnp.where(keep_mask, jnp.arange(pool_max), pool_max)
-    keep_indices_sorted = jnp.sort(keep_indices)
-    # Filter out the pool_max sentinel values
-    n_keep = jnp.sum(keep_mask.astype(jnp.int32))
-
-    # Gather kept agents into compact form
-    def _gather_compact(x):
-        # Gather from keep_indices_sorted, masking invalid entries
-        gathered = x[keep_indices_sorted % pool_max]
-        valid = (jnp.arange(pool_max) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
-        return jnp.where(valid, gathered, jnp.zeros_like(gathered))
-
-    new_params = jax.tree_util.tree_map(_gather_compact, pool.params)
-    new_elo = _gather_compact(pool.elo)
-    new_add_order = _gather_compact(pool.add_order)
-    new_style_stats = _gather_compact(pool.style_stats)
-
-    pool_final = pool.replace(
-        params=new_params,
-        elo=new_elo,
-        add_order=new_add_order,
-        style_stats=new_style_stats,
-        size=n_keep,
-    )
-
+    
+    pool_final = pool.replace(params=new_params, elo=new_elo, size=n_keep)
+    
     return pool_final, main_elo_next, key
 
 
@@ -1924,33 +1705,9 @@ def main() -> None:
     ckpter = orbax.checkpoint.PyTreeCheckpointer()
     save_args = orbax_utils.save_args_from_target(ts)
 
-    # Restore latest checkpoint if available (params only; fresh optimizer state)
-    ckpt_steps = []
-    for name in os.listdir(ckpt_dir):
-        full = os.path.join(ckpt_dir, name)
-        if os.path.isdir(full) and name.startswith("step_"):
-            try:
-                step = int(name.split("_", 1)[1])
-                ckpt_steps.append(step)
-            except ValueError:
-                pass
-    if ckpt_steps:
-        latest_step = max(ckpt_steps)
-        restore_path = os.path.join(ckpt_dir, f"step_{latest_step}")
-        restored = ckpter.restore(restore_path)
-        restored_params = (
-            restored["params"]
-            if isinstance(restored, dict) and "params" in restored
-            else getattr(restored, "params", restored)
-        )
-        ts = ts.replace(params=restored_params)
-        print(f"Restored checkpoint params from {restore_path}")
-
-    # Initialize pool with initial agent (compute style stats for diversity tracking)
+    # Initialize pool with initial agent
     pool = pool_init(ts.params)
-    key, k_style = jax.random.split(key)
-    init_style_stats, _ = compute_style_stats(ts.params, k_style)
-    pool = pool_add(pool, ts.params, jnp.float32(0.0), init_style_stats)
+    pool = pool_add(pool, ts.params, jnp.float32(0.0))
     main_elo = jnp.float32(0.0)
 
     # Initialize environment
@@ -2028,8 +1785,6 @@ def main() -> None:
         # Checkpointing
         if end_step % CFG.checkpoint_every == 0:
             save_path = f"{ckpt_dir}/step_{end_step}"
-            if os.path.exists(save_path):
-                shutil.rmtree(save_path)
             ckpter.save(save_path, ts, save_args=save_args)
             print(f"Saved checkpoint to {save_path}")
 
