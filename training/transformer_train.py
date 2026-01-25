@@ -109,7 +109,7 @@ class Config:
     eval_hands: int = 512
     add_to_pool_every_updates: int = 100
     elo_k: float = 32.0
-    elo_tau: float = eval_hands  # Temperature for EV-soft sigmoid scoring (chip units)
+    elo_tau: float = 100.0  # Temperature for sigmoid scoring in chip units (BB scale)
 
     # Runtime
     seed: int = 0
@@ -1333,8 +1333,9 @@ def collect_rollout(
     """
     # Select opponent from pool
     opp_params, key = pool_select_opponent(pool, key)
+    # When pool only has 1 agent (self), use main_params for self-play
     opp_params = jax.tree_util.tree_map(
-        lambda o, m: jax.lax.cond(pool.size == 0, lambda _: m, lambda _: o, operand=None),
+        lambda o, m: jax.lax.cond(pool.size <= 1, lambda _: m, lambda _: o, operand=None),
         opp_params,
         main_params,
     )
@@ -1377,7 +1378,9 @@ def collect_rollout(
         )
 
         # Opponent forward (conditional)
-        has_opponent = pool.size > 0
+        # Only compute separate opponent forward pass if pool has >1 agent
+        # When pool.size <= 1, we're in self-play mode - reuse main logits
+        has_opponent = pool.size > 1
 
         def compute_opp_logits():
             return forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b)[0]
@@ -1535,8 +1538,10 @@ def play_one_hand(
         s, aux, key = carry
         pid = s.current_player.astype(jnp.int32)
         params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
-        # Use deterministic=True for stable ELO evaluation
-        a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
+        # Use stochastic sampling for evaluation - matches training behavior and
+        # is correct for poker (mixed strategies). deterministic=True causes policy
+        # collapse issues where the model always picks "safe" actions like fold.
+        a, _, _, key = policy_act(params, s, aux, key, deterministic=False)
         aux2 = aux_record_action(aux, s, a)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
@@ -1573,7 +1578,7 @@ def play_one_hand_with_action_counts(
         s, aux, key, counts = carry
         pid = s.current_player.astype(jnp.int32)
         params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
-        a, _, _, key = policy_act(params, s, aux, key, deterministic=True)
+        a, _, _, key = policy_act(params, s, aux, key, deterministic=False)
         aux2 = aux_record_action(aux, s, a)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
@@ -1711,25 +1716,49 @@ def eval_and_update_pool(
     valid_mask_final = jnp.arange(pool_max) < size_curr
     valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)
 
-    _, keep_idx = jax.lax.top_k(valid_elos_final, k=k_best)
-    n_keep = jnp.minimum(size_curr, jnp.int32(k_best))
+    # === Category 1: Top 4 by ELO ===
+    _, top_elo_idx = jax.lax.top_k(valid_elos_final, k=k_best)
+
+    # === Category 2: Top 2 by style diversity (distance from mean style) ===
+    valid_f = valid_mask_final.astype(jnp.float32)
+    n_valid_f = jnp.maximum(1.0, jnp.sum(valid_f))
+    mean_style = jnp.sum(pool.style_stats * valid_f[:, None], axis=0) / n_valid_f
+    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=-1)
+    style_dist = jnp.where(valid_mask_final, style_dist, -1e9)
+    _, top_diverse_idx = jax.lax.top_k(style_dist, k=2)
+
+    # === Category 3: Top 2 most recent (by add_order) ===
+    valid_add_order = jnp.where(valid_mask_final, pool.add_order, -1)
+    _, top_recent_idx = jax.lax.top_k(valid_add_order, k=2)
+
+    # === Combine indices with deduplication ===
+    # Create a "keep score" for each agent: agents in any category get marked
+    keep_score = jnp.zeros(pool_max, dtype=jnp.float32)
+    # Top ELO agents get highest priority (score = 3)
+    keep_score = keep_score.at[top_elo_idx].add(3.0)
+    # Style-diverse agents get medium priority (score = 2)
+    keep_score = keep_score.at[top_diverse_idx].add(2.0)
+    # Recent agents get lower priority (score = 1)
+    keep_score = keep_score.at[top_recent_idx].add(1.0)
+    # Mask out invalid agents
+    keep_score = jnp.where(valid_mask_final, keep_score, -1e9)
+
+    # Select top pool_max agents by keep_score (handles deduplication naturally)
+    _, keep_idx = jax.lax.top_k(keep_score, k=pool_max)
+
+    # Count how many valid agents we're actually keeping
+    n_keep = jnp.minimum(size_curr, jnp.int32(pool_max))
 
     def _gather_pad(x):
         picked = x[keep_idx]
-        mask = (jnp.arange(k_best) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
+        mask = (jnp.arange(pool_max) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
         picked = picked * mask.astype(picked.dtype)
-        pad_len = pool_max - k_best
-        pad = jnp.zeros((pad_len,) + x.shape[1:], dtype=x.dtype)
-        return jnp.concatenate([picked, pad], axis=0)
+        return picked
 
     new_params = jax.tree_util.tree_map(_gather_pad, pool.params)
 
     picked_elo = pool.elo[keep_idx]
-    picked_elo = picked_elo * (jnp.arange(k_best) < n_keep).astype(jnp.float32)
-    new_elo = jnp.concatenate(
-        [picked_elo, jnp.zeros(pool_max - k_best, dtype=pool.elo.dtype)],
-        axis=0,
-    )
+    new_elo = picked_elo * (jnp.arange(pool_max) < n_keep).astype(jnp.float32)
 
     # Also retain style_stats and add_order for kept agents
     new_style_stats = _gather_pad(pool.style_stats)
