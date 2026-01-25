@@ -1733,21 +1733,22 @@ def eval_and_update_pool(
 
     # === Combine indices with deduplication ===
     # Create a "keep score" for each agent: agents in any category get marked
-    keep_score = jnp.zeros(pool_max, dtype=jnp.float32)
-    # Top ELO agents get highest priority (score = 3)
+    # Valid agents not in any category get score 0.5 (still kept, but lower priority)
+    keep_score = jnp.where(valid_mask_final, jnp.float32(0.5), jnp.float32(-1e9))
+    # Top ELO agents get highest priority (score += 3)
     keep_score = keep_score.at[top_elo_idx].add(3.0)
-    # Style-diverse agents get medium priority (score = 2)
+    # Style-diverse agents get medium priority (score += 2)
     keep_score = keep_score.at[top_diverse_idx].add(2.0)
-    # Recent agents get lower priority (score = 1)
+    # Recent agents get lower priority (score += 1)
     keep_score = keep_score.at[top_recent_idx].add(1.0)
-    # Mask out invalid agents
+    # Re-mask invalid agents (in case top_k returned invalid indices when pool < k)
     keep_score = jnp.where(valid_mask_final, keep_score, -1e9)
 
     # Select top pool_max agents by keep_score (handles deduplication naturally)
     _, keep_idx = jax.lax.top_k(keep_score, k=pool_max)
 
-    # Count how many valid agents we're actually keeping
-    n_keep = jnp.minimum(size_curr, jnp.int32(pool_max))
+    # Count how many valid agents we're actually keeping (all valid agents)
+    n_keep = size_curr
 
     def _gather_pad(x):
         picked = x[keep_idx]
