@@ -101,7 +101,8 @@ class Config:
     replay_capacity: int = 200_000  # Target transition capacity (see note above)
     num_minibatches: int = 1 # More minibatches for more gradient steps
     update_epochs: int = 1  # Multiple epochs safe with V-trace importance weighting
-    warmup_updates: int = 1000  # LR warmup period (in update steps)
+    lr_warmup_updates: int = 1000  # LR warmup period (in update steps)
+    warmup_unrolls: int = 8  # Number of unrolls to collect before training starts
 
     # Short replay window (key for V-trace) - only sample from recent data
     recent_window_transitions: int = 500_000  # Sample only from recent N transitions (0 = no limit)
@@ -815,16 +816,16 @@ def make_lr_schedule(total_updates: int) -> optax.Schedule:
     warmup_fn = optax.linear_schedule(
         init_value=CFG.lr_init,
         end_value=CFG.lr_peak,
-        transition_steps=CFG.warmup_updates,
+        transition_steps=CFG.lr_warmup_updates,
     )
     decay_fn = optax.cosine_decay_schedule(
         init_value=CFG.lr_peak,
-        decay_steps=max(1, total_updates - CFG.warmup_updates),
+        decay_steps=max(1, total_updates - CFG.lr_warmup_updates),
         alpha=CFG.lr_final / CFG.lr_peak,  # Final LR as fraction of peak
     )
     return optax.join_schedules(
         schedules=[warmup_fn, decay_fn],
-        boundaries=[CFG.warmup_updates],
+        boundaries=[CFG.lr_warmup_updates],
     )
 
 
@@ -2006,8 +2007,7 @@ def main() -> None:
 
     # Warmup unroll buffer
     print("Warming up unroll buffer...")
-    warm_updates = max(1, CFG.warmup_updates // (CFG.num_envs * CFG.rollout_len))
-    for _ in range(warm_updates):
+    for _ in range(CFG.warmup_unrolls):
         buf, vec, key = do_collect(ts.params, pool, buf, vec, key)
     print(f"Buffer size after warmup: {buf.size} unrolls")
 
