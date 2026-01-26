@@ -86,9 +86,9 @@ class Config:
     ent_decay_steps: int = 20_000
 
     # Optimization with schedule
-    lr_init: float = 1e-4
-    lr_peak: float = 3e-4
-    lr_final: float = 1e-5
+    lr_init: float = 3e-4
+    lr_peak: float = 1e-3
+    lr_final: float = 1e-4
     warmup_updates: int = 500
     max_grad_norm: float = 0.5  # Tighter for V-trace stability
 
@@ -119,7 +119,7 @@ class Config:
     # Checkpointing
     checkpoint_dir: str = "./drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
-    log_every: int = 50
+    log_every: int = 200
 
 
 CFG = Config()
