@@ -40,6 +40,7 @@ from flax.training import orbax_utils
 from model import (
     TossHoldemModel,
     NUM_ACTIONS,
+    NUM_BETTING_ACTIONS,
     CARD_SEQ_LEN,
     ACTION_SEQ_LEN,
     CARD_INPUT_DIM,
@@ -121,7 +122,7 @@ class Config:
     # Checkpointing
     checkpoint_dir: str = "./drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
-    log_every: int = 200
+    log_every: int = 100
 
     # Resume from checkpoint (weights only, fresh optimizer state)
     resume_weights_from: str = ""  # e.g., "./drive/MyDrive/checkpoints/step_40000"
@@ -1057,10 +1058,22 @@ def vtrace_loss_on_unroll(
     entropy = jnp.sum(ent_flat * valid_f) / denom
 
     # Illegal action penalty - penalize high logits for illegal actions
-    # This teaches the model to not prefer actions that are illegal
-    illegal_mask = ~flat_legal  # True where action is illegal
+    # ONLY within the relevant action space (betting vs discard)
+    # This avoids penalizing one head for decisions it has no control over
+
+    # Determine which head is active based on what's legal
+    # If any betting action (0-9) is legal, it's a betting decision
+    # If any discard action (10-12) is legal, it's a discard decision
+    is_betting = jnp.any(flat_legal[:, :NUM_BETTING_ACTIONS], axis=-1, keepdims=True)
+    is_discard = jnp.any(flat_legal[:, NUM_BETTING_ACTIONS:], axis=-1, keepdims=True)
+
+    # Only penalize illegals within the active head
+    betting_illegal = ~flat_legal[:, :NUM_BETTING_ACTIONS] & is_betting
+    discard_illegal = ~flat_legal[:, NUM_BETTING_ACTIONS:] & is_discard
+    head_aware_illegal = jnp.concatenate([betting_illegal, discard_illegal], axis=-1)
+
     # Use softplus(logits) to penalize positive logits for illegal actions
-    illegal_logits = jnp.where(illegal_mask, jax.nn.softplus(raw_logits), 0.0)
+    illegal_logits = jnp.where(head_aware_illegal, jax.nn.softplus(raw_logits), 0.0)
     illegal_penalty_per_sample = jnp.sum(illegal_logits, axis=-1)  # Sum over actions
     illegal_penalty = jnp.sum(illegal_penalty_per_sample * valid_f) / denom
 
@@ -2051,8 +2064,8 @@ def main() -> None:
                 f"Val: {m['value_loss']:.4f} | "
                 f"Ent: {m['entropy']:.4f} | "
                 f"Ill: {m['illegal_penalty']:.4f} | "
-                f"EntC: {float(m['ent_coef']):.4f} | "
-                f"rho: {m['rho_mean']:.2f}"
+                f"Adv: {m['adv_mean']:.4f} | "
+                f"Ret: {m['ret_mean']:.4f}"
             )
 
         # Checkpointing
