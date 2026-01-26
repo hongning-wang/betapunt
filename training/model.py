@@ -1,10 +1,9 @@
 """Transformer-based AlphaHoldem model for Toss or Hold'em.
 
 Architecture:
-- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Projection -> (B, 9, 128)
-  (No transformer - card positions have fixed semantics)
-- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> Transformer -> (B, 32, 128)
-- Cross-Attention Fusion: Multiple layers of learnable queries attending to context
+- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> 1-layer Transformer -> (B, 9, 128)
+- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> 2-layer Transformer -> (B, 32, 128)
+- Cross-Attention Fusion: 2 layers of learnable queries (4 tokens) attending to context
 - Separate Output Heads: Policy (13), Value (1) with independent final layers
 
 Designed for JAX/Flax with JIT compilation.
@@ -35,13 +34,38 @@ NUM_HEADS = 2
 FFN_DIM = 512
 NUM_TRANSFORMER_LAYERS = 2
 NUM_CROSS_ATTENTION_LAYERS = 2
-NUM_QUERY_TOKENS = 6
+NUM_QUERY_TOKENS = 4
 PROCESSING_DIM = 256
 
 
 # =============================================================================
 # Transformer Components
 # =============================================================================
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    Faster than LayerNorm as it skips mean centering.
+    """
+    epsilon: float = 1e-6
+
+    @nn.compact
+    def __call__(self, x: chex.Array) -> chex.Array:
+        dtype = x.dtype
+        x = x.astype(jnp.float32)
+
+        variance = jnp.mean(jnp.square(x), axis=-1, keepdims=True)
+        x = x * jax.lax.rsqrt(variance + self.epsilon)
+
+        scale = self.param(
+            'scale',
+            nn.initializers.ones,
+            (x.shape[-1],),
+            jnp.float32,
+        )
+
+        return (x * scale).astype(dtype)
+
 
 class MultiHeadAttention(nn.Module):
     num_heads: int
@@ -109,13 +133,13 @@ class TransformerBlock(nn.Module):
         
         # Pre-norm self-attention
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = RMSNorm()(x)
         x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
         x = residual + x
 
         # Pre-norm FFN
         residual = x
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = RMSNorm()(x)
         x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
         x = nn.gelu(x)
         x = nn.Dense(self.emb_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
@@ -158,7 +182,7 @@ class TransformerEncoder(nn.Module):
             )(x, mask)
 
         # Final layer norm
-        x = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
+        x = RMSNorm()(x)
 
         return x
 
@@ -191,8 +215,8 @@ class CrossAttentionBlock(nn.Module):
         head_dim = self.emb_dim // self.num_heads
 
         # === Cross-Attention Sub-block ===
-        attn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(query_tokens)
-        context_normed = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(context)
+        attn_input = RMSNorm()(query_tokens)
+        context_normed = RMSNorm()(context)
 
         attn_output = MultiHeadAttention(
             num_heads=self.num_heads,
@@ -202,7 +226,7 @@ class CrossAttentionBlock(nn.Module):
         post_attn = query_tokens + attn_output
 
         # === FFN Sub-block ===
-        ffn_input = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(post_attn)
+        ffn_input = RMSNorm()(post_attn)
 
         ffn_hidden = nn.Dense(
             self.ffn_dim,
@@ -227,7 +251,7 @@ class CrossAttentionBlock(nn.Module):
 # =============================================================================
 
 class CardEncoder(nn.Module):
-    """Encodes card tensor using embeddings and transformer.
+    """Encodes card tensor using embeddings and small transformer.
 
     Input: (B, 9, 2) where each entry is [card_index, type_id].
 
@@ -241,16 +265,15 @@ class CardEncoder(nn.Module):
 
     Output: (B, 9, emb_dim)
 
-    Uses transformer to learn card relationships (flush/straight patterns).
+    Uses 1-layer transformer to learn card relationships (flush/straight patterns).
     """
 
     emb_dim: int = EMB_DIM
     rank_emb_dim: int = 48
     suit_emb_dim: int = 32
     position_emb_dim: int = 48  # 48 + 32 + 48 = 128
-    num_heads: int = NUM_HEADS
+    num_heads: int = 2
     ffn_dim: int = 256
-    num_layers: int = 1
 
     @nn.compact
     def __call__(
@@ -326,14 +349,12 @@ class CardEncoder(nn.Module):
         concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
 
         # -----------------------------
-        # Transformer to learn card relationships
+        # Small 1-layer transformer for card relationships
         # -----------------------------
-        transformer_dim = self.rank_emb_dim + self.suit_emb_dim + self.position_emb_dim  # 128
-        card_repr = TransformerEncoder(
-            emb_dim=transformer_dim,
+        card_repr = TransformerBlock(
+            emb_dim=self.emb_dim,
             num_heads=self.num_heads,
             ffn_dim=self.ffn_dim,
-            num_layers=self.num_layers,
         )(concat, valid_mask)  # (B, 9, 128)
 
         return card_repr, valid_mask
@@ -464,7 +485,7 @@ class TossHoldemModel(nn.Module):
         1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings (concatenated)
         2. Action Encoder: (B, 30, 7) -> (B, 30, 128) with embeddings (concatenated)
         3. Concatenate: (B, 39, 128)
-        4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 8, 128)
+        4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 4, 128)
         5. Processing MLP: Flatten -> Dense -> ReLU -> Dense -> ReLU -> Dense -> (B, 256)
         6. Separate Output Heads:
            - Policy: Independent MLP -> (B, 13)
@@ -516,8 +537,12 @@ class TossHoldemModel(nn.Module):
         )(action_tensor, action_mask)  # (B, 30, 128)
         
         # =================================================================
-        # 2. Concatenate to form context
+        # 2. Normalize and concatenate to form context
         # =================================================================
+
+        # Normalize both modalities to same scale before fusion
+        card_repr = RMSNorm(name='card_norm')(card_repr)
+        action_repr = RMSNorm(name='action_norm')(action_repr)
 
         context = jnp.concatenate([card_repr, action_repr], axis=1)  # (B, 39, 128)
 
@@ -537,7 +562,7 @@ class TossHoldemModel(nn.Module):
         # Initialize learnable query tokens (will be broadcast across batch)
         query_tokens = self.param(
             'query_tokens',
-            nn.initializers.normal(stddev=0.02),
+            nn.initializers.lecun_normal(),
             (self.num_query_tokens, self.emb_dim),
             jnp.bfloat16,
         )
@@ -556,19 +581,19 @@ class TossHoldemModel(nn.Module):
                 num_heads=self.num_heads,
                 ffn_dim=self.ffn_dim,
                 name=f'cross_attn_{layer_idx}',
-            )(fused, context, context_mask)  # (B, 6, 128)
+            )(fused, context, context_mask)  # (B, 4, 128)
 
         # Final layer norm after cross-attention
-        fused = nn.LayerNorm(dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(fused)
+        fused = RMSNorm()(fused)
 
         # =================================================================
         # 4. Processing MLP
         # =================================================================
 
-        # Flatten: (B, 6, 128) -> (B, 768)
+        # Flatten: (B, 4, 128) -> (B, 512)
         flat = fused.reshape(batch_size, -1)
 
-        # Layer 1: (B, 768) -> (B, 512)
+        # Layer 1: (B, 512) -> (B, 512)
         processed = nn.Dense(
             512,
             dtype=jnp.bfloat16,
