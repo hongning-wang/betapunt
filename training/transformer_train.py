@@ -70,7 +70,7 @@ class Config:
     """
 
     # Parallel sampling
-    num_envs: int = 8_192 # parallel environments
+    num_envs: int = 2_048 # parallel environments
     rollout_len: int = 32
 
     # V-trace hyperparameters (IMPALA-style)
@@ -82,8 +82,8 @@ class Config:
 
     # Entropy coefficient with schedule
     ent_coef_init: float = 0.01
-    ent_coef_final: float = 0.005
-    ent_decay_steps: int = 15_000
+    ent_coef_final: float = 0.001
+    ent_decay_steps: int = 20_000
 
     # Optimization with schedule
     lr_init: float = 1e-4

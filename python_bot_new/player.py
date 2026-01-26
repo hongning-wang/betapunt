@@ -25,7 +25,7 @@ from torch_transformer_model import (
 
 
 # =============================================================================
-# Constants (matching game.py and model.py)
+# Constants (matching training/model.py)
 # =============================================================================
 
 # Model action indices
@@ -49,6 +49,15 @@ ACTION_SEQ_LEN = 32
 CARD_INPUT_DIM = 2
 ACTION_INPUT_DIM = 7
 NUM_ACTIONS = 13
+NUM_CARD_TYPES = 6  # heropriv=0, flop=1, herodiscard=2, villaindiscard=3, turn=4, river=5
+
+# Card type IDs (semantic, matching training/model.py)
+CARD_TYPE_HEROPRIV = 0       # Hero's private cards (positions 0-2)
+CARD_TYPE_FLOP = 1           # Flop cards (positions 3-4)
+CARD_TYPE_HERODISCARD = 2    # Hero's discard (position 5)
+CARD_TYPE_VILLAINDISCARD = 3 # Villain's discard (position 6)
+CARD_TYPE_TURN = 4           # Turn card (position 7)
+CARD_TYPE_RIVER = 5          # River card (position 8)
 
 # Paths
 BOT_DIR = os.path.dirname(__file__)
@@ -67,29 +76,139 @@ STREET_RIVER = 4
 # Card Conversion Utilities
 # =============================================================================
 
+RANK_MAP = {
+    '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6,
+    '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12
+}
+SUIT_CHARS = {'s', 'h', 'd', 'c'}
+
+
+def parse_card(card_str: str) -> Tuple[int, str]:
+    """Parse card string into (rank, suit_char).
+
+    Returns (-1, '') for invalid cards.
+    """
+    if len(card_str) != 2:
+        return -1, ''
+    rank_char = card_str[0]
+    suit_char = card_str[1].lower()
+    if rank_char not in RANK_MAP or suit_char not in SUIT_CHARS:
+        return -1, ''
+    return RANK_MAP[rank_char], suit_char
+
+
+def canonize_and_sort_cards(
+    hero_cards: List[str],
+    flop_cards: List[str],
+    hero_discard: Optional[str],
+    villain_discard: Optional[str],
+    turn_card: Optional[str],
+    river_card: Optional[str],
+) -> Tuple[List[int], List[int], int, int, int, int, List[int]]:
+    """Canonize suits and sort cards by rank.
+
+    Suit canonization: first suit seen = 0, second = 1, etc.
+    Cards are processed in order: hero hand, flop, hero discard, villain discard, turn, river.
+    Hero hand and flop are each sorted by rank (ascending).
+
+    Returns:
+        hero_indices: List of 3 card indices (sorted by rank), -1 for invalid
+        flop_indices: List of 2 card indices (sorted by rank), -1 for invalid
+        hero_discard_idx: Card index or -1
+        villain_discard_idx: Card index or -1
+        turn_idx: Card index or -1
+        river_idx: Card index or -1
+        hero_sort_map: List mapping sorted position -> original position in hero_cards
+    """
+    suit_canon = {}  # original suit char -> canonized suit (0-3)
+
+    def get_canon_suit(suit_char: str) -> int:
+        if suit_char not in suit_canon:
+            suit_canon[suit_char] = len(suit_canon)
+        return suit_canon[suit_char]
+
+    def card_to_index(card_str: Optional[str]) -> int:
+        if not card_str:
+            return -1
+        rank, suit_char = parse_card(card_str)
+        if rank < 0:
+            return -1
+        canon_suit = get_canon_suit(suit_char)
+        return canon_suit * 13 + rank
+
+    # Process hero cards first (for suit canonization), then sort by rank
+    # Track original position for mapping back
+    hero_parsed = []
+    for orig_pos, card_str in enumerate(hero_cards[:3]):
+        rank, suit_char = parse_card(card_str)
+        if rank >= 0:
+            canon_suit = get_canon_suit(suit_char)
+            hero_parsed.append((rank, canon_suit, canon_suit * 13 + rank, orig_pos))
+        else:
+            hero_parsed.append((-1, -1, -1, orig_pos))
+
+    # Sort hero cards by rank (ascending), keeping invalid cards at end
+    hero_parsed_valid = [(r, s, idx, orig) for r, s, idx, orig in hero_parsed if r >= 0]
+    hero_parsed_invalid = [(r, s, idx, orig) for r, s, idx, orig in hero_parsed if r < 0]
+    hero_parsed_valid.sort(key=lambda x: x[0])  # Sort by rank
+    hero_sorted = hero_parsed_valid + hero_parsed_invalid
+    hero_indices = [idx for _, _, idx, _ in hero_sorted]
+    hero_sort_map = [orig for _, _, _, orig in hero_sorted]  # sorted_pos -> original_pos
+    # Pad to 3 if needed
+    while len(hero_indices) < 3:
+        hero_indices.append(-1)
+    while len(hero_sort_map) < 3:
+        hero_sort_map.append(-1)
+
+    # Process flop cards, then sort by rank
+    flop_parsed = []
+    for card_str in flop_cards[:2]:
+        rank, suit_char = parse_card(card_str)
+        if rank >= 0:
+            canon_suit = get_canon_suit(suit_char)
+            flop_parsed.append((rank, canon_suit * 13 + rank))
+        else:
+            flop_parsed.append((-1, -1))
+
+    # Sort flop by rank
+    flop_parsed_valid = [(r, idx) for r, idx in flop_parsed if r >= 0]
+    flop_parsed_invalid = [(r, idx) for r, idx in flop_parsed if r < 0]
+    flop_parsed_valid.sort(key=lambda x: x[0])
+    flop_sorted = flop_parsed_valid + flop_parsed_invalid
+    flop_indices = [idx for _, idx in flop_sorted]
+    while len(flop_indices) < 2:
+        flop_indices.append(-1)
+
+    # Process remaining cards in order (for suit canonization)
+    hero_discard_idx = card_to_index(hero_discard)
+    villain_discard_idx = card_to_index(villain_discard)
+    turn_idx = card_to_index(turn_card)
+    river_idx = card_to_index(river_card)
+
+    return hero_indices, flop_indices, hero_discard_idx, villain_discard_idx, turn_idx, river_idx, hero_sort_map
+
+
 def card_string_to_index(card_str: str) -> int:
-    """Convert card string like 'As' to index 0-51.
-    
+    """Convert card string like 'As' to index 0-51 (non-canonized).
+
+    NOTE: This is only used for fallback. For model input, use canonize_and_sort_cards.
+
     Encoding: suit * 13 + rank
     Suits: s=0, h=1, d=2, c=3 (spades, hearts, diamonds, clubs)
     Ranks: 2=0, 3=1, ..., A=12
     """
     if len(card_str) != 2:
         return -1
-    
+
     rank_char = card_str[0]
     suit_char = card_str[1].lower()
-    
-    rank_map = {
-        '2': 0, '3': 1, '4': 2, '5': 3, '6': 4, '7': 5, '8': 6,
-        '9': 7, 'T': 8, 'J': 9, 'Q': 10, 'K': 11, 'A': 12
-    }
+
     suit_map = {'s': 0, 'h': 1, 'd': 2, 'c': 3}
-    
-    if rank_char not in rank_map or suit_char not in suit_map:
+
+    if rank_char not in RANK_MAP or suit_char not in suit_map:
         return -1
-    
-    rank = rank_map[rank_char]
+
+    rank = RANK_MAP[rank_char]
     suit = suit_map[suit_char]
     return suit * 13 + rank
 
@@ -120,19 +239,20 @@ def skeleton_street_to_model_street(street: int) -> int:
 
 class StateEncoder:
     """Encodes game state into tensors for the model."""
-    
+
     def __init__(self):
         self.reset()
-    
+
     def reset(self):
         """Reset state for a new round."""
         self.action_history = []  # List of action dicts
         self.action_ptr = 0
-        self.my_discarded_idx = -1
+        self.my_discarded_idx = -1  # Index in ORIGINAL hand (for engine)
         self.opp_discarded_idx = -1
         self.is_dealer = False
         self.my_hole_cards = []
         self.board_cards = []
+        self.hero_sort_map = []  # Maps sorted position -> original position
     
     def record_action(
         self,
@@ -162,82 +282,91 @@ class StateEncoder:
         is_dealer: bool,
         discarded_idx: int,
     ) -> torch.Tensor:
-        """Encode cards into (9, 2) tensor.
-        
-        Card positions:
-          0: heropriv0 (type_id=0)
-          1: heropriv1 (type_id=1)
-          2: heropriv2 (type_id=2)
-          3: flop0 (type_id=3)
-          4: flop1 (type_id=4)
-          5: herodiscard (type_id=5)
-          6: villaindiscard (type_id=6)
-          7: turn (type_id=7)
-          8: river (type_id=8)
+        """Encode cards into (9, 2) tensor with canonized suits and sorted by rank.
+
+        Card positions and semantic type_ids (matching training/model.py):
+          0-2: heropriv (type_id=0 for all, sorted by rank)
+          3-4: flop (type_id=1 for all, sorted by rank)
+          5: herodiscard (type_id=2)
+          6: villaindiscard (type_id=3)
+          7: turn (type_id=4)
+          8: river (type_id=5)
+
+        Suits are canonized: first suit seen = 0, second = 1, etc.
+        Hero hand and flop cards are sorted by rank (ascending).
+
+        Also updates self.hero_sort_map for discard action mapping.
         """
         card_tensor = torch.full((CARD_SEQ_LEN, CARD_INPUT_DIM), -1, dtype=torch.long)
-        
-        # Hero's hole cards (positions 0-2) in original order.
-        for i, card_str in enumerate(my_cards[:3]):
-            if i == discarded_idx:
-                continue
-            card_idx = card_string_to_index(card_str)
-            if card_idx >= 0:
-                card_tensor[i, 0] = card_idx
-                card_tensor[i, 1] = i  # type_id = position
-        
-        # Board cards
-        # In Toss-or-Hold'em:
-        # - board[0:2] = flop cards
-        # - board[2] = OOP discard
-        # - board[3] = dealer discard
-        # - board[4] = turn
-        # - board[5] = river
-        
-        # Flop cards (positions 3-4)
-        if len(board) >= 2:
-            for i, card_str in enumerate(board[:2]):
-                card_idx = card_string_to_index(card_str)
-                if card_idx >= 0:
-                    card_tensor[3 + i, 0] = card_idx
-                    card_tensor[3 + i, 1] = 3 + i  # type_id = 3 or 4
-        
-        # Discards (positions 5-6)
-        # Hero discard at position 5, villain at position 6
+
+        # Extract board components
+        # In Toss-or-Hold'em board order: [flop0, flop1, oop_discard, dealer_discard, turn, river]
+        flop_cards = board[:2] if len(board) >= 2 else []
+
+        hero_discard = None
+        villain_discard = None
         if len(board) >= 4:
             # board[2] = OOP discard, board[3] = dealer discard
             hero_discard_board_idx = 3 if is_dealer else 2
             villain_discard_board_idx = 2 if is_dealer else 3
-            
             hero_discard = board[hero_discard_board_idx] if len(board) > hero_discard_board_idx else None
             villain_discard = board[villain_discard_board_idx] if len(board) > villain_discard_board_idx else None
-            
-            if hero_discard:
-                card_idx = card_string_to_index(hero_discard)
-                if card_idx >= 0:
-                    card_tensor[5, 0] = card_idx
-                    card_tensor[5, 1] = 5
-            
-            if villain_discard:
-                card_idx = card_string_to_index(villain_discard)
-                if card_idx >= 0:
-                    card_tensor[6, 0] = card_idx
-                    card_tensor[6, 1] = 6
-        
+
+        turn_card = board[4] if len(board) >= 5 else None
+        river_card = board[5] if len(board) >= 6 else None
+
+        # For discard phase, use full hand; after discard, filter out discarded card
+        if discarded_idx >= 0:
+            hero_cards_for_canon = [c for i, c in enumerate(my_cards[:3]) if i != discarded_idx]
+        else:
+            hero_cards_for_canon = list(my_cards[:3])
+
+        # Canonize suits and sort cards
+        hero_indices, flop_indices, hero_discard_card_idx, villain_discard_card_idx, turn_idx, river_idx, hero_sort_map = \
+            canonize_and_sort_cards(
+                hero_cards_for_canon,
+                flop_cards,
+                hero_discard,
+                villain_discard,
+                turn_card,
+                river_card,
+            )
+
+        # Store the sort map for discard action translation
+        self.hero_sort_map = hero_sort_map
+
+        # Fill hero's hole cards (positions 0-2, sorted by rank)
+        for i, card_idx in enumerate(hero_indices[:3]):
+            if card_idx >= 0:
+                card_tensor[i, 0] = card_idx
+                card_tensor[i, 1] = CARD_TYPE_HEROPRIV
+
+        # Fill flop cards (positions 3-4, sorted by rank)
+        for i, card_idx in enumerate(flop_indices[:2]):
+            if card_idx >= 0:
+                card_tensor[3 + i, 0] = card_idx
+                card_tensor[3 + i, 1] = CARD_TYPE_FLOP
+
+        # Hero discard (position 5)
+        if hero_discard_card_idx >= 0:
+            card_tensor[5, 0] = hero_discard_card_idx
+            card_tensor[5, 1] = CARD_TYPE_HERODISCARD
+
+        # Villain discard (position 6)
+        if villain_discard_card_idx >= 0:
+            card_tensor[6, 0] = villain_discard_card_idx
+            card_tensor[6, 1] = CARD_TYPE_VILLAINDISCARD
+
         # Turn (position 7)
-        if len(board) >= 5:
-            card_idx = card_string_to_index(board[4])
-            if card_idx >= 0:
-                card_tensor[7, 0] = card_idx
-                card_tensor[7, 1] = 7
-        
+        if turn_idx >= 0:
+            card_tensor[7, 0] = turn_idx
+            card_tensor[7, 1] = CARD_TYPE_TURN
+
         # River (position 8)
-        if len(board) >= 6:
-            card_idx = card_string_to_index(board[5])
-            if card_idx >= 0:
-                card_tensor[8, 0] = card_idx
-                card_tensor[8, 1] = 8
-        
+        if river_idx >= 0:
+            card_tensor[8, 0] = river_idx
+            card_tensor[8, 1] = CARD_TYPE_RIVER
+
         return card_tensor
     
     def encode_actions(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -401,56 +530,65 @@ class Player(Bot):
     def _get_discard_action(self, game_state, round_state, active, legal_actions):
         """Get discard action."""
         my_cards = round_state.hands[active]
-        
+
         if self.model is None:
-            # Fallback: discard lowest card
-            lowest_idx = min(range(len(my_cards)), key=lambda i: card_string_to_index(my_cards[i]) % 13)
+            # Fallback: discard lowest rank card
+            lowest_idx = min(range(len(my_cards)), key=lambda i: RANK_MAP.get(my_cards[i][0], 99))
             return DiscardAction(lowest_idx)
-        
-        # Build tensors
+
+        # Build tensors - this also populates self.encoder.hero_sort_map
         card_tensor = self.encoder.encode_cards(
             self.encoder.my_hole_cards,
             list(round_state.board),
             self.encoder.is_dealer,
             self.encoder.my_discarded_idx,
         ).unsqueeze(0)
-        
+
         action_tensor, action_mask = self.encoder.encode_actions()
         action_tensor = action_tensor.unsqueeze(0)
         action_mask = action_mask.unsqueeze(0)
-        
-        # Build legal mask for discard actions
+
+        # Build legal mask for discard actions (based on sorted positions)
+        num_valid_cards = len([c for c in my_cards if c])
         legal_mask = torch.zeros(NUM_ACTIONS, dtype=torch.bool)
-        legal_mask[ACT_DISCARD_0] = len(my_cards) > 0
-        legal_mask[ACT_DISCARD_1] = len(my_cards) > 1
-        legal_mask[ACT_DISCARD_2] = len(my_cards) > 2
+        legal_mask[ACT_DISCARD_0] = num_valid_cards > 0
+        legal_mask[ACT_DISCARD_1] = num_valid_cards > 1
+        legal_mask[ACT_DISCARD_2] = num_valid_cards > 2
         legal_mask = legal_mask.unsqueeze(0)
-        
+
         # Get model prediction
         with torch.no_grad():
             logits, _ = self.model(card_tensor, action_tensor, action_mask)
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
             action_idx = torch.argmax(probs, dim=-1).item()
-        
-        # Map to discard action
-        if action_idx == ACT_DISCARD_0:
-            discard_idx = 0
-        elif action_idx == ACT_DISCARD_1:
-            discard_idx = 1
-        elif action_idx == ACT_DISCARD_2:
-            discard_idx = 2
-        else:
-            # Fallback
-            discard_idx = 0
 
-        self.encoder.my_discarded_idx = discard_idx
-        
-        # Record the action
+        # Model outputs discard action for SORTED position
+        # We need to map back to ORIGINAL hand position for the engine
+        if action_idx == ACT_DISCARD_0:
+            sorted_pos = 0
+        elif action_idx == ACT_DISCARD_1:
+            sorted_pos = 1
+        elif action_idx == ACT_DISCARD_2:
+            sorted_pos = 2
+        else:
+            sorted_pos = 0  # Fallback
+
+        # Map sorted position to original hand position
+        if sorted_pos < len(self.encoder.hero_sort_map) and self.encoder.hero_sort_map[sorted_pos] >= 0:
+            original_idx = self.encoder.hero_sort_map[sorted_pos]
+        else:
+            # Fallback: discard lowest rank card
+            original_idx = min(range(len(my_cards)), key=lambda i: RANK_MAP.get(my_cards[i][0], 99))
+
+        # Store the original index (for engine and for filtering in subsequent encode_cards calls)
+        self.encoder.my_discarded_idx = original_idx
+
+        # Record the action (using the model's action index, not original position)
         self._record_my_action(round_state, active, action_idx)
-        self._advance_last_state(round_state, DiscardAction(discard_idx))
-        
-        return DiscardAction(discard_idx)
+        self._advance_last_state(round_state, DiscardAction(original_idx))
+
+        return DiscardAction(original_idx)
     
     def _get_betting_action(self, game_state, round_state, active, legal_actions):
         """Get betting action."""

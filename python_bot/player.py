@@ -431,8 +431,8 @@ class Player(Bot):
             logits, _ = self.model(card_tensor, action_tensor, action_mask)
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
-            action_idx = torch.argmax(probs, dim=-1).item()
-        
+            action_idx = torch.multinomial(probs[0], num_samples=1).item()
+
         # Map to discard action
         if action_idx == ACT_DISCARD_0:
             discard_idx = 0
@@ -486,8 +486,8 @@ class Player(Bot):
             logits, _ = self.model(card_tensor, action_tensor, action_mask)
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
-            action_idx = torch.argmax(probs, dim=-1).item()
-        
+            action_idx = torch.multinomial(probs[0], num_samples=1).item()
+
         # Convert to skeleton action
         skeleton_action = self._model_action_to_skeleton(action_idx, round_state, legal_actions, active)
         

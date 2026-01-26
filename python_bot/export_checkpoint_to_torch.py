@@ -118,10 +118,10 @@ def load_flax_params_into_torch(
         torch_ln.bias.data.copy_(torch.from_numpy(bias).to(torch_ln.bias.dtype))
 
     # =========================================================================
-    # CardEncoder
+    # CardEncoder (updated for new architecture with 2-layer MLP)
     # =========================================================================
     card_enc = flax_params["CardEncoder_0"]
-    
+
     # Card encoder embeddings
     model.card_encoder.rank_emb.weight.data.copy_(
         torch.from_numpy(_as_numpy(card_enc["Embed_0"]["embedding"])).to(model.card_encoder.rank_emb.weight.dtype)
@@ -133,26 +133,24 @@ def load_flax_params_into_torch(
         torch.from_numpy(_as_numpy(card_enc["Embed_2"]["embedding"])).to(model.card_encoder.type_emb.weight.dtype)
     )
 
-    # Card encoder projection
-    put_linear_dict(card_enc["Dense_0"], model.card_encoder.projection)
+    # Card encoder 2-layer MLP: Dense_0 = hidden, Dense_1 = projection
+    put_linear_dict(card_enc["Dense_0"], model.card_encoder.hidden)
+    put_linear_dict(card_enc["Dense_1"], model.card_encoder.projection)
 
     # =========================================================================
-    # ActionEncoder
+    # ActionEncoder (updated for new architecture with combined street_time_emb)
     # =========================================================================
     act_enc = flax_params["ActionEncoder_0"]
 
-    # Action encoder embeddings
+    # Action encoder embeddings (actor, event, combined street_time)
     model.action_encoder.actor_emb.weight.data.copy_(
         torch.from_numpy(_as_numpy(act_enc["Embed_0"]["embedding"])).to(model.action_encoder.actor_emb.weight.dtype)
     )
     model.action_encoder.event_emb.weight.data.copy_(
         torch.from_numpy(_as_numpy(act_enc["Embed_1"]["embedding"])).to(model.action_encoder.event_emb.weight.dtype)
     )
-    model.action_encoder.street_emb.weight.data.copy_(
-        torch.from_numpy(_as_numpy(act_enc["Embed_2"]["embedding"])).to(model.action_encoder.street_emb.weight.dtype)
-    )
-    model.action_encoder.time_emb.weight.data.copy_(
-        torch.from_numpy(_as_numpy(act_enc["Embed_3"]["embedding"])).to(model.action_encoder.time_emb.weight.dtype)
+    model.action_encoder.street_time_emb.weight.data.copy_(
+        torch.from_numpy(_as_numpy(act_enc["Embed_2"]["embedding"])).to(model.action_encoder.street_time_emb.weight.dtype)
     )
 
     # Continuous projection
