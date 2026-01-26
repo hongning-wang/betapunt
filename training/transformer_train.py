@@ -100,7 +100,7 @@ class Config:
     replay_capacity: int = 200_000  # Target transition capacity (see note above)
     num_minibatches: int = 1 # More minibatches for more gradient steps
     update_epochs: int = 1  # Multiple epochs safe with V-trace importance weighting
-    warmup_steps: int = 100_000  # Shorter warmup (in transitions)
+    warmup_updates: int = 1000  # LR warmup period (in update steps)
 
     # Short replay window (key for V-trace) - only sample from recent data
     recent_window_transitions: int = 500_000  # Sample only from recent N transitions (0 = no limit)
@@ -887,8 +887,8 @@ def forward_apply(
     Args:
         params: Model parameters
         card: (B, 9, 2) card tensor
-        action_hist: (B, 40, 7) action history
-        action_mask: (B, 40) action mask
+        action_hist: (B, 32, 7) action history
+        action_mask: (B, 32) action mask
 
     Returns:
         logits: (B, NUM_ACTIONS) action logits
@@ -1960,7 +1960,7 @@ def main() -> None:
     # Each unroll contains rollout_len * num_envs transitions
     # Note: With default settings (500k / 262k = 1), min capacity of 16 applies
     transitions_per_unroll = CFG.rollout_len * CFG.num_envs
-    unroll_capacity = 4  # Minimum capacity for stability
+    unroll_capacity = 16  # Larger buffer for meaningful off-policy learning with V-trace
     actual_transitions = unroll_capacity * transitions_per_unroll
     buf = unroll_buffer_init(unroll_capacity, CFG.rollout_len, CFG.num_envs)
     print(f"Unroll buffer capacity: {unroll_capacity} unrolls ({actual_transitions:,} transitions)")
@@ -1993,7 +1993,7 @@ def main() -> None:
 
     # Warmup unroll buffer
     print("Warming up unroll buffer...")
-    warm_updates = max(1, CFG.warmup_steps // (CFG.num_envs * CFG.rollout_len))
+    warm_updates = max(1, CFG.warmup_updates // (CFG.num_envs * CFG.rollout_len))
     for _ in range(warm_updates):
         buf, vec, key = do_collect(ts.params, pool, buf, vec, key)
     print(f"Buffer size after warmup: {buf.size} unrolls")

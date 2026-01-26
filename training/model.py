@@ -25,7 +25,7 @@ NUM_BETTING_ACTIONS = 10  # Actions 0-9: Fold, Check, Call, raises, All-in
 NUM_DISCARD_ACTIONS = 3   # Actions 10-12: Discard card 0, 1, or 2
 CARD_SEQ_LEN = 9        # [heropriv0, heropriv1, heropriv2, flop0, flop1, oopdiscard, dealerdiscard, turn, river]
 ACTION_SEQ_LEN = 32
-NUM_CARD_TYPES = 9
+NUM_CARD_TYPES = 6      # Simplified: 0=hero_private, 1=flop, 2=hero_discard, 3=villain_discard, 4=turn, 5=river
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
@@ -271,7 +271,7 @@ class CardEncoder(nn.Module):
     emb_dim: int = EMB_DIM
     rank_emb_dim: int = 48
     suit_emb_dim: int = 32
-    position_emb_dim: int = 48  # 48 + 32 + 48 = 128
+    # position_emb_dim computed to fill remainder: emb_dim - rank - suit
     num_heads: int = 2
     ffn_dim: int = 256
 
@@ -285,16 +285,13 @@ class CardEncoder(nn.Module):
             card_tensor: (B, 9, 2) int32 tensor with [card_index, type_id]
 
             card_index: 0-51 valid cards, -1 invalid/undealt
-            type_id: 0-8 valid types:
-                0 = heropriv0
-                1 = heropriv1
-                2 = heropriv2
-                3 = flop0
-                4 = flop1
-                5 = herodiscard
-                6 = villaindiscard
-                7 = turn
-                8 = river
+            type_id: 0-5 valid types (simplified scheme):
+                0 = hero_private (positions 0-2)
+                1 = flop (positions 3-4)
+                2 = hero_discard (position 5)
+                3 = villain_discard (position 6)
+                4 = turn (position 7)
+                5 = river (position 8)
                 -1 = invalid/unused
 
         Returns:
@@ -322,30 +319,32 @@ class CardEncoder(nn.Module):
         type_safe = jnp.where(type_id >= 0, type_id, NUM_CARD_TYPES).astype(jnp.int32)
 
         # -----------------------------
-        # Embeddings: rank(48) + suit(32) + position(48) = 128
+        # Embeddings: rank + suit + position = emb_dim
         # -----------------------------
+        position_emb_dim = self.emb_dim - self.rank_emb_dim - self.suit_emb_dim
+
         rank_emb = nn.Embed(
             num_embeddings=14,  # 13 ranks + invalid
             features=self.rank_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(rank_safe)  # (B, 9, 48)
+        )(rank_safe)
 
         suit_emb = nn.Embed(
             num_embeddings=5,   # 4 suits + invalid
             features=self.suit_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(suit_safe)  # (B, 9, 32)
+        )(suit_safe)
 
         position_emb = nn.Embed(
-            num_embeddings=NUM_CARD_TYPES + 1,  # 9 positions + invalid
-            features=self.position_emb_dim,
+            num_embeddings=NUM_CARD_TYPES + 1,  # 6 types + invalid
+            features=position_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(type_safe)  # (B, 9, 48)
+        )(type_safe)
 
-        # Concatenate: (B, 9, 128)
+        # Concatenate: (B, 9, emb_dim)
         concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
 
         # -----------------------------
@@ -371,7 +370,7 @@ class ActionEncoder(nn.Module):
         [5]: pot_base - continuous
         [6]: effective_stack - continuous
 
-    Output: (B, 30, emb_dim)
+    Output: (B, 32, emb_dim)
 
     Uses CONCATENATION of embeddings (not addition) to preserve information.
     """
@@ -390,11 +389,11 @@ class ActionEncoder(nn.Module):
     ) -> chex.Array:
         """
         Args:
-            action_tensor: (B, 30, 7) float32 tensor
-            action_mask: (B, 30) boolean mask where True = valid action
+            action_tensor: (B, 32, 7) float32 tensor
+            action_mask: (B, 32) boolean mask where True = valid action
 
         Returns:
-            action_representation: (B, 40, emb_dim)
+            action_representation: (B, 32, emb_dim)
         """
         action_tensor = action_tensor.astype(jnp.bfloat16)
 
@@ -413,21 +412,21 @@ class ActionEncoder(nn.Module):
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(actor_id)  # (B, 30, component_emb_dim)
+        )(actor_id)  # (B, 32, component_emb_dim)
 
         event_emb = nn.Embed(
             num_embeddings=13,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(event_type)  # (B, 30, component_emb_dim)
+        )(event_type)  # (B, 32, component_emb_dim)
 
         street_emb = nn.Embed(
             num_embeddings=5,
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(street_id)  # (B, 30, component_emb_dim)
+        )(street_id)  # (B, 32, component_emb_dim)
 
         time_mod = jnp.mod(time_id, jnp.int32(ACTION_SEQ_LEN))
         time_emb = nn.Embed(
@@ -435,7 +434,7 @@ class ActionEncoder(nn.Module):
             features=self.component_emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(time_mod)  # (B, 30, component_emb_dim)
+        )(time_mod)  # (B, 32, component_emb_dim)
 
         # === Continuous Features Projection ===
         eps = jnp.bfloat16(1e-6)
@@ -443,25 +442,25 @@ class ActionEncoder(nn.Module):
         cont1 = jnp.log1p(to_call / pot_base_safe)
         cont2 = jnp.log1p(pot_base_safe)
         cont3 = jnp.log1p(eff_stack / pot_base_safe)
-        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 40, 3)
+        continuous = jnp.concatenate([cont1, cont2, cont3], axis=-1)  # (B, 32, 3)
         continuous_emb = nn.Dense(
             32,  # Project continuous features to 32 dims
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(continuous)  # (B, 30, 32)
+        )(continuous)  # (B, 32, 32)
 
         # === CONCATENATE all embeddings (not add) ===
         concat = jnp.concatenate(
             [actor_emb, event_emb, street_emb, time_emb, continuous_emb],
             axis=-1
-        )  # (B, 30, 4*component_emb_dim + 32)
+        )  # (B, 32, 4*component_emb_dim + 32)
 
         # Project to emb_dim
         combined = nn.Dense(
             self.emb_dim,
             dtype=jnp.bfloat16,
             param_dtype=jnp.bfloat16,
-        )(concat)  # (B, 30, emb_dim)
+        )(concat)  # (B, 32, emb_dim)
 
         # === Transformer ===
         encoded = TransformerEncoder(
@@ -483,7 +482,7 @@ class TossHoldemModel(nn.Module):
 
     Architecture:
         1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings (concatenated)
-        2. Action Encoder: (B, 30, 7) -> (B, 30, 128) with embeddings (concatenated)
+        2. Action Encoder: (B, 32, 7) -> (B, 32, 128) with embeddings (concatenated)
         3. Concatenate: (B, 39, 128)
         4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 4, 128)
         5. Processing MLP: Flatten -> Dense -> ReLU -> Dense -> ReLU -> Dense -> (B, 256)
@@ -511,8 +510,8 @@ class TossHoldemModel(nn.Module):
         """
         Args:
             card_tensor: (B, 9, 2) int32 - [card_index, type_id]
-            action_tensor: (B, 30, 7) float32 - action history features
-            action_mask: (B, 30) boolean - True for valid actions, False for padding
+            action_tensor: (B, 32, 7) float32 - action history features
+            action_mask: (B, 32) boolean - True for valid actions, False for padding
 
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
@@ -534,7 +533,7 @@ class TossHoldemModel(nn.Module):
             num_heads=self.num_heads,
             ffn_dim=self.ffn_dim,
             num_layers=self.num_layers,
-        )(action_tensor, action_mask)  # (B, 30, 128)
+        )(action_tensor, action_mask)  # (B, 32, 128)
         
         # =================================================================
         # 2. Normalize and concatenate to form context
@@ -681,13 +680,13 @@ def create_action_mask(action_tensor: chex.Array) -> chex.Array:
     An action is considered valid if any of its features are non-zero.
     
     Args:
-        action_tensor: (B, 30, 7) action history tensor
+        action_tensor: (B, 32, 7) action history tensor
         
     Returns:
-        mask: (B, 30) boolean mask where True = valid action
+        mask: (B, 32) boolean mask where True = valid action
     """
     # Sum across features - if any feature is non-zero, the action is valid
-    feature_sum = jnp.sum(jnp.abs(action_tensor), axis=-1)  # (B, 30)
+    feature_sum = jnp.sum(jnp.abs(action_tensor), axis=-1)  # (B, 32)
     mask = feature_sum > 0
     return mask
 
