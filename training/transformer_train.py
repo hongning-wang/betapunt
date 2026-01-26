@@ -83,7 +83,10 @@ class Config:
     # Entropy coefficient with schedule
     ent_coef_init: float = 0.01
     ent_coef_final: float = 0.001
-    ent_decay_steps: int = 20_000
+    ent_decay_steps: int = 40_000
+
+    # Illegal action penalty - penalizes high logits for illegal actions
+    illegal_action_coef: float = 0.1
 
     # Optimization with schedule
     lr_init: float = 3e-4
@@ -120,6 +123,9 @@ class Config:
     checkpoint_dir: str = "./drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
     log_every: int = 200
+
+    # Resume from checkpoint (weights only, fresh optimizer state)
+    resume_weights_from: str = ""  # e.g., "./drive/MyDrive/checkpoints/step_40000"
 
 
 CFG = Config()
@@ -846,11 +852,21 @@ def make_train_state(rng: chex.PRNGKey, total_updates: int) -> TrainState:
         optax.adam(lr_schedule),
     )
 
-    return TrainState.create(
+    ts = TrainState.create(
         apply_fn=model.apply,
         params=variables["params"],
         tx=tx,
     )
+
+    # Optionally load weights from a checkpoint (fresh optimizer state)
+    if CFG.resume_weights_from:
+        ckpter = orbax.checkpoint.PyTreeCheckpointer()
+        restored = ckpter.restore(CFG.resume_weights_from)
+        print(f"Loaded weights from {CFG.resume_weights_from}")
+        # Replace params only, keep fresh optimizer state
+        ts = ts.replace(params=restored["params"])
+
+    return ts
 
 
 # Create model instance once at module level to avoid reinstantiation inside JIT
@@ -980,7 +996,8 @@ def compute_vtrace_on_unroll(
     pg_rhos = jax.lax.stop_gradient(pg_rhos)
 
     # Return flat versions for loss computation, plus masked_logits for entropy
-    return logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal
+    # Also return raw logits for illegal action penalty
+    return logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, logits
 
 
 @jax.jit
@@ -1004,7 +1021,7 @@ def vtrace_loss_on_unroll(
         metrics: Dict of training metrics
     """
     # Compute V-trace targets, advantages, and get logits for entropy (single forward pass)
-    logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal = compute_vtrace_on_unroll(params, unroll)
+    logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, raw_logits = compute_vtrace_on_unroll(params, unroll)
 
     # Flatten V-trace outputs for loss computation
     vs_flat = vs.reshape(-1)
@@ -1040,8 +1057,16 @@ def vtrace_loss_on_unroll(
     ent_flat = dist.entropy()
     entropy = jnp.sum(ent_flat * valid_f) / denom
 
+    # Illegal action penalty - penalize high logits for illegal actions
+    # This teaches the model to not prefer actions that are illegal
+    illegal_mask = ~flat_legal  # True where action is illegal
+    # Use softplus(logits) to penalize positive logits for illegal actions
+    illegal_logits = jnp.where(illegal_mask, jax.nn.softplus(raw_logits), 0.0)
+    illegal_penalty_per_sample = jnp.sum(illegal_logits, axis=-1)  # Sum over actions
+    illegal_penalty = jnp.sum(illegal_penalty_per_sample * valid_f) / denom
+
     # Total loss
-    total = policy_loss + CFG.vf_coef * value_loss - ent_coef * entropy
+    total = policy_loss + CFG.vf_coef * value_loss - ent_coef * entropy + CFG.illegal_action_coef * illegal_penalty
 
     # Metrics
     def _masked_mean(x, w):
@@ -1059,6 +1084,7 @@ def vtrace_loss_on_unroll(
         "policy_loss": policy_loss,
         "value_loss": value_loss,
         "entropy": entropy,
+        "illegal_penalty": illegal_penalty,
         "value_mean": _masked_mean(values_flat, valid_f),
         "adv_mean": _masked_mean(advantages_flat, valid_f),
         "ret_mean": _masked_mean(vs_flat, valid_f),
@@ -2025,6 +2051,7 @@ def main() -> None:
                 f"Pol: {m['policy_loss']:.4f} | "
                 f"Val: {m['value_loss']:.4f} | "
                 f"Ent: {m['entropy']:.4f} | "
+                f"Ill: {m['illegal_penalty']:.4f} | "
                 f"EntC: {float(m['ent_coef']):.4f} | "
                 f"rho: {m['rho_mean']:.2f}"
             )
@@ -2032,6 +2059,9 @@ def main() -> None:
         # Checkpointing
         if end_step % CFG.checkpoint_every == 0:
             save_path = f"{ckpt_dir}/step_{end_step}"
+            if os.path.exists(save_path):
+                import shutil
+                shutil.rmtree(save_path)
             ckpter.save(save_path, ts, save_args=save_args)
             print(f"Saved checkpoint to {save_path}")
 

@@ -433,6 +433,12 @@ class Player(Bot):
             probs = F.softmax(masked_logits, dim=-1)
             action_idx = torch.multinomial(probs[0], num_samples=1).item()
 
+        # Debug logging
+        print(f"[DISCARD] logits: {logits[0].tolist()}")
+        print(f"[DISCARD] masked_logits: {masked_logits[0].tolist()}")
+        print(f"[DISCARD] probs: {probs[0].tolist()}")
+        print(f"[DISCARD] chosen: {action_idx}")
+
         # Map to discard action
         if action_idx == ACT_DISCARD_0:
             discard_idx = 0
@@ -487,6 +493,13 @@ class Player(Bot):
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
             action_idx = torch.multinomial(probs[0], num_samples=1).item()
+
+        # Debug logging
+        action_names = ['FOLD', 'CHECK', 'CALL', 'RAISE_MIN', 'RAISE_33', 'RAISE_50', 'RAISE_75', 'RAISE_125', 'RAISE_200', 'ALLIN', 'DISC_0', 'DISC_1', 'DISC_2']
+        print(f"[BET] street={round_state.street} legal_mask={legal_mask[0].tolist()}")
+        print(f"[BET] logits: {[f'{action_names[i]}:{v:.3f}' for i, v in enumerate(logits[0].tolist())]}")
+        print(f"[BET] probs:  {[f'{action_names[i]}:{v:.3f}' for i, v in enumerate(probs[0].tolist())]}")
+        print(f"[BET] chosen: {action_names[action_idx]} ({action_idx})")
 
         # Convert to skeleton action
         skeleton_action = self._model_action_to_skeleton(action_idx, round_state, legal_actions, active)
