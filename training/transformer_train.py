@@ -117,7 +117,7 @@ class Config:
     block_size: int = 100  # Number of collect+update steps per scan block (reduces host-device sync)
 
     # Checkpointing
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "./drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
     log_every: int = 50
 
