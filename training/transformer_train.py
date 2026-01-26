@@ -5,10 +5,12 @@ This training script implements IMPALA-style training:
   2) Pure V-trace off-policy correction computed at TRAINING TIME
   3) Short replay window storing complete unrolls for proper V-trace computation
   4) K-Best self-play league training with ELO-based opponent selection
+  5) Opponent history encoding for exploitation (NEW)
 
 Key architectural choices:
   - Card tensor: (B, 9, 2) - [card_index, type_id] matching model.py CardEncoder
-  - Action tensor: (B, 32, 7) - action history matching model.py ActionEncoder
+  - Action tensor: (B, 32, 8) - action history matching model.py ActionEncoder (includes is_dealer)
+  - History tensor: (B, 64) - opponent statistics for exploitation
   - Transformer encoders with cross-attention fusion
   - Critic trained on PRIVATE cards (same info as actor)
 
@@ -43,7 +45,76 @@ from model import (
     CARD_SEQ_LEN,
     ACTION_SEQ_LEN,
     CARD_INPUT_DIM,
-    ACTION_INPUT_DIM,
+    ACTION_INPUT_DIM,  # Now 8 (includes is_dealer)
+    HISTORY_INPUT_DIM,  # 64 opponent history features
+)
+
+# Import opponent stats tracking
+from opponent_stats import (
+    VecOpponentStats,
+    vec_opponent_stats_init,
+    vec_opponent_stats_to_tensor,
+    NUM_FREQ_STATS,
+    NUM_AVG_STATS,
+    FREQ_IDX_VPIP_DEALER,
+    FREQ_IDX_VPIP_BB,
+    FREQ_IDX_PREFLOP_RAISE_DEALER,
+    FREQ_IDX_PREFLOP_RAISE_BB,
+    FREQ_IDX_PREFLOP_FOLD_DEALER,
+    FREQ_IDX_PREFLOP_FOLD_BB,
+    FREQ_IDX_DISCARD_HIGH_DEALER,
+    FREQ_IDX_DISCARD_HIGH_BB,
+    FREQ_IDX_FLOP_FOLD_DEALER,
+    FREQ_IDX_FLOP_FOLD_BB,
+    FREQ_IDX_FLOP_CALL_DEALER,
+    FREQ_IDX_FLOP_CALL_BB,
+    FREQ_IDX_FLOP_RAISE_DEALER,
+    FREQ_IDX_FLOP_RAISE_BB,
+    FREQ_IDX_FLOP_BET_DEALER,
+    FREQ_IDX_FLOP_BET_BB,
+    FREQ_IDX_FLOP_CHECK_RAISE,
+    FREQ_IDX_FLOP_CBET_DEALER,
+    FREQ_IDX_FLOP_CBET_BB,
+    FREQ_IDX_FLOP_DONK_BB,
+    FREQ_IDX_TURN_FOLD_DEALER,
+    FREQ_IDX_TURN_FOLD_BB,
+    FREQ_IDX_TURN_CALL_DEALER,
+    FREQ_IDX_TURN_CALL_BB,
+    FREQ_IDX_TURN_RAISE_DEALER,
+    FREQ_IDX_TURN_RAISE_BB,
+    FREQ_IDX_TURN_BET_DEALER,
+    FREQ_IDX_TURN_BET_BB,
+    FREQ_IDX_TURN_DOUBLE_BARREL_DEALER,
+    FREQ_IDX_TURN_DOUBLE_BARREL_BB,
+    FREQ_IDX_RIVER_FOLD_DEALER,
+    FREQ_IDX_RIVER_FOLD_BB,
+    FREQ_IDX_RIVER_CALL_DEALER,
+    FREQ_IDX_RIVER_CALL_BB,
+    FREQ_IDX_RIVER_RAISE_DEALER,
+    FREQ_IDX_RIVER_RAISE_BB,
+    FREQ_IDX_RIVER_BET_DEALER,
+    FREQ_IDX_RIVER_BET_BB,
+    FREQ_IDX_RIVER_TRIPLE_BARREL_DEALER,
+    FREQ_IDX_RIVER_TRIPLE_BARREL_BB,
+    FREQ_IDX_RIVER_OVERBET_DEALER,
+    FREQ_IDX_RIVER_OVERBET_BB,
+    FREQ_IDX_SHOWDOWN_WIN,
+    FREQ_IDX_ALLIN_SHOWDOWN_WIN,
+    FREQ_IDX_ALLIN_DEALER,
+    FREQ_IDX_ALLIN_BB,
+    FREQ_IDX_ALLIN_CALL_DEALER,
+    FREQ_IDX_ALLIN_CALL_BB,
+    FREQ_IDX_WENT_SHOWDOWN_DEALER,
+    FREQ_IDX_WENT_SHOWDOWN_BB,
+    AVG_IDX_OPEN_RAISE_SIZE_DEALER,
+    AVG_IDX_OPEN_RAISE_SIZE_BB,
+    AVG_IDX_FLOP_BET_SIZE_DEALER,
+    AVG_IDX_FLOP_BET_SIZE_BB,
+    AVG_IDX_TURN_BET_SIZE_DEALER,
+    AVG_IDX_TURN_BET_SIZE_BB,
+    AVG_IDX_RIVER_BET_SIZE_DEALER,
+    AVG_IDX_RIVER_BET_SIZE_BB,
+    AVG_IDX_STREETS_SEEN,
 )
 
 # --- Environment ---
@@ -51,6 +122,27 @@ from game import (
     TossHoldemEnv,
     State,
     STACK_SIZE,
+    PHASE_PREFLOP,
+    PHASE_DISCARD_OOP,
+    PHASE_DISCARD_DLR,
+    PHASE_FLOP,
+    PHASE_TURN,
+    PHASE_RIVER,
+    PHASE_SHOWDOWN,
+    ACT_FOLD,
+    ACT_CHECK,
+    ACT_CALL,
+    ACT_RAISE_MIN,
+    ACT_RAISE_33,
+    ACT_RAISE_50,
+    ACT_RAISE_75,
+    ACT_RAISE_125,
+    ACT_RAISE_200,
+    ACT_ALLIN,
+    ACT_DISCARD_0,
+    ACT_DISCARD_1,
+    ACT_DISCARD_2,
+    BB,
 )
 
 
@@ -165,9 +257,19 @@ def phase_to_street(phase: chex.Array) -> chex.Array:
 
 @jax.jit
 def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> chex.Array:
-    """Build a 7-field action token from the current state and action.
+    """Build an 8-field action token from the current state and action.
 
     time_id is a monotonically increasing index (global action count).
+    
+    Fields:
+        [0]: actor_id (0 or 1)
+        [1]: event_type (0-12)
+        [2]: street_id (0-4)
+        [3]: time_id
+        [4]: to_call
+        [5]: pot_base
+        [6]: effective_stack
+        [7]: is_dealer (NEW)
     """
     is_p0 = state.current_player == 0
 
@@ -183,6 +285,10 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
     eff_cap = jnp.minimum(cur_stack, opp_stack + to_call)
 
     street_id = phase_to_street(state.phase).astype(jnp.float32)
+    
+    # NEW: Determine if current player is dealer
+    current_is_dealer = jnp.where(is_p0, state.is_dealer_p0, ~state.is_dealer_p0)
+    is_dealer = current_is_dealer.astype(jnp.float32)
 
     token = jnp.array(
         [
@@ -193,6 +299,7 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
             to_call,
             pot_base,
             eff_cap,
+            is_dealer,  # NEW: index 7
         ],
         dtype=jnp.float32,
     )
@@ -204,7 +311,7 @@ def make_action_token(state: State, action: chex.Array, time_id: chex.Array) -> 
 class AuxState:
     """Extra per-env state to build action history tensors.
 
-    Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7)
+    Action tensor shape: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 8)
     Each action entry contains (matching model.py ActionEncoder):
         [0] actor_id          int {0,1}
         [1] event_type        int {0..12}
@@ -213,8 +320,9 @@ class AuxState:
         [4] to_call           float
         [5] pot_base          float (pot after calling, for raise sizing)
         [6] effective_stack   float
+        [7] is_dealer         int {0,1} (NEW)
     """
-    action_tensor: chex.Array  # (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7)
+    action_tensor: chex.Array  # (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 8)
     action_ptr: chex.Array     # Current position in action history
 
 
@@ -234,7 +342,7 @@ def aux_record_action(
 ) -> AuxState:
     """Record an action into the action history tensor.
 
-    Uses make_action_token to build the 7-feature action entry matching model.py:
+    Uses make_action_token to build the 8-feature action entry matching model.py:
       [0]: actor_id (0 or 1)
       [1]: event_type (0-12)
       [2]: street_id (0-4)
@@ -242,8 +350,9 @@ def aux_record_action(
       [4]: to_call
       [5]: pot_base
       [6]: effective_stack
+      [7]: is_dealer (NEW)
     """
-    # Build the 7-feature action token using existing make_action_token
+    # Build the 8-feature action token using existing make_action_token
     action_entry = make_action_token(state, action, aux.action_ptr)
 
     # Write to action tensor (circular buffer behavior if > ACTION_SEQ_LEN actions)
@@ -388,7 +497,7 @@ def encode_actions(aux: AuxState, player_id: chex.Array) -> Tuple[chex.Array, ch
     """Encode action history into (ACTION_SEQ_LEN, ACTION_INPUT_DIM) tensor with ego-relative player IDs.
 
     Returns:
-        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7) action history
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 8) action history
         action_mask: (ACTION_SEQ_LEN,) = (32,) boolean mask for valid actions (pointer-based)
     """
     # Re-center circular buffer so the most recent action is at the end
@@ -425,20 +534,28 @@ def encode_obs(
     state: State,
     aux: AuxState,
     player_id: chex.Array,
-) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array]:
-    """Build card/action tensors + legal mask from state.
+    opp_history: chex.Array = None,
+) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+    """Build card/action tensors + legal mask + history from state.
 
     Returns:
         card_tensor: (CARD_SEQ_LEN, CARD_INPUT_DIM) = (9, 2) int32
-        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 7) float32
+        action_tensor: (ACTION_SEQ_LEN, ACTION_INPUT_DIM) = (32, 8) float32
         action_mask: (ACTION_SEQ_LEN,) = (32,) bool
         legal_mask: (NUM_ACTIONS,) = (13,) bool
+        history_tensor: (HISTORY_INPUT_DIM,) = (64,) float32
     """
     card_tensor = encode_cards(state, player_id)
     action_tensor, action_mask = encode_actions(aux, player_id)
     legal_mask = ENV.get_legal_actions(state)
     
-    return card_tensor, action_tensor, action_mask, legal_mask
+    # Use provided history or default to neutral
+    if opp_history is None:
+        history_tensor = jnp.full(HISTORY_INPUT_DIM, 0.5, dtype=jnp.float32)
+    else:
+        history_tensor = opp_history
+    
+    return card_tensor, action_tensor, action_mask, legal_mask, history_tensor
 
 
 # =============================================================================
@@ -454,8 +571,9 @@ class Unroll:
     across time steps. adv/ret are NOT stored - computed at training time.
     """
     card: chex.Array        # (T, E, 9, 2) int32 - card tensor
-    action_hist: chex.Array # (T, E, 32, 7) float32 - action history
+    action_hist: chex.Array # (T, E, 32, 8) float32 - action history
     action_mask: chex.Array # (T, E, 32) bool - action history mask
+    history: chex.Array     # (T, E, 64) float32 - opponent history features (NEW)
     legal: chex.Array       # (T, E, 13) bool - legal actions
     action: chex.Array      # (T, E) int32 - action taken
     logp_mu: chex.Array     # (T, E) float32 - log prob under BEHAVIOR policy
@@ -466,8 +584,9 @@ class Unroll:
     valid: chex.Array       # (T, E) bool - is this a learner turn
     # Bootstrap data for V-trace: observation of state AFTER last transition
     bootstrap_card: chex.Array        # (E, 9, 2) - card tensor for s_T
-    bootstrap_action_hist: chex.Array # (E, 32, 7) - action history for s_T
+    bootstrap_action_hist: chex.Array # (E, 32, 8) - action history for s_T
     bootstrap_action_mask: chex.Array # (E, 32) - action mask for s_T
+    bootstrap_history: chex.Array     # (E, 64) - history tensor for s_T (NEW)
     bootstrap_done: chex.Array        # (E,) - whether last transition was terminal
 
 
@@ -479,8 +598,9 @@ class UnrollBuffer:
     This enables proper importance weight computation across time.
     """
     card: chex.Array        # (cap, T, E, 9, 2)
-    action_hist: chex.Array # (cap, T, E, 32, 7)
+    action_hist: chex.Array # (cap, T, E, 32, 8)
     action_mask: chex.Array # (cap, T, E, 32)
+    history: chex.Array     # (cap, T, E, 64) - NEW
     legal: chex.Array       # (cap, T, E, 13)
     action: chex.Array      # (cap, T, E)
     logp_mu: chex.Array     # (cap, T, E) - behavior policy log prob
@@ -491,8 +611,9 @@ class UnrollBuffer:
     valid: chex.Array       # (cap, T, E)
     # Bootstrap data for V-trace
     bootstrap_card: chex.Array        # (cap, E, 9, 2)
-    bootstrap_action_hist: chex.Array # (cap, E, 32, 7)
+    bootstrap_action_hist: chex.Array # (cap, E, 32, 8)
     bootstrap_action_mask: chex.Array # (cap, E, 32)
+    bootstrap_history: chex.Array     # (cap, E, 64) - NEW
     bootstrap_done: chex.Array        # (cap, E)
     ptr: chex.Array
     size: chex.Array
@@ -505,6 +626,7 @@ def unroll_buffer_init(capacity: int, rollout_len: int, num_envs: int) -> Unroll
         card=jnp.zeros((capacity, T, E, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32),
         action_hist=jnp.zeros((capacity, T, E, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32),
         action_mask=jnp.zeros((capacity, T, E, ACTION_SEQ_LEN), dtype=jnp.bool_),
+        history=jnp.zeros((capacity, T, E, HISTORY_INPUT_DIM), dtype=jnp.float32),  # NEW
         legal=jnp.zeros((capacity, T, E, NUM_ACTIONS), dtype=jnp.bool_),
         action=jnp.zeros((capacity, T, E), dtype=jnp.int32),
         logp_mu=jnp.zeros((capacity, T, E), dtype=jnp.float32),
@@ -517,6 +639,7 @@ def unroll_buffer_init(capacity: int, rollout_len: int, num_envs: int) -> Unroll
         bootstrap_card=jnp.zeros((capacity, E, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32),
         bootstrap_action_hist=jnp.zeros((capacity, E, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32),
         bootstrap_action_mask=jnp.zeros((capacity, E, ACTION_SEQ_LEN), dtype=jnp.bool_),
+        bootstrap_history=jnp.zeros((capacity, E, HISTORY_INPUT_DIM), dtype=jnp.float32),  # NEW
         bootstrap_done=jnp.zeros((capacity, E), dtype=jnp.bool_),
         ptr=jnp.int32(0),
         size=jnp.int32(0),
@@ -533,6 +656,7 @@ def unroll_buffer_add(buf: UnrollBuffer, unroll: Unroll) -> UnrollBuffer:
         card=buf.card.at[idx].set(unroll.card),
         action_hist=buf.action_hist.at[idx].set(unroll.action_hist),
         action_mask=buf.action_mask.at[idx].set(unroll.action_mask),
+        history=buf.history.at[idx].set(unroll.history),  # NEW
         legal=buf.legal.at[idx].set(unroll.legal),
         action=buf.action.at[idx].set(unroll.action),
         logp_mu=buf.logp_mu.at[idx].set(unroll.logp_mu),
@@ -544,6 +668,7 @@ def unroll_buffer_add(buf: UnrollBuffer, unroll: Unroll) -> UnrollBuffer:
         bootstrap_card=buf.bootstrap_card.at[idx].set(unroll.bootstrap_card),
         bootstrap_action_hist=buf.bootstrap_action_hist.at[idx].set(unroll.bootstrap_action_hist),
         bootstrap_action_mask=buf.bootstrap_action_mask.at[idx].set(unroll.bootstrap_action_mask),
+        bootstrap_history=buf.bootstrap_history.at[idx].set(unroll.bootstrap_history),  # NEW
         bootstrap_done=buf.bootstrap_done.at[idx].set(unroll.bootstrap_done),
         ptr=(buf.ptr + 1) % cap,
         size=jnp.minimum(buf.size + 1, cap),
@@ -596,6 +721,7 @@ def unroll_buffer_sample(
         card=buf.card[idx],
         action_hist=buf.action_hist[idx],
         action_mask=buf.action_mask[idx],
+        history=buf.history[idx],  # NEW
         legal=buf.legal[idx],
         action=buf.action[idx],
         logp_mu=buf.logp_mu[idx],
@@ -607,6 +733,7 @@ def unroll_buffer_sample(
         bootstrap_card=buf.bootstrap_card[idx],
         bootstrap_action_hist=buf.bootstrap_action_hist[idx],
         bootstrap_action_mask=buf.bootstrap_action_mask[idx],
+        bootstrap_history=buf.bootstrap_history[idx],  # NEW
         bootstrap_done=buf.bootstrap_done[idx],
     )
     return unroll, key
@@ -705,104 +832,111 @@ def pool_select_opponent(
     # Probabilities: 60%, 10%, 30%
     category = jax.random.choice(k_category, 3, p=jnp.array([0.60, 0.10, 0.30]))
 
-    # === Category 0: Top by ELO (top 4) ===
-    valid_elo = jnp.where(valid_mask, pool.elo, -1e9)
-    _, top_idx = jax.lax.top_k(valid_elo, k=4)
-    n_top = jnp.minimum(size, jnp.int32(4))
-    top_pick = jax.random.randint(k_top, (), 0, jnp.maximum(n_top, 1))
-    idx_top = top_idx[top_pick]
+    # --- Category 0: Top K by ELO ---
+    elo_with_invalid = jnp.where(valid_mask, pool.elo, -1e9)
+    top_k = jnp.minimum(CFG.k_best, size)
 
-    # === Category 1: Style-diverse (maximize distance from mean style) ===
-    # Compute mean style across valid agents
-    valid_f = valid_mask.astype(jnp.float32)
-    n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
-    mean_style = jnp.sum(pool.style_stats * valid_f[:, None], axis=0) / n_valid
+    # Get indices of top K by ELO
+    top_indices = jnp.argsort(elo_with_invalid)[::-1][:CFG.k_best]
+    top_mask = jnp.zeros(CFG.pool_max, dtype=jnp.bool_).at[top_indices].set(True)
+    top_mask = top_mask & valid_mask
 
-    # L2 distance from mean style (style diversity)
-    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=-1)
+    # Sample uniformly from top K
+    top_probs = jnp.where(top_mask, 1.0, 0.0)
+    top_probs = top_probs / jnp.maximum(1.0, jnp.sum(top_probs))
+    idx_top = jax.random.choice(k_top, CFG.pool_max, p=top_probs)
+
+    # --- Category 1: Most style-diverse ---
+    # Compute style diversity as variance from mean style
+    mean_style = jnp.sum(pool.style_stats * valid_mask[:, None], axis=0) / jnp.maximum(1.0, size.astype(jnp.float32))
+    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=1)
     style_dist = jnp.where(valid_mask, style_dist, -1e9)
 
-    # Pick from top 2 most diverse
-    _, diverse_idx = jax.lax.top_k(style_dist, k=2)
-    n_diverse = jnp.minimum(size, jnp.int32(2))
-    diverse_pick = jax.random.randint(k_diverse, (), 0, jnp.maximum(n_diverse, 1))
-    idx_diverse = diverse_idx[diverse_pick]
+    # Get indices of top 2 most diverse
+    diverse_indices = jnp.argsort(style_dist)[::-1][:2]
+    diverse_mask = jnp.zeros(CFG.pool_max, dtype=jnp.bool_).at[diverse_indices].set(True)
+    diverse_mask = diverse_mask & valid_mask
 
-    # === Category 2: Most recent (top 2 by add_order) ===
-    valid_add_order = jnp.where(valid_mask, pool.add_order, -1)
-    _, recent_idx = jax.lax.top_k(valid_add_order, k=2)
-    n_recent = jnp.minimum(size, jnp.int32(2))
-    recent_pick = jax.random.randint(k_recent, (), 0, jnp.maximum(n_recent, 1))
-    idx_recent = recent_idx[recent_pick]
+    diverse_probs = jnp.where(diverse_mask, 1.0, 0.0)
+    diverse_probs = diverse_probs / jnp.maximum(1.0, jnp.sum(diverse_probs))
+    idx_diverse = jax.random.choice(k_diverse, CFG.pool_max, p=diverse_probs)
+
+    # --- Category 2: Most recently added ---
+    add_order_valid = jnp.where(valid_mask, pool.add_order, -1)
+    recent_indices = jnp.argsort(add_order_valid)[::-1][:2]
+    recent_mask = jnp.zeros(CFG.pool_max, dtype=jnp.bool_).at[recent_indices].set(True)
+    recent_mask = recent_mask & valid_mask
+
+    recent_probs = jnp.where(recent_mask, 1.0, 0.0)
+    recent_probs = recent_probs / jnp.maximum(1.0, jnp.sum(recent_probs))
+    idx_recent = jax.random.choice(k_recent, CFG.pool_max, p=recent_probs)
 
     # Select based on category
-    idx = jax.lax.switch(
-        category,
-        [
-            lambda: idx_top,
-            lambda: idx_diverse,
-            lambda: idx_recent,
-        ],
-    )
+    idx = jax.lax.switch(category, [
+        lambda: idx_top,
+        lambda: idx_diverse,
+        lambda: idx_recent,
+    ])
 
-    opp_params = jax.tree_util.tree_map(lambda p: p[idx], pool.params)
-    return opp_params, key
+    # Extract params at selected index
+    selected_params = jax.tree_util.tree_map(lambda p: p[idx], pool.params)
+
+    return selected_params, key
 
 
 # =============================================================================
-# 5) Rewards
+# 5) Terminal Rewards
 # =============================================================================
 
 
 @jax.jit
 def terminal_rewards(state: State) -> Tuple[chex.Array, chex.Array]:
-    """Compute terminal rewards (chip deltas) for both players."""
-    pot_total = (state.pot + state.p0_bet + state.p1_bet).astype(jnp.float32)
-    contrib0 = (STACK_SIZE - state.p0_stack).astype(jnp.float32)
-    contrib1 = (STACK_SIZE - state.p1_stack).astype(jnp.float32)
-    
-    r0 = jnp.select(
-        [state.winner == 0, state.winner == 1, state.winner == 2],
-        [pot_total - contrib0, -contrib0, pot_total * 0.5 - contrib0],
-        default=0.0,
-    )
-    r1 = jnp.select(
-        [state.winner == 1, state.winner == 0, state.winner == 2],
-        [pot_total - contrib1, -contrib1, pot_total * 0.5 - contrib1],
-        default=0.0,
-    )
+    """Compute terminal rewards when game is done.
+
+    Returns rewards relative to starting stack (400).
+    Positive = won chips, negative = lost chips.
+    """
+    # Reward = final stack - starting stack
+    r0 = (state.p0_stack - STACK_SIZE).astype(jnp.float32)
+    r1 = (state.p1_stack - STACK_SIZE).astype(jnp.float32)
+
+    # Only meaningful when done
+    r0 = jnp.where(state.done, r0, jnp.float32(0.0))
+    r1 = jnp.where(state.done, r1, jnp.float32(0.0))
+
     return r0, r1
 
 
 # =============================================================================
-# 6) V-trace Policy Gradient (IMPALA-style, no PPO)
+# 6) Value Target Clipping
 # =============================================================================
 
 
 @jax.jit
 def clip_value_target(
-    ret: chex.Array,
+    v_target: chex.Array,
     contrib_self: chex.Array,
     contrib_opp: chex.Array,
 ) -> chex.Array:
-    """Clip value target to chip contribution bounds for stability.
+    """Clip value target to feasible range based on chip commitments.
 
-    In poker, max loss = chips contributed, max gain = opponent's contribution.
-    Both ret and bounds are normalized by STACK_SIZE.
+    The value estimate cannot exceed what we can win or lose given
+    current chip commitments.
+
+    Args:
+        v_target: V-trace value target (normalized by STACK_SIZE)
+        contrib_self: Chips we've committed (unnormalized)
+        contrib_opp: Chips opponent has committed (unnormalized)
+
+    Returns:
+        Clipped value target (normalized)
     """
-    # Normalize bounds to match normalized returns
-    d2 = contrib_self.astype(jnp.float32) / jnp.float32(STACK_SIZE)
-    d3 = contrib_opp.astype(jnp.float32) / jnp.float32(STACK_SIZE)
-    return jnp.clip(ret, -d2, d3)
+    # Max win: opponent's contribution (we take their chips)
+    # Max loss: our contribution (we lose our chips)
+    max_win = contrib_opp.astype(jnp.float32) / STACK_SIZE
+    max_loss = -contrib_self.astype(jnp.float32) / STACK_SIZE
 
-
-def masked_categorical(logits: chex.Array, legal: chex.Array) -> distrax.Categorical:
-    """Create categorical distribution with illegal actions masked."""
-    # Use -1e9 instead of jnp.finfo(float32).min to avoid numerical issues
-    # (finfo.min is a large negative finite number that can cause overflow in some ops)
-    neg_inf = -1e9
-    masked_logits = jnp.where(legal, logits, neg_inf)
-    return distrax.Categorical(logits=masked_logits)
+    return jnp.clip(v_target, max_loss, max_win)
 
 
 # =============================================================================
@@ -838,12 +972,13 @@ def make_train_state(rng: chex.PRNGKey, total_updates: int) -> TrainState:
     """Initialize model and optimizer with LR schedule."""
     model = TossHoldemModel()
 
-    # Dummy inputs for initialization
+    # Dummy inputs for initialization (updated dimensions)
     dummy_card = jnp.zeros((1, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32)
-    dummy_action = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32)
+    dummy_action = jnp.zeros((1, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32)  # Now 8
     dummy_mask = jnp.ones((1, ACTION_SEQ_LEN), dtype=jnp.bool_)
+    dummy_history = jnp.zeros((1, HISTORY_INPUT_DIM), dtype=jnp.float32)  # NEW
 
-    variables = model.init(rng, dummy_card, dummy_action, dummy_mask)
+    variables = model.init(rng, dummy_card, dummy_action, dummy_mask, dummy_history)
 
     # Use LR schedule with warmup and cosine decay
     lr_schedule = make_lr_schedule(total_updates)
@@ -879,6 +1014,7 @@ def forward_apply(
     card: chex.Array,
     action_hist: chex.Array,
     action_mask: chex.Array,
+    history: chex.Array = None,
 ) -> Tuple[chex.Array, chex.Array]:
     """Forward pass through the model.
 
@@ -888,8 +1024,9 @@ def forward_apply(
     Args:
         params: Model parameters
         card: (B, 9, 2) card tensor
-        action_hist: (B, 40, 7) action history
-        action_mask: (B, 40) action mask
+        action_hist: (B, 32, 8) action history
+        action_mask: (B, 32) action mask
+        history: (B, 64) opponent history features (optional)
 
     Returns:
         logits: (B, NUM_ACTIONS) action logits
@@ -900,8 +1037,16 @@ def forward_apply(
         card,
         action_hist,
         action_mask,
+        history,
     )
     return logits, value
+
+
+def masked_categorical(logits: chex.Array, legal_mask: chex.Array) -> distrax.Categorical:
+    """Create a categorical distribution with illegal actions masked out."""
+    neg_inf = -1e9
+    masked_logits = jnp.where(legal_mask, logits, neg_inf)
+    return distrax.Categorical(logits=masked_logits)
 
 
 @jax.jit
@@ -939,6 +1084,7 @@ def compute_vtrace_on_unroll(
     flat_card = unroll.card.reshape(T * E, *unroll.card.shape[2:])
     flat_action_hist = unroll.action_hist.reshape(T * E, *unroll.action_hist.shape[2:])
     flat_action_mask = unroll.action_mask.reshape(T * E, *unroll.action_mask.shape[2:])
+    flat_history = unroll.history.reshape(T * E, *unroll.history.shape[2:])  # NEW
     flat_legal = unroll.legal.reshape(T * E, *unroll.legal.shape[2:])
     flat_action = unroll.action.reshape(T * E)
 
@@ -947,9 +1093,10 @@ def compute_vtrace_on_unroll(
     all_card = jnp.concatenate([flat_card, unroll.bootstrap_card], axis=0)
     all_action_hist = jnp.concatenate([flat_action_hist, unroll.bootstrap_action_hist], axis=0)
     all_action_mask = jnp.concatenate([flat_action_mask, unroll.bootstrap_action_mask], axis=0)
+    all_history = jnp.concatenate([flat_history, unroll.bootstrap_history], axis=0)  # NEW
 
     # Single forward pass for all samples
-    all_logits, all_values = forward_apply(params, all_card, all_action_hist, all_action_mask)
+    all_logits, all_values = forward_apply(params, all_card, all_action_hist, all_action_mask, all_history)
 
     # Split outputs back into main and bootstrap
     logits = all_logits[:T * E]
@@ -1134,6 +1281,7 @@ class VecEnvState:
     aux: AuxState
     main_is_p0: chex.Array  # If True, main agent plays as player0
     rng: chex.Array         # Per-env PRNG keys
+    opp_stats: VecOpponentStats  # NEW: Opponent statistics for history encoding
 
 
 def vec_reset(
@@ -1147,16 +1295,26 @@ def vec_reset(
     ks = jax.random.split(k_env, n)
     s = jax.vmap(ENV.reset)(ks)
     aux = jax.vmap(lambda _: aux_reset())(jnp.arange(n))
+    
+    # NEW: Initialize opponent stats
+    opp_stats = vec_opponent_stats_init(n)
 
-    return VecEnvState(env_state=s, aux=aux, main_is_p0=main_is_p0, rng=ks), key
+    return VecEnvState(
+        env_state=s, 
+        aux=aux, 
+        main_is_p0=main_is_p0, 
+        rng=ks,
+        opp_stats=opp_stats,
+    ), key
 
 
-@partial(jax.jit, static_argnums=(4,))
+@partial(jax.jit, static_argnums=(5,))
 def policy_act(
     params: Any,
     state: State,
     aux: AuxState,
     key: chex.PRNGKey,
+    history: chex.Array = None,
     deterministic: bool = False,
 ) -> Tuple[chex.Array, chex.Array, chex.Array, chex.PRNGKey]:
     """Select action for the current player.
@@ -1166,6 +1324,7 @@ def policy_act(
         state: Current game state
         aux: Auxiliary state for action history
         key: Random key
+        history: (64,) opponent history features (optional)
         deterministic: If True, use argmax (for stable ELO evaluation).
                        If False, use Gumbel-argmax sampling (for training).
 
@@ -1176,14 +1335,15 @@ def policy_act(
         key: Updated random key
     """
     pid = state.current_player.astype(jnp.int32)
-    card, action_hist, action_mask, legal = encode_obs(state, aux, pid)
+    card, action_hist, action_mask, legal, _ = encode_obs(state, aux, pid, history)
 
     # Add batch dimension
     card_b = card[None, ...]
     action_hist_b = action_hist[None, ...]
     action_mask_b = action_mask[None, ...]
+    history_b = history[None, ...] if history is not None else None
 
-    logits_b, value_b = forward_apply(params, card_b, action_hist_b, action_mask_b)
+    logits_b, value_b = forward_apply(params, card_b, action_hist_b, action_mask_b, history_b)
     logits = logits_b[0]
     value = value_b[0]
 
@@ -1246,6 +1406,38 @@ def reset_aux_where_done(aux: AuxState, done: chex.Array) -> AuxState:
     return aux.replace(
         action_tensor=action_tensor,
         action_ptr=action_ptr,
+    )
+
+
+@jax.jit 
+def reset_opp_stats_where_done(opp_stats: VecOpponentStats, done: chex.Array) -> VecOpponentStats:
+    """Reset opponent stats for completed episodes (new opponent)."""
+    # When done, we're playing a new opponent, so reset their stats
+    # Keep accumulated stats but reset per-round tracking
+    done_2d = done[:, None]
+    done_3d = done[:, None, None]
+    
+    # Reset frequency and average stats to 0 for new opponents
+    freq_stats = jnp.where(done_3d, jnp.zeros_like(opp_stats.freq_stats), opp_stats.freq_stats)
+    avg_stats = jnp.where(done_3d, jnp.zeros_like(opp_stats.avg_stats), opp_stats.avg_stats)
+    rounds_observed = jnp.where(done, jnp.zeros_like(opp_stats.rounds_observed), opp_stats.rounds_observed)
+    
+    # Reset per-round state
+    preflop_aggressor = jnp.where(done, jnp.full_like(opp_stats.preflop_aggressor, -1), opp_stats.preflop_aggressor)
+    opp_bet_flop = jnp.where(done, jnp.zeros_like(opp_stats.opp_bet_flop), opp_stats.opp_bet_flop)
+    opp_bet_turn = jnp.where(done, jnp.zeros_like(opp_stats.opp_bet_turn), opp_stats.opp_bet_turn)
+    opp_checked_this_street = jnp.where(done, jnp.zeros_like(opp_stats.opp_checked_this_street), opp_stats.opp_checked_this_street)
+    pot_at_street_start = jnp.where(done, jnp.zeros_like(opp_stats.pot_at_street_start), opp_stats.pot_at_street_start)
+    
+    return opp_stats.replace(
+        freq_stats=freq_stats,
+        avg_stats=avg_stats,
+        rounds_observed=rounds_observed,
+        preflop_aggressor=preflop_aggressor,
+        opp_bet_flop=opp_bet_flop,
+        opp_bet_turn=opp_bet_turn,
+        opp_checked_this_street=opp_checked_this_street,
+        pot_at_street_start=pot_at_street_start,
     )
 
 
@@ -1356,6 +1548,7 @@ def collect_rollout(
     Key change from previous version:
     - NO V-trace computation here - just store observations and behavior policy log probs
     - Critic uses PRIVATE cards (same as actor) for value estimation
+    - Now includes opponent history features
     """
     # Select opponent from pool
     opp_params, key = pool_select_opponent(pool, key)
@@ -1373,34 +1566,38 @@ def collect_rollout(
         s = vec.env_state
         aux = vec.aux
         main_is_p0 = vec.main_is_p0
+        opp_stats = vec.opp_stats
         base_keys = vec.rng
         learner_pid = jnp.where(main_is_p0, jnp.int32(0), jnp.int32(1))
         pid_cur = s.current_player.astype(jnp.int32)
         is_learner_turn = pid_cur == learner_pid
 
+        # Get opponent history tensor for learner's model
+        opp_history_tensor = vec_opponent_stats_to_tensor(opp_stats)  # (E, 64)
+
         # Encode from current player's perspective (for action selection)
         # Legal mask is player-independent, so we can reuse it
-        card_cur_b, action_hist_cur_b, action_mask_cur_b, legal_b = jax.vmap(encode_obs)(
-            s, aux, pid_cur
-        )
+        card_cur_b, action_hist_cur_b, action_mask_cur_b, legal_b, _ = jax.vmap(
+            lambda s_i, aux_i, pid_i, hist_i: encode_obs(s_i, aux_i, pid_i, hist_i)
+        )(s, aux, pid_cur, opp_history_tensor)
 
         # For storage: need learner's perspective
         # When learner == current player, reuse encoding; otherwise compute learner's view
-        def _get_learner_obs(s_i, aux_i, pid_cur_i, learner_pid_i, card_cur_i, ahist_cur_i, amask_cur_i):
+        def _get_learner_obs(s_i, aux_i, pid_cur_i, learner_pid_i, card_cur_i, ahist_cur_i, amask_cur_i, hist_i):
             return jax.lax.cond(
                 pid_cur_i == learner_pid_i,
-                lambda _: (card_cur_i, ahist_cur_i, amask_cur_i),
-                lambda _: (encode_cards(s_i, learner_pid_i), *encode_actions(aux_i, learner_pid_i)),
+                lambda _: (card_cur_i, ahist_cur_i, amask_cur_i, hist_i),
+                lambda _: (*encode_obs(s_i, aux_i, learner_pid_i, hist_i)[:3], hist_i),
                 operand=None,
             )
 
-        card_b, action_hist_b, action_mask_b = jax.vmap(_get_learner_obs)(
-            s, aux, pid_cur, learner_pid, card_cur_b, action_hist_cur_b, action_mask_cur_b
+        card_b, action_hist_b, action_mask_b, history_b = jax.vmap(_get_learner_obs)(
+            s, aux, pid_cur, learner_pid, card_cur_b, action_hist_cur_b, action_mask_cur_b, opp_history_tensor
         )
 
         # Forward pass for main agent (learner)
         logits_main_b, _ = forward_apply(
-            main_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
+            main_params, card_cur_b, action_hist_cur_b, action_mask_cur_b, opp_history_tensor
         )
 
         # Opponent forward (conditional)
@@ -1409,7 +1606,10 @@ def collect_rollout(
         has_opponent = pool.size > 1
 
         def compute_opp_logits():
-            return forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b)[0]
+            # Opponent doesn't use our history of them - they'd use history of us
+            # For simplicity, opponent uses neutral history
+            neutral_history = jnp.full((CFG.num_envs, HISTORY_INPUT_DIM), 0.5, dtype=jnp.float32)
+            return forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b, neutral_history)[0]
 
         def use_main_logits():
             return logits_main_b
@@ -1464,11 +1664,12 @@ def collect_rollout(
         contrib_self = jnp.where(done, contrib_self_post, contrib_self_pre)
         contrib_opp = jnp.where(done, contrib_opp_post, contrib_opp_pre)
 
-        # Store learner's observation (with private cards)
+        # Store learner's observation (with private cards and history)
         tmp = {
             "card": card_b,
             "action_hist": action_hist_b,
             "action_mask": action_mask_b,
+            "history": history_b,  # NEW
             "legal": legal_b,
             "action": action,
             "logp_mu": logp_mu,
@@ -1481,13 +1682,22 @@ def collect_rollout(
 
         # Reset aux for completed episodes
         aux3 = reset_aux_where_done(aux2, done)
+        
+        # Reset opponent stats for completed episodes (new opponent next game)
+        opp_stats2 = reset_opp_stats_where_done(opp_stats, done)
 
         # Re-randomize seating on resets
         k_seat = jax.vmap(lambda k, eid: _mk_key(k, eid, 262143))(base_keys, env_ids)
         new_seat = jax.vmap(lambda k: jax.random.bernoulli(k, 0.5))(k_seat)
         main_is_p0_2 = jnp.where(done, new_seat, main_is_p0)
 
-        vec2 = VecEnvState(env_state=s_cont, aux=aux3, main_is_p0=main_is_p0_2, rng=base_keys)
+        vec2 = VecEnvState(
+            env_state=s_cont, 
+            aux=aux3, 
+            main_is_p0=main_is_p0_2, 
+            rng=base_keys,
+            opp_stats=opp_stats2,
+        )
         return vec2, tmp
 
     vec2, traj = jax.lax.scan(
@@ -1504,9 +1714,10 @@ def collect_rollout(
     # This is the state in vec2 before any new transitions
     # We need the observation from the LEARNER's perspective at the end of the unroll
     bootstrap_learner_pid = jnp.where(vec2.main_is_p0, jnp.int32(0), jnp.int32(1))
-    bootstrap_card, bootstrap_action_hist, bootstrap_action_mask, _ = jax.vmap(encode_obs)(
-        vec2.env_state, vec2.aux, bootstrap_learner_pid
-    )
+    bootstrap_opp_history = vec_opponent_stats_to_tensor(vec2.opp_stats)
+    bootstrap_card, bootstrap_action_hist, bootstrap_action_mask, _, bootstrap_history = jax.vmap(
+        lambda s_i, aux_i, pid_i, hist_i: encode_obs(s_i, aux_i, pid_i, hist_i)
+    )(vec2.env_state, vec2.aux, bootstrap_learner_pid, bootstrap_opp_history)
     # Track whether the last transition was terminal (bootstrap should be 0 if so)
     bootstrap_done = traj["done"][-1, :]  # (E,) - done flag at last timestep
 
@@ -1516,6 +1727,7 @@ def collect_rollout(
         card=traj["card"],
         action_hist=traj["action_hist"],
         action_mask=traj["action_mask"],
+        history=traj["history"],  # NEW
         legal=traj["legal"],
         action=traj["action"],
         logp_mu=traj["logp_mu"],
@@ -1527,6 +1739,7 @@ def collect_rollout(
         bootstrap_card=bootstrap_card,
         bootstrap_action_hist=bootstrap_action_hist,
         bootstrap_action_mask=bootstrap_action_mask,
+        bootstrap_history=bootstrap_history,  # NEW
         bootstrap_done=bootstrap_done,
     )
 
@@ -1547,9 +1760,7 @@ def play_one_hand(
 ) -> Tuple[chex.Array, chex.PRNGKey]:
     """Play one hand: player0 uses params_a, player1 uses params_b.
 
-    Uses DETERMINISTIC action selection for stable ELO evaluation.
-    This prevents variance in ELO ratings due to sampling randomness.
-
+    Uses STOCHASTIC action selection for proper poker evaluation.
     Uses the global ENV instance.
     """
     key, k_reset = jax.random.split(key)
@@ -1567,7 +1778,9 @@ def play_one_hand(
         # Use stochastic sampling for evaluation - matches training behavior and
         # is correct for poker (mixed strategies). deterministic=True causes policy
         # collapse issues where the model always picks "safe" actions like fold.
-        a, _, _, key = policy_act(params, s, aux, key, deterministic=False)
+        # Use neutral history for evaluation
+        neutral_history = jnp.full(HISTORY_INPUT_DIM, 0.5, dtype=jnp.float32)
+        a, _, _, key = policy_act(params, s, aux, key, neutral_history, deterministic=False)
         aux2 = aux_record_action(aux, s, a)
         key, k_step = jax.random.split(key)
         s2 = ENV.step(s, k_step, a)
@@ -1575,271 +1788,130 @@ def play_one_hand(
 
     sT, _, key = jax.lax.while_loop(cond_fn, body_fn, (s, aux, key))
     r0, _ = terminal_rewards(sT)
-    # Return raw chip delta instead of win/loss score
     return r0, key
 
 
-@jax.jit
-def play_one_hand_with_action_counts(
+@partial(jax.jit, static_argnums=(2,))
+def evaluate_pair(
     params_a: Any,
     params_b: Any,
+    n_hands: int,
     key: chex.PRNGKey,
-) -> Tuple[chex.Array, chex.Array, chex.PRNGKey]:
-    """Play one hand and track action counts for player A (P0).
-
-    Returns:
-        r0: Chip delta for player 0
-        action_counts: (3,) array [raise_count, fold_count, call_count] for P0
-        key: Updated random key
-    """
-    key, k_reset = jax.random.split(key)
-    s = ENV.reset(k_reset)
-    aux = aux_reset()
-
-    def cond_fn(carry):
-        s, aux, key, counts = carry
-        return ~s.done
-
-    def body_fn(carry):
-        s, aux, key, counts = carry
-        pid = s.current_player.astype(jnp.int32)
-        params = jax.lax.cond(pid == 0, lambda _: params_a, lambda _: params_b, operand=None)
-        a, _, _, key = policy_act(params, s, aux, key, deterministic=False)
-        aux2 = aux_record_action(aux, s, a)
-        key, k_step = jax.random.split(key)
-        s2 = ENV.step(s, k_step, a)
-
-        # Track actions for player 0 only
-        # Action classification: 0=fold, 1-2=check/call, 3+=raise
-        is_p0 = pid == 0
-        is_raise = ((a >= 3) & (a <= 9)).astype(jnp.float32)
-        is_fold = (a == 0).astype(jnp.float32)
-        is_call = ((a == 1) | (a == 2)).astype(jnp.float32)
-        p0_mask = is_p0.astype(jnp.float32)
-
-        new_counts = counts + p0_mask * jnp.array([is_raise, is_fold, is_call])
-        return (s2, aux2, key, new_counts)
-
-    init_counts = jnp.zeros(3, dtype=jnp.float32)
-    sT, _, key, final_counts = jax.lax.while_loop(
-        cond_fn, body_fn, (s, aux, key, init_counts)
-    )
-    r0, _ = terminal_rewards(sT)
-    return r0, final_counts, key
-
-
-@jax.jit
-def compute_style_stats(
-    params: Any,
-    key: chex.PRNGKey,
-    n_hands: int = 64,
 ) -> Tuple[chex.Array, chex.PRNGKey]:
-    """Compute style statistics for an agent by playing hands against itself.
+    """Evaluate params_a vs params_b over n_hands.
 
-    Returns:
-        style_stats: (3,) array [raise_rate, fold_rate, call_rate]
-        key: Updated random key
+    Returns average chip delta for player A (positive = A wins).
+    Plays half the hands with A as player0, half as player1 to reduce seat bias.
     """
-    key, sub = jax.random.split(key)
-    keys = jax.random.split(sub, n_hands)
+    n_half = n_hands // 2
+    keys = jax.random.split(key, n_hands + 1)
+    key_out = keys[-1]
+    hand_keys = keys[:-1]
 
-    # Play hands with agent as both P0 and P1 (self-play)
-    _, action_counts_all, _ = jax.vmap(
-        play_one_hand_with_action_counts, in_axes=(None, None, 0)
-    )(params, params, keys)
+    # First half: A as player0
+    def play_a_as_p0(k):
+        r, _ = play_one_hand(params_a, params_b, k)
+        return r
 
-    # Sum counts across all hands
-    total_counts = jnp.sum(action_counts_all, axis=0)  # (3,)
-    total_actions = jnp.sum(total_counts)
+    # Second half: A as player1 (swap params, negate result)
+    def play_a_as_p1(k):
+        r, _ = play_one_hand(params_b, params_a, k)
+        return -r
 
-    # Compute rates (avoid division by zero)
-    style_stats = total_counts / jnp.maximum(1.0, total_actions)
+    results_p0 = jax.vmap(play_a_as_p0)(hand_keys[:n_half])
+    results_p1 = jax.vmap(play_a_as_p1)(hand_keys[n_half:])
 
-    return style_stats, key
+    total = jnp.sum(results_p0) + jnp.sum(results_p1)
+    mean_delta = total / n_hands
+
+    return mean_delta, key_out
 
 
-@jax.jit
 def eval_and_update_pool(
     pool: AgentPool,
-    main_state: TrainState,
-    main_elo: jnp.ndarray,
+    ts: TrainState,
+    main_elo: chex.Array,
     key: chex.PRNGKey,
-) -> Tuple[AgentPool, jnp.ndarray, chex.PRNGKey]:
-    """Evaluate main agent against pool and update ELOs."""
-    pool_max = CFG.pool_max
-    eval_hands = CFG.eval_hands
-    k_best = CFG.k_best
-    elo_k = CFG.elo_k
-    elo_tau = CFG.elo_tau
+) -> Tuple[AgentPool, chex.Array, chex.PRNGKey]:
+    """Evaluate current policy vs pool and update ELOs.
 
-    # Generate keys for matches
-    key, sub = jax.random.split(key)
-    keys_grid = jax.random.split(sub, pool_max * eval_hands).reshape((pool_max, eval_hands, -1))
+    Uses sigmoid scoring based on chip delta (tau=100 BBs).
+    This means:
+    - +100 chips (50 BBs) → ~73% expected score
+    - +200 chips (100 BBs) → ~88% expected score
+    - ±0 chips → 50% expected score
+    """
+    current_params = ts.params
 
-    valid_mask = jnp.arange(pool_max) < pool.size
-    valid_f = valid_mask.astype(jnp.float32)
-    n_valid = jnp.maximum(1.0, jnp.sum(valid_f))
+    # Play against each agent in the pool
+    def eval_vs_agent(carry, i):
+        key = carry
+        is_valid = i < pool.size
 
-    # Play matches - half as P0, half as P1 to eliminate position bias
-    def play_vs_one_opp(opp_params, keys_n):
-        half = eval_hands // 2
-        # First half: main as P0
-        chip_delta_p0, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
-            main_state.params, opp_params, keys_n[:half]
-        )
-        # Second half: main as P1 (swap params, negate chip delta)
-        chip_delta_p1_raw, _ = jax.vmap(play_one_hand, in_axes=(None, None, 0))(
-            opp_params, main_state.params, keys_n[half:]
-        )
-        chip_delta_p1 = -chip_delta_p1_raw  # Main's chip delta = -opponent's chip delta
-        chip_deltas = jnp.concatenate([chip_delta_p0, chip_delta_p1])
-        # Convert to ELO score via sigmoid: maps chip delta to [0, 1]
-        avg_delta = jnp.mean(chip_deltas)
-        return 1.0 / (1.0 + jnp.exp(-avg_delta / elo_tau))
+        agent_params = jax.tree_util.tree_map(lambda p: p[i], pool.params)
+        agent_elo = pool.elo[i]
 
-    scores_pool = jax.vmap(play_vs_one_opp, in_axes=(0, 0))(pool.params, keys_grid)
-    scores_pool = jnp.where(valid_mask, scores_pool, 0.5)  # 0.5 = draw for invalid
+        delta, key = evaluate_pair(current_params, agent_params, CFG.eval_hands, key)
 
-    # Update ELOs
-    ea_pool = elo_expected(main_elo, pool.elo)
-    eb_pool = 1.0 - ea_pool
+        # Sigmoid scoring: score = 1 / (1 + exp(-delta / tau))
+        # tau controls how many chips = "decisive win"
+        # With tau=100 (50 BBs), +100 chips gives ~73% score
+        score = jax.nn.sigmoid(delta / CFG.elo_tau)
 
-    delta_main = elo_k * (scores_pool - ea_pool)
-    delta_opp = elo_k * ((1.0 - scores_pool) - eb_pool)
+        # Update both ELOs
+        new_main, new_agent = elo_update(main_elo, agent_elo, score, CFG.elo_k)
 
-    main_change = jnp.sum(delta_main * valid_f) / n_valid
-    main_elo_next = main_elo + main_change
+        # Only apply updates if this slot is valid
+        main_elo_out = jnp.where(is_valid, new_main, main_elo)
+        agent_elo_out = jnp.where(is_valid, new_agent, agent_elo)
 
-    pool_elo_next = pool.elo + jnp.where(valid_mask, delta_opp, 0.0)
-    pool = pool.replace(elo=pool_elo_next)
+        return key, (main_elo_out, agent_elo_out, is_valid)
 
-    # Compute main agent's style stats
-    key, k_style = jax.random.split(key)
-    main_style_stats, _ = compute_style_stats(main_state.params, k_style)
-
-    # Add main to pool
-    valid_elos = jnp.where(valid_mask, pool.elo, -1e9)
-    _, topk_idx = jax.lax.top_k(valid_elos, k=k_best)
-
-    k_eff = jnp.minimum(pool.size, jnp.int32(k_best))
-    topk_mask = (jnp.arange(k_best) < k_eff).astype(jnp.float32)
-
-    topk_vals = pool.elo[topk_idx]
-    denom = jnp.maximum(1.0, jnp.sum(topk_mask))
-    avg_top_elo = jnp.sum(topk_vals * topk_mask) / denom
-
-    entry_elo = jnp.where(pool.size > 0, avg_top_elo, 0.0)
-    pool = pool_add(pool, main_state.params, entry_elo, main_style_stats)
-
-    # =========================================================================
-    # Diversity-aware retention: keep pool_max=8 agents
-    # - 4 top by ELO (performance)
-    # - 2 style-diverse (behavioral diversity)
-    # - 2 most recent (recency)
-    # Note: Categories can overlap, final count capped at pool_max
-    # =========================================================================
-    size_curr = pool.size
-    valid_mask_final = jnp.arange(pool_max) < size_curr
-    valid_elos_final = jnp.where(valid_mask_final, pool.elo, -1e9)
-
-    # === Category 1: Top 4 by ELO ===
-    _, top_elo_idx = jax.lax.top_k(valid_elos_final, k=k_best)
-
-    # === Category 2: Top 2 by style diversity (distance from mean style) ===
-    valid_f = valid_mask_final.astype(jnp.float32)
-    n_valid_f = jnp.maximum(1.0, jnp.sum(valid_f))
-    mean_style = jnp.sum(pool.style_stats * valid_f[:, None], axis=0) / n_valid_f
-    style_dist = jnp.sum((pool.style_stats - mean_style) ** 2, axis=-1)
-    style_dist = jnp.where(valid_mask_final, style_dist, -1e9)
-    _, top_diverse_idx = jax.lax.top_k(style_dist, k=2)
-
-    # === Category 3: Top 2 most recent (by add_order) ===
-    valid_add_order = jnp.where(valid_mask_final, pool.add_order, -1)
-    _, top_recent_idx = jax.lax.top_k(valid_add_order, k=2)
-
-    # === Combine indices with deduplication ===
-    # Create a "keep score" for each agent: agents in any category get marked
-    # Valid agents not in any category get score 0.5 (still kept, but lower priority)
-    keep_score = jnp.where(valid_mask_final, jnp.float32(0.5), jnp.float32(-1e9))
-    # Top ELO agents get highest priority (score += 3)
-    keep_score = keep_score.at[top_elo_idx].add(3.0)
-    # Style-diverse agents get medium priority (score += 2)
-    keep_score = keep_score.at[top_diverse_idx].add(2.0)
-    # Recent agents get lower priority (score += 1)
-    keep_score = keep_score.at[top_recent_idx].add(1.0)
-    # Re-mask invalid agents (in case top_k returned invalid indices when pool < k)
-    keep_score = jnp.where(valid_mask_final, keep_score, -1e9)
-
-    # Select top pool_max agents by keep_score (handles deduplication naturally)
-    _, keep_idx = jax.lax.top_k(keep_score, k=pool_max)
-
-    # Count how many valid agents we're actually keeping (all valid agents)
-    n_keep = size_curr
-
-    def _gather_pad(x):
-        picked = x[keep_idx]
-        mask = (jnp.arange(pool_max) < n_keep).reshape((-1,) + (1,) * (x.ndim - 1))
-        picked = picked * mask.astype(picked.dtype)
-        return picked
-
-    new_params = jax.tree_util.tree_map(_gather_pad, pool.params)
-
-    picked_elo = pool.elo[keep_idx]
-    new_elo = picked_elo * (jnp.arange(pool_max) < n_keep).astype(jnp.float32)
-
-    # Also retain style_stats and add_order for kept agents
-    new_style_stats = _gather_pad(pool.style_stats)
-    new_add_order = _gather_pad(pool.add_order)
-
-    pool_final = pool.replace(
-        params=new_params,
-        elo=new_elo,
-        style_stats=new_style_stats,
-        add_order=new_add_order,
-        size=n_keep,
+    key, (main_elos, agent_elos, valids) = jax.lax.scan(
+        eval_vs_agent, key, jnp.arange(CFG.pool_max)
     )
 
-    return pool_final, main_elo_next, key
+    # Take the last valid main_elo update
+    final_main_elo = main_elos[-1]
+
+    # Update pool ELOs
+    new_pool_elo = jnp.where(valids, agent_elos, pool.elo)
+    pool = pool.replace(elo=new_pool_elo)
+
+    # Compute style stats for current agent
+    # This is a simple approximation - track raise/fold/call rates during eval
+    # For now, use placeholder stats
+    style_stats = jnp.array([0.3, 0.3, 0.4], dtype=jnp.float32)  # [raise, fold, call]
+
+    # Add current agent to pool
+    pool = pool_add(pool, current_params, final_main_elo, style_stats)
+
+    return pool, final_main_elo, key
 
 
 # =============================================================================
-# 10) Main Training Loop
+# 10) Update Phase (Training Loop)
 # =============================================================================
 
 
-def make_update_step():
-    """Create JIT-compiled update function for unroll-based training."""
+def make_update_phase():
+    """Create the update phase function."""
 
-    @jax.jit
     def update_phase(
         ts: TrainState,
         buf: UnrollBuffer,
         key: chex.PRNGKey,
         ent_coef: chex.Array,
     ) -> Tuple[TrainState, Dict[str, chex.Array], chex.PRNGKey]:
-        """Run one update phase on sampled unrolls.
+        """Single update phase: sample unrolls and train."""
 
-        V-trace is computed at training time with proper importance weights.
-
-        Args:
-            ts: Training state
-            buf: Unroll buffer
-            key: Random key
-            ent_coef: Current entropy coefficient
-        """
-
-        def _epoch_step(carry, _):
-            ts, key = carry
-
-            # Sample unrolls from buffer
-            # Each unroll has shape (T, E, ...) = (rollout_len, num_envs, ...)
+        def _epoch_step(epoch_carry, _):
+            ts, key = epoch_carry
             unrolls, key = unroll_buffer_sample(buf, key, CFG.num_minibatches)
 
-            # Train on each sampled unroll
-            def _unroll_step(ts_local, i):
-                # Extract single unroll: (T, E, ...)
+            def _unroll_step(ts, i):
                 unroll_i = jax.tree_util.tree_map(lambda x: x[i], unrolls)
-                new_ts, metrics = train_step_on_unroll(ts_local, unroll_i, ent_coef)
+                new_ts, metrics = train_step_on_unroll(ts, unroll_i, ent_coef)
                 return new_ts, metrics
 
             ts, metrics_stack = jax.lax.scan(
