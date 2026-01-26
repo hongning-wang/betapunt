@@ -82,9 +82,9 @@ class Config:
     vf_coef: float = 0.25
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.01
-    ent_coef_final: float = 0.001
-    ent_decay_steps: int = 40_000
+    ent_coef_init: float = 0.005
+    ent_coef_final: float = 0.0005
+    ent_decay_steps: int = 15_000
 
     # Illegal action penalty - penalizes high logits for illegal actions
     illegal_action_coef: float = 0.1
