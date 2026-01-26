@@ -119,7 +119,7 @@ class Config:
     # Checkpointing
     checkpoint_dir: str = "./drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
-    log_every: int = 50
+    log_every: int = 200
 
 
 CFG = Config()
