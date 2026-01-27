@@ -804,21 +804,12 @@ def collect_rollout(main_params, pool, buf, vec, key):
         to_call = (opp_bet - cur_bet).astype(jnp.float32)
         pot_before = (s.pot + s.p0_bet + s.p1_bet).astype(jnp.float32)
         
-        # Estimate bet amount (chips added to pot by this action)
-        # For simplicity, use to_call for calls, estimate for raises
-        cur_stack = jnp.where(s.current_player == 0, s.p0_stack, s.p1_stack)
-        # After action, new_bet will be at least opp_bet (if call) or more (if raise)
-        # bet_amount = new chips added = new_bet - cur_bet
-        # For tracking purposes, use to_call as base, add estimated raise
-        is_raise = (action >= 3) & (action <= 9)  # RAISE_MIN through ALLIN
-        # Rough estimate: raises add at least to_call + some amount based on pot
-        bet_amount = jnp.where(
-            is_raise,
-            jnp.minimum(cur_stack, to_call + pot_before * 0.5),  # rough estimate
-            jnp.where(action == 2, to_call, 0.0)  # CALL
-        ).astype(jnp.float32)
+        # Record action and step environment FIRST
+        aux2 = jax.vmap(aux_record_action)(aux, s, action)
+        k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
+        s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)
 
-        # Update opponent stats AFTER seeing their action (only on opp turns)
+        # Update opponent stats with actual bet amount
         opp_stats = vec_update_opp_stats(
             opp_stats,
             phase=s.phase,
@@ -827,13 +818,8 @@ def collect_rollout(main_params, pool, buf, vec, key):
             opp_is_dealer=opp_is_dealer,
             to_call=to_call,
             pot_before=pot_before,
-            bet_amount=bet_amount,
+            bet_amount=s.p0_bet,
         )
-
-        # Record action and step environment
-        aux2 = jax.vmap(aux_record_action)(aux, s, action)
-        k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
-        s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)
 
         # Rewards
         r0, r1 = terminal_rewards(s_next)

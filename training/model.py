@@ -519,8 +519,9 @@ class HistoryEncoder(nn.Module):
     - fold_freq_dealer, fold_freq_bb
     - open_raise_size_avg_dealer, open_raise_size_avg_bb
     
-    DISCARD (2):
-    - discard_high_card_freq_dealer, discard_high_card_freq_bb
+    PREFLOP EXTRA (2):
+    - limp_freq_dealer
+    - fold_to_probe_freq (opponent folds when we probe their missed c-bet)
     
     FLOP (14):
     - fold_freq_dealer, fold_freq_bb
@@ -538,7 +539,8 @@ class HistoryEncoder(nn.Module):
     - raise_freq_dealer, raise_freq_bb
     - bet_freq_dealer, bet_freq_bb
     - avg_bet_size_dealer, avg_bet_size_bb
-    - double_barrel_freq_dealer, double_barrel_freq_bb
+    - double_barrel_freq (merged, no position split)
+    - big_raise_freq (raises > pot size)
     
     RIVER (14):
     - fold_freq_dealer, fold_freq_bb
@@ -546,18 +548,21 @@ class HistoryEncoder(nn.Module):
     - raise_freq_dealer, raise_freq_bb
     - bet_freq_dealer, bet_freq_bb
     - avg_bet_size_dealer, avg_bet_size_bb
-    - triple_barrel_freq_dealer, triple_barrel_freq_bb
+    - triple_barrel_freq (merged, no position split)
+    - min_raise_freq (small raises < 40% pot)
     - overbet_freq_dealer, overbet_freq_bb
     
     AGGREGATED (14):
     - showdown_winrate
     - allin_showdown_winrate
-    - avg_streets_seen
-    - rounds_observed
+    - avg_streets_seen (normalized)
+    - rounds_observed (log-scaled)
     - allin_freq_dealer, allin_freq_bb
-    - allin_call_freq_dealer, allin_call_freq_bb
+    - allin_call_freq (merged, no position split)
+    - big_call_freq (calls > 50% pot)
     - went_to_showdown_dealer, went_to_showdown_bb
     - reraise_freq_dealer, reraise_freq_bb
+    - fold_to_cbet_dealer, fold_to_cbet_bb
     """
     
     emb_dim: int = EMB_DIM
