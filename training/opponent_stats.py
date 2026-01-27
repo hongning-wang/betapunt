@@ -1,12 +1,18 @@
 """Opponent statistics tracking for history encoding.
 
-This module provides the OpponentStats class and helper functions for tracking
-64 opponent history features used by the HistoryEncoder in model.py.
+This module provides vectorized opponent stat tracking for the HistoryEncoder.
+Stats are updated during rollout collection when the opponent takes actions,
+enabling the model to learn opponent-adaptive play.
+
+Key design:
+- Stats persist across hands within a rollout (same pool opponent)
+- Per-round state (preflop_aggressor, etc.) resets on hand completion
+- Accumulated stats (frequencies, averages) persist to build opponent profile
 
 Feature List (64 total):
 
 PREFLOP (8):
-- vpip_dealer, vpip_bb
+- vpip_dealer, vpip_bb (voluntarily put money in pot)
 - raise_freq_dealer, raise_freq_bb
 - fold_freq_dealer, fold_freq_bb
 - open_raise_size_avg_dealer, open_raise_size_avg_bb
@@ -15,50 +21,36 @@ DISCARD (2):
 - discard_high_card_freq_dealer, discard_high_card_freq_bb
 
 FLOP (14):
-- fold_freq_dealer, fold_freq_bb
-- call_freq_dealer, call_freq_bb
-- raise_freq_dealer, raise_freq_bb
-- bet_freq_dealer, bet_freq_bb
-- avg_bet_size_dealer, avg_bet_size_bb
-- check_raise_freq
-- cbet_freq_dealer, cbet_freq_bb
-- donk_bet_freq_bb
+- fold/call/raise/bet frequencies by position
+- avg_bet_size by position
+- check_raise_freq, cbet_freq, donk_bet_freq
 
 TURN (12):
-- fold_freq_dealer, fold_freq_bb
-- call_freq_dealer, call_freq_bb
-- raise_freq_dealer, raise_freq_bb
-- bet_freq_dealer, bet_freq_bb
-- avg_bet_size_dealer, avg_bet_size_bb
-- double_barrel_freq_dealer, double_barrel_freq_bb
+- fold/call/raise/bet frequencies by position
+- avg_bet_size by position
+- double_barrel_freq by position
 
 RIVER (14):
-- fold_freq_dealer, fold_freq_bb
-- call_freq_dealer, call_freq_bb
-- raise_freq_dealer, raise_freq_bb
-- bet_freq_dealer, bet_freq_bb
-- avg_bet_size_dealer, avg_bet_size_bb
-- triple_barrel_freq_dealer, triple_barrel_freq_bb
-- overbet_freq_dealer, overbet_freq_bb
+- fold/call/raise/bet frequencies by position
+- avg_bet_size by position
+- triple_barrel_freq, overbet_freq by position
 
 AGGREGATED (14):
-- showdown_winrate
-- allin_showdown_winrate
-- avg_streets_seen
-- rounds_observed
-- allin_freq_dealer, allin_freq_bb
-- allin_call_freq_dealer, allin_call_freq_bb
-- went_to_showdown_dealer, went_to_showdown_bb
-- reraise_freq_dealer, reraise_freq_bb
+- showdown_winrate, allin_showdown_winrate
+- avg_streets_seen, rounds_observed
+- allin_freq, allin_call_freq, went_to_showdown by position
+- reraise_freq by position
 """
 
 import jax
 import jax.numpy as jnp
 import chex
-from typing import Tuple
 
-# Feature indices for the 64-dimensional history tensor
-# This defines the exact ordering of features
+# =============================================================================
+# Output tensor indices (64 features)
+# =============================================================================
+
+HISTORY_DIM = 64
 
 # PREFLOP (8 features, indices 0-7)
 IDX_PREFLOP_VPIP_DEALER = 0
@@ -134,196 +126,15 @@ IDX_AGG_WENT_TO_SHOWDOWN_BB = 59
 IDX_AGG_RERAISE_FREQ_DEALER = 60
 IDX_AGG_RERAISE_FREQ_BB = 61
 
-# Padding to reach 64 (indices 62-63) - reserved for future use
-IDX_RESERVED_1 = 62
-IDX_RESERVED_2 = 63
-
-HISTORY_DIM = 64
-
-
-@chex.dataclass(frozen=True)
-class OpponentStats:
-    """Tracks opponent statistics for history encoding.
-    
-    Uses (successes, trials) pairs for frequency-based stats.
-    Uses (sum, count) pairs for average-based stats.
-    
-    All arrays are flat to enable efficient JAX operations.
-    """
-    # Frequency stats: (num_stats, 2) where [:, 0] = successes, [:, 1] = trials
-    # We track dealer and bb versions separately
-    freq_stats: chex.Array  # (num_freq_stats, 2)
-    
-    # Average stats: (num_avg_stats, 2) where [:, 0] = sum, [:, 1] = count
-    avg_stats: chex.Array  # (num_avg_stats, 2)
-    
-    # Round-level tracking
-    rounds_observed: chex.Array  # scalar
-    
-    # Per-round state tracking (reset each round)
-    # Track who was preflop aggressor for cbet/donk detection
-    preflop_aggressor: chex.Array  # 0 = dealer, 1 = bb, -1 = none
-    
-    # Track if opponent bet on each street (for barrel detection)
-    opp_bet_flop: chex.Array  # bool
-    opp_bet_turn: chex.Array  # bool
-    
-    # Track if opponent checked this street (for check-raise detection)
-    opp_checked_this_street: chex.Array  # bool
-    
-    # Track current street's pot size for overbet detection
-    pot_at_street_start: chex.Array  # float
-
-
-# Number of frequency-based statistics we track
-# Each has (successes, trials) pair
-NUM_FREQ_STATS = 50  # Adjust based on actual count
-
-# Number of average-based statistics we track
-# Each has (sum, count) pair
-NUM_AVG_STATS = 10  # open_raise_size, avg_bet_size per street, avg_streets_seen
-
-
-def opponent_stats_init() -> OpponentStats:
-    """Initialize empty opponent stats."""
-    return OpponentStats(
-        freq_stats=jnp.zeros((NUM_FREQ_STATS, 2), dtype=jnp.float32),
-        avg_stats=jnp.zeros((NUM_AVG_STATS, 2), dtype=jnp.float32),
-        rounds_observed=jnp.float32(0),
-        preflop_aggressor=jnp.int32(-1),
-        opp_bet_flop=jnp.bool_(False),
-        opp_bet_turn=jnp.bool_(False),
-        opp_checked_this_street=jnp.bool_(False),
-        pot_at_street_start=jnp.float32(0),
-    )
-
-
-def opponent_stats_reset_round(stats: OpponentStats) -> OpponentStats:
-    """Reset per-round tracking state (called at start of each round)."""
-    return stats.replace(
-        preflop_aggressor=jnp.int32(-1),
-        opp_bet_flop=jnp.bool_(False),
-        opp_bet_turn=jnp.bool_(False),
-        opp_checked_this_street=jnp.bool_(False),
-        pot_at_street_start=jnp.float32(0),
-    )
-
-
-def _freq(successes: chex.Array, trials: chex.Array) -> chex.Array:
-    """Compute frequency with 0.5 default when trials=0."""
-    return jnp.where(trials > 0, successes / trials, 0.5)
-
-
-def _avg(total: chex.Array, count: chex.Array, default: float = 0.0) -> chex.Array:
-    """Compute average with default when count=0."""
-    return jnp.where(count > 0, total / count, default)
-
-
-def _log_rounds(count: chex.Array) -> chex.Array:
-    """Log-scale rounds observed for better numerical properties."""
-    return jnp.log1p(count)
-
-
-@jax.jit
-def opponent_stats_to_tensor(stats: OpponentStats) -> chex.Array:
-    """Convert opponent stats to 64-dimensional tensor for model input.
-    
-    Args:
-        stats: OpponentStats object
-        
-    Returns:
-        tensor: (64,) float32 tensor of features
-    """
-    tensor = jnp.zeros(HISTORY_DIM, dtype=jnp.float32)
-    
-    # Helper to get frequency from freq_stats array
-    def get_freq(idx):
-        return _freq(stats.freq_stats[idx, 0], stats.freq_stats[idx, 1])
-    
-    def get_avg(idx, default=0.0):
-        return _avg(stats.avg_stats[idx, 0], stats.avg_stats[idx, 1], default)
-    
-    # === PREFLOP ===
-    tensor = tensor.at[IDX_PREFLOP_VPIP_DEALER].set(get_freq(0))
-    tensor = tensor.at[IDX_PREFLOP_VPIP_BB].set(get_freq(1))
-    tensor = tensor.at[IDX_PREFLOP_RAISE_FREQ_DEALER].set(get_freq(2))
-    tensor = tensor.at[IDX_PREFLOP_RAISE_FREQ_BB].set(get_freq(3))
-    tensor = tensor.at[IDX_PREFLOP_FOLD_FREQ_DEALER].set(get_freq(4))
-    tensor = tensor.at[IDX_PREFLOP_FOLD_FREQ_BB].set(get_freq(5))
-    tensor = tensor.at[IDX_PREFLOP_OPEN_RAISE_SIZE_AVG_DEALER].set(get_avg(0, 2.5))  # default ~2.5x
-    tensor = tensor.at[IDX_PREFLOP_OPEN_RAISE_SIZE_AVG_BB].set(get_avg(1, 3.0))
-    
-    # === DISCARD ===
-    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_DEALER].set(get_freq(6))
-    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_BB].set(get_freq(7))
-    
-    # === FLOP ===
-    tensor = tensor.at[IDX_FLOP_FOLD_FREQ_DEALER].set(get_freq(8))
-    tensor = tensor.at[IDX_FLOP_FOLD_FREQ_BB].set(get_freq(9))
-    tensor = tensor.at[IDX_FLOP_CALL_FREQ_DEALER].set(get_freq(10))
-    tensor = tensor.at[IDX_FLOP_CALL_FREQ_BB].set(get_freq(11))
-    tensor = tensor.at[IDX_FLOP_RAISE_FREQ_DEALER].set(get_freq(12))
-    tensor = tensor.at[IDX_FLOP_RAISE_FREQ_BB].set(get_freq(13))
-    tensor = tensor.at[IDX_FLOP_BET_FREQ_DEALER].set(get_freq(14))
-    tensor = tensor.at[IDX_FLOP_BET_FREQ_BB].set(get_freq(15))
-    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_DEALER].set(get_avg(2, 0.5))  # default 0.5 pot
-    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_BB].set(get_avg(3, 0.5))
-    tensor = tensor.at[IDX_FLOP_CHECK_RAISE_FREQ].set(get_freq(16))
-    tensor = tensor.at[IDX_FLOP_CBET_FREQ_DEALER].set(get_freq(17))
-    tensor = tensor.at[IDX_FLOP_CBET_FREQ_BB].set(get_freq(18))
-    tensor = tensor.at[IDX_FLOP_DONK_BET_FREQ_BB].set(get_freq(19))
-    
-    # === TURN ===
-    tensor = tensor.at[IDX_TURN_FOLD_FREQ_DEALER].set(get_freq(20))
-    tensor = tensor.at[IDX_TURN_FOLD_FREQ_BB].set(get_freq(21))
-    tensor = tensor.at[IDX_TURN_CALL_FREQ_DEALER].set(get_freq(22))
-    tensor = tensor.at[IDX_TURN_CALL_FREQ_BB].set(get_freq(23))
-    tensor = tensor.at[IDX_TURN_RAISE_FREQ_DEALER].set(get_freq(24))
-    tensor = tensor.at[IDX_TURN_RAISE_FREQ_BB].set(get_freq(25))
-    tensor = tensor.at[IDX_TURN_BET_FREQ_DEALER].set(get_freq(26))
-    tensor = tensor.at[IDX_TURN_BET_FREQ_BB].set(get_freq(27))
-    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_DEALER].set(get_avg(4, 0.5))
-    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_BB].set(get_avg(5, 0.5))
-    tensor = tensor.at[IDX_TURN_DOUBLE_BARREL_FREQ_DEALER].set(get_freq(28))
-    tensor = tensor.at[IDX_TURN_DOUBLE_BARREL_FREQ_BB].set(get_freq(29))
-    
-    # === RIVER ===
-    tensor = tensor.at[IDX_RIVER_FOLD_FREQ_DEALER].set(get_freq(30))
-    tensor = tensor.at[IDX_RIVER_FOLD_FREQ_BB].set(get_freq(31))
-    tensor = tensor.at[IDX_RIVER_CALL_FREQ_DEALER].set(get_freq(32))
-    tensor = tensor.at[IDX_RIVER_CALL_FREQ_BB].set(get_freq(33))
-    tensor = tensor.at[IDX_RIVER_RAISE_FREQ_DEALER].set(get_freq(34))
-    tensor = tensor.at[IDX_RIVER_RAISE_FREQ_BB].set(get_freq(35))
-    tensor = tensor.at[IDX_RIVER_BET_FREQ_DEALER].set(get_freq(36))
-    tensor = tensor.at[IDX_RIVER_BET_FREQ_BB].set(get_freq(37))
-    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_DEALER].set(get_avg(6, 0.5))
-    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_BB].set(get_avg(7, 0.5))
-    tensor = tensor.at[IDX_RIVER_TRIPLE_BARREL_FREQ_DEALER].set(get_freq(38))
-    tensor = tensor.at[IDX_RIVER_TRIPLE_BARREL_FREQ_BB].set(get_freq(39))
-    tensor = tensor.at[IDX_RIVER_OVERBET_FREQ_DEALER].set(get_freq(40))
-    tensor = tensor.at[IDX_RIVER_OVERBET_FREQ_BB].set(get_freq(41))
-    
-    # === AGGREGATED ===
-    tensor = tensor.at[IDX_AGG_SHOWDOWN_WINRATE].set(get_freq(42))
-    tensor = tensor.at[IDX_AGG_ALLIN_SHOWDOWN_WINRATE].set(get_freq(43))
-    tensor = tensor.at[IDX_AGG_AVG_STREETS_SEEN].set(get_avg(8, 2.0) / 4.0)  # normalize to [0, 1]
-    tensor = tensor.at[IDX_AGG_ROUNDS_OBSERVED].set(_log_rounds(stats.rounds_observed))
-    tensor = tensor.at[IDX_AGG_ALLIN_FREQ_DEALER].set(get_freq(44))
-    tensor = tensor.at[IDX_AGG_ALLIN_FREQ_BB].set(get_freq(45))
-    tensor = tensor.at[IDX_AGG_ALLIN_CALL_FREQ_DEALER].set(get_freq(46))
-    tensor = tensor.at[IDX_AGG_ALLIN_CALL_FREQ_BB].set(get_freq(47))
-    tensor = tensor.at[IDX_AGG_WENT_TO_SHOWDOWN_DEALER].set(get_freq(48))
-    tensor = tensor.at[IDX_AGG_WENT_TO_SHOWDOWN_BB].set(get_freq(49))
-    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_DEALER].set(get_freq(50 - 1))  # adjust index
-    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_BB].set(get_freq(51 - 1))
-    
-    return tensor
-
+# CAN ADD ONE
+IDX_AGG_RESERVED_1 = 62
+IDX_AGG_RESERVED_2 = 63
 
 # =============================================================================
-# Frequency stat indices (for freq_stats array)
+# Internal tracking indices
 # =============================================================================
-# This maps logical stat names to indices in the freq_stats array
+
+NUM_FREQ_STATS = 50
 
 FREQ_IDX_VPIP_DEALER = 0
 FREQ_IDX_VPIP_BB = 1
@@ -376,7 +187,8 @@ FREQ_IDX_ALLIN_CALL_BB = 47
 FREQ_IDX_WENT_SHOWDOWN_DEALER = 48
 FREQ_IDX_WENT_SHOWDOWN_BB = 49
 
-# Average stat indices (for avg_stats array)
+NUM_AVG_STATS = 10
+
 AVG_IDX_OPEN_RAISE_SIZE_DEALER = 0
 AVG_IDX_OPEN_RAISE_SIZE_BB = 1
 AVG_IDX_FLOP_BET_SIZE_DEALER = 2
@@ -386,53 +198,46 @@ AVG_IDX_TURN_BET_SIZE_BB = 5
 AVG_IDX_RIVER_BET_SIZE_DEALER = 6
 AVG_IDX_RIVER_BET_SIZE_BB = 7
 AVG_IDX_STREETS_SEEN = 8
+AVG_IDX_RESERVED = 9
+
+# Action and Phase constants (must match game.py)
+ACT_FOLD = 0
+ACT_CHECK = 1
+ACT_CALL = 2
+ACT_RAISE_MIN = 3
+ACT_ALLIN = 9
+ACT_DISCARD_0 = 10
+ACT_DISCARD_2 = 12
+
+PHASE_PREFLOP = 0
+PHASE_FLOP = 3
+PHASE_TURN = 4
+PHASE_RIVER = 5
 
 
 # =============================================================================
-# Update functions
+# Vectorized Opponent Stats
 # =============================================================================
 
-@jax.jit
-def _update_freq(stats: OpponentStats, idx: int, success: bool) -> OpponentStats:
-    """Update a frequency stat."""
-    new_freq = stats.freq_stats.at[idx, 0].add(jnp.float32(success))
-    new_freq = new_freq.at[idx, 1].add(1.0)
-    return stats.replace(freq_stats=new_freq)
-
-
-@jax.jit
-def _update_avg(stats: OpponentStats, idx: int, value: float) -> OpponentStats:
-    """Update an average stat."""
-    new_avg = stats.avg_stats.at[idx, 0].add(value)
-    new_avg = new_avg.at[idx, 1].add(1.0)
-    return stats.replace(avg_stats=new_avg)
-
-
-def is_high_card(card_index: int) -> bool:
-    """Check if card is a high card (A, K, Q, J = ranks 12, 11, 10, 9)."""
-    rank = card_index % 13
-    return rank >= 9
-
-
-# =============================================================================
-# Vectorized opponent stats for parallel environments
-# =============================================================================
 
 @chex.dataclass(frozen=True)
 class VecOpponentStats:
     """Vectorized opponent stats for E parallel environments."""
     freq_stats: chex.Array  # (E, NUM_FREQ_STATS, 2)
     avg_stats: chex.Array   # (E, NUM_AVG_STATS, 2)
+    
     rounds_observed: chex.Array  # (E,)
-    preflop_aggressor: chex.Array  # (E,)
-    opp_bet_flop: chex.Array  # (E,)
-    opp_bet_turn: chex.Array  # (E,)
-    opp_checked_this_street: chex.Array  # (E,)
-    pot_at_street_start: chex.Array  # (E,)
+    preflop_aggressor: chex.Array  # (E,) int32: 0=dealer, 1=bb, -1=none
+    opp_bet_flop: chex.Array  # (E,) bool
+    opp_bet_turn: chex.Array  # (E,) bool
+    opp_checked_this_street: chex.Array  # (E,) bool
+    pot_at_street_start: chex.Array  # (E,) float32
+    current_street: chex.Array  # (E,) int32
+    went_allin_this_hand: chex.Array  # (E,) bool
 
 
 def vec_opponent_stats_init(num_envs: int) -> VecOpponentStats:
-    """Initialize vectorized opponent stats for num_envs environments."""
+    """Initialize fresh vectorized opponent stats."""
     return VecOpponentStats(
         freq_stats=jnp.zeros((num_envs, NUM_FREQ_STATS, 2), dtype=jnp.float32),
         avg_stats=jnp.zeros((num_envs, NUM_AVG_STATS, 2), dtype=jnp.float32),
@@ -442,28 +247,242 @@ def vec_opponent_stats_init(num_envs: int) -> VecOpponentStats:
         opp_bet_turn=jnp.zeros(num_envs, dtype=jnp.bool_),
         opp_checked_this_street=jnp.zeros(num_envs, dtype=jnp.bool_),
         pot_at_street_start=jnp.zeros(num_envs, dtype=jnp.float32),
+        current_street=jnp.zeros(num_envs, dtype=jnp.int32),
+        went_allin_this_hand=jnp.zeros(num_envs, dtype=jnp.bool_),
     )
 
 
 @jax.jit
-def vec_opponent_stats_to_tensor(stats: VecOpponentStats) -> chex.Array:
-    """Convert vectorized opponent stats to (E, 64) tensor."""
-    return jax.vmap(lambda fs, avgs, ro: _single_stats_to_tensor(fs, avgs, ro))(
-        stats.freq_stats, stats.avg_stats, stats.rounds_observed
+def vec_reset_round_state(opp_stats: VecOpponentStats, done: chex.Array) -> VecOpponentStats:
+    """Reset per-round state on hand completion. Keeps accumulated stats!"""
+    return opp_stats.replace(
+        preflop_aggressor=jnp.where(done, jnp.int32(-1), opp_stats.preflop_aggressor),
+        opp_bet_flop=jnp.where(done, False, opp_stats.opp_bet_flop),
+        opp_bet_turn=jnp.where(done, False, opp_stats.opp_bet_turn),
+        opp_checked_this_street=jnp.where(done, False, opp_stats.opp_checked_this_street),
+        pot_at_street_start=jnp.where(done, 0.0, opp_stats.pot_at_street_start),
+        current_street=jnp.where(done, jnp.int32(0), opp_stats.current_street),
+        went_allin_this_hand=jnp.where(done, False, opp_stats.went_allin_this_hand),
+        rounds_observed=jnp.where(done, opp_stats.rounds_observed + 1, opp_stats.rounds_observed),
     )
 
 
+@jax.jit
+def vec_update_opp_stats(
+    opp_stats: VecOpponentStats,
+    phase: chex.Array,
+    action: chex.Array,
+    is_opp_turn: chex.Array,
+    opp_is_dealer: chex.Array,
+    to_call: chex.Array,
+    pot_before: chex.Array,
+    bet_amount: chex.Array,
+) -> VecOpponentStats:
+    """Update opponent statistics based on their action."""
+    update = is_opp_turn
+    
+    is_fold = action == ACT_FOLD
+    is_check = action == ACT_CHECK
+    is_call = action == ACT_CALL
+    is_raise = (action >= ACT_RAISE_MIN) & (action <= ACT_ALLIN)
+    is_allin = action == ACT_ALLIN
+    is_discard = (action >= ACT_DISCARD_0) & (action <= ACT_DISCARD_2)
+    
+    is_vpip = is_call | is_raise
+    facing_bet = to_call > 0
+    is_bet = is_raise & ~facing_bet
+    is_raise_vs_bet = is_raise & facing_bet
+    
+    is_preflop = phase == PHASE_PREFLOP
+    is_flop = phase == PHASE_FLOP
+    is_turn = phase == PHASE_TURN
+    is_river = phase == PHASE_RIVER
+    
+    bet_frac = jnp.where(pot_before > 0, bet_amount / pot_before, 0.0)
+    
+    freq = opp_stats.freq_stats
+    avg = opp_stats.avg_stats
+    
+    def update_freq(f, idx, success, should_update):
+        success_add = jnp.where(should_update, success.astype(jnp.float32), 0.0)
+        trial_add = jnp.where(should_update, 1.0, 0.0)
+        f = f.at[:, idx, 0].add(success_add)
+        f = f.at[:, idx, 1].add(trial_add)
+        return f
+    
+    def update_avg(a, idx, value, should_update):
+        sum_add = jnp.where(should_update, value, 0.0)
+        count_add = jnp.where(should_update, 1.0, 0.0)
+        a = a.at[:, idx, 0].add(sum_add)
+        a = a.at[:, idx, 1].add(count_add)
+        return a
+    
+    # PREFLOP
+    preflop_action = update & is_preflop & ~is_discard
+    freq = update_freq(freq, FREQ_IDX_VPIP_DEALER, is_vpip, preflop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_VPIP_BB, is_vpip, preflop_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_PREFLOP_RAISE_DEALER, is_raise, preflop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_PREFLOP_RAISE_BB, is_raise, preflop_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_PREFLOP_FOLD_DEALER, is_fold, preflop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_PREFLOP_FOLD_BB, is_fold, preflop_action & ~opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_OPEN_RAISE_SIZE_DEALER, bet_frac, preflop_action & is_raise & opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_OPEN_RAISE_SIZE_BB, bet_frac, preflop_action & is_raise & ~opp_is_dealer)
+    
+    # FLOP
+    flop_action = update & is_flop
+    freq = update_freq(freq, FREQ_IDX_FLOP_FOLD_DEALER, is_fold, flop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_FOLD_BB, is_fold, flop_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_CALL_DEALER, is_call, flop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_CALL_BB, is_call, flop_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_RAISE_DEALER, is_raise_vs_bet, flop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_RAISE_BB, is_raise_vs_bet, flop_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_BET_DEALER, is_bet, flop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_BET_BB, is_bet, flop_action & ~opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_FLOP_BET_SIZE_DEALER, bet_frac, flop_action & (is_bet | is_raise) & opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_FLOP_BET_SIZE_BB, bet_frac, flop_action & (is_bet | is_raise) & ~opp_is_dealer)
+    
+    is_check_raise = is_raise_vs_bet & opp_stats.opp_checked_this_street
+    freq = update_freq(freq, FREQ_IDX_FLOP_CHECK_RAISE, is_check_raise, flop_action)
+    
+    opp_was_aggressor = jnp.where(opp_is_dealer, opp_stats.preflop_aggressor == 0, opp_stats.preflop_aggressor == 1)
+    is_cbet = is_bet & opp_was_aggressor
+    freq = update_freq(freq, FREQ_IDX_FLOP_CBET_DEALER, is_cbet, flop_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_FLOP_CBET_BB, is_cbet, flop_action & ~opp_is_dealer)
+    
+    is_donk = is_bet & ~opp_is_dealer & (opp_stats.preflop_aggressor == 0)
+    freq = update_freq(freq, FREQ_IDX_FLOP_DONK_BB, is_donk, flop_action)
+    
+    # TURN
+    turn_action = update & is_turn
+    freq = update_freq(freq, FREQ_IDX_TURN_FOLD_DEALER, is_fold, turn_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_FOLD_BB, is_fold, turn_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_CALL_DEALER, is_call, turn_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_CALL_BB, is_call, turn_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_RAISE_DEALER, is_raise_vs_bet, turn_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_RAISE_BB, is_raise_vs_bet, turn_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_BET_DEALER, is_bet, turn_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_BET_BB, is_bet, turn_action & ~opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_TURN_BET_SIZE_DEALER, bet_frac, turn_action & (is_bet | is_raise) & opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_TURN_BET_SIZE_BB, bet_frac, turn_action & (is_bet | is_raise) & ~opp_is_dealer)
+    
+    is_double_barrel = is_bet & opp_stats.opp_bet_flop
+    freq = update_freq(freq, FREQ_IDX_TURN_DOUBLE_BARREL_DEALER, is_double_barrel, turn_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_TURN_DOUBLE_BARREL_BB, is_double_barrel, turn_action & ~opp_is_dealer)
+    
+    # RIVER
+    river_action = update & is_river
+    freq = update_freq(freq, FREQ_IDX_RIVER_FOLD_DEALER, is_fold, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_FOLD_BB, is_fold, river_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_CALL_DEALER, is_call, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_CALL_BB, is_call, river_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_RAISE_DEALER, is_raise_vs_bet, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_RAISE_BB, is_raise_vs_bet, river_action & ~opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_BET_DEALER, is_bet, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_BET_BB, is_bet, river_action & ~opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_RIVER_BET_SIZE_DEALER, bet_frac, river_action & (is_bet | is_raise) & opp_is_dealer)
+    avg = update_avg(avg, AVG_IDX_RIVER_BET_SIZE_BB, bet_frac, river_action & (is_bet | is_raise) & ~opp_is_dealer)
+    
+    is_triple_barrel = is_bet & opp_stats.opp_bet_flop & opp_stats.opp_bet_turn
+    freq = update_freq(freq, FREQ_IDX_RIVER_TRIPLE_BARREL_DEALER, is_triple_barrel, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_TRIPLE_BARREL_BB, is_triple_barrel, river_action & ~opp_is_dealer)
+    
+    is_overbet = (is_bet | is_raise) & (bet_amount > pot_before)
+    freq = update_freq(freq, FREQ_IDX_RIVER_OVERBET_DEALER, is_overbet, river_action & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_RIVER_OVERBET_BB, is_overbet, river_action & ~opp_is_dealer)
+    
+    # ALL-IN
+    freq = update_freq(freq, FREQ_IDX_ALLIN_DEALER, is_allin, update & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_ALLIN_BB, is_allin, update & ~opp_is_dealer)
+    is_big_call = is_call & (to_call > 100)
+    freq = update_freq(freq, FREQ_IDX_ALLIN_CALL_DEALER, is_big_call, update & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_ALLIN_CALL_BB, is_big_call, update & ~opp_is_dealer)
+    
+    # Update per-round state
+    new_preflop_agg = jnp.where(update & is_preflop & is_raise, jnp.where(opp_is_dealer, 0, 1), opp_stats.preflop_aggressor)
+    new_opp_bet_flop = jnp.where(update & is_flop & is_bet, True, opp_stats.opp_bet_flop)
+    new_opp_bet_turn = jnp.where(update & is_turn & is_bet, True, opp_stats.opp_bet_turn)
+    new_opp_checked = jnp.where(update & is_check, True, opp_stats.opp_checked_this_street)
+    street_changed = phase != opp_stats.current_street
+    new_opp_checked = jnp.where(street_changed, False, new_opp_checked)
+    new_went_allin = jnp.where(update & is_allin, True, opp_stats.went_allin_this_hand)
+    
+    return opp_stats.replace(
+        freq_stats=freq,
+        avg_stats=avg,
+        preflop_aggressor=new_preflop_agg,
+        opp_bet_flop=new_opp_bet_flop,
+        opp_bet_turn=new_opp_bet_turn,
+        opp_checked_this_street=new_opp_checked,
+        current_street=phase,
+        went_allin_this_hand=new_went_allin,
+    )
+
+
+@jax.jit
+def vec_update_showdown(
+    opp_stats: VecOpponentStats,
+    done: chex.Array,
+    went_to_showdown: chex.Array,
+    opp_won: chex.Array,
+    opp_is_dealer: chex.Array,
+) -> VecOpponentStats:
+    """Update showdown statistics on hand completion."""
+    update = done
+    freq = opp_stats.freq_stats
+    avg = opp_stats.avg_stats
+    
+    def update_freq(f, idx, success, should_update):
+        success_add = jnp.where(should_update, success.astype(jnp.float32), 0.0)
+        trial_add = jnp.where(should_update, 1.0, 0.0)
+        f = f.at[:, idx, 0].add(success_add)
+        f = f.at[:, idx, 1].add(trial_add)
+        return f
+    
+    def update_avg(a, idx, value, should_update):
+        sum_add = jnp.where(should_update, value, 0.0)
+        count_add = jnp.where(should_update, 1.0, 0.0)
+        a = a.at[:, idx, 0].add(sum_add)
+        a = a.at[:, idx, 1].add(count_add)
+        return a
+    
+    freq = update_freq(freq, FREQ_IDX_SHOWDOWN_WIN, opp_won, update & went_to_showdown)
+    freq = update_freq(freq, FREQ_IDX_ALLIN_SHOWDOWN_WIN, opp_won, update & went_to_showdown & opp_stats.went_allin_this_hand)
+    freq = update_freq(freq, FREQ_IDX_WENT_SHOWDOWN_DEALER, went_to_showdown, update & opp_is_dealer)
+    freq = update_freq(freq, FREQ_IDX_WENT_SHOWDOWN_BB, went_to_showdown, update & ~opp_is_dealer)
+    
+    streets = opp_stats.current_street.astype(jnp.float32)
+    streets_seen = jnp.clip(streets, 1.0, 4.0)
+    avg = update_avg(avg, AVG_IDX_STREETS_SEEN, streets_seen, update)
+    
+    return opp_stats.replace(freq_stats=freq, avg_stats=avg)
+
+
+# =============================================================================
+# Conversion to tensor
+# =============================================================================
+
+
+def _freq(successes: chex.Array, trials: chex.Array) -> chex.Array:
+    return jnp.where(trials > 0, successes / trials, 0.5)
+
+
+def _avg(total: chex.Array, count: chex.Array, default: float = 0.0) -> chex.Array:
+    return jnp.where(count > 0, total / count, default)
+
+
+def _log_rounds(count: chex.Array) -> chex.Array:
+    return jnp.log1p(count) / 5.0
+
+
 def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
-    """Convert single env stats arrays to 64-dim tensor."""
     tensor = jnp.zeros(HISTORY_DIM, dtype=jnp.float32)
     
     def get_freq(idx):
         return _freq(freq_stats[idx, 0], freq_stats[idx, 1])
     
-    def get_avg(idx, default=0.0):
+    def get_avg(idx, default=0.5):
         return _avg(avg_stats[idx, 0], avg_stats[idx, 1], default)
     
-    # === PREFLOP ===
     tensor = tensor.at[IDX_PREFLOP_VPIP_DEALER].set(get_freq(FREQ_IDX_VPIP_DEALER))
     tensor = tensor.at[IDX_PREFLOP_VPIP_BB].set(get_freq(FREQ_IDX_VPIP_BB))
     tensor = tensor.at[IDX_PREFLOP_RAISE_FREQ_DEALER].set(get_freq(FREQ_IDX_PREFLOP_RAISE_DEALER))
@@ -472,12 +491,8 @@ def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
     tensor = tensor.at[IDX_PREFLOP_FOLD_FREQ_BB].set(get_freq(FREQ_IDX_PREFLOP_FOLD_BB))
     tensor = tensor.at[IDX_PREFLOP_OPEN_RAISE_SIZE_AVG_DEALER].set(get_avg(AVG_IDX_OPEN_RAISE_SIZE_DEALER, 2.5))
     tensor = tensor.at[IDX_PREFLOP_OPEN_RAISE_SIZE_AVG_BB].set(get_avg(AVG_IDX_OPEN_RAISE_SIZE_BB, 3.0))
-    
-    # === DISCARD ===
-    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_DEALER].set(get_freq(FREQ_IDX_DISCARD_HIGH_DEALER))
-    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_BB].set(get_freq(FREQ_IDX_DISCARD_HIGH_BB))
-    
-    # === FLOP ===
+    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_DEALER].set(0.5)
+    tensor = tensor.at[IDX_DISCARD_HIGH_CARD_FREQ_BB].set(0.5)
     tensor = tensor.at[IDX_FLOP_FOLD_FREQ_DEALER].set(get_freq(FREQ_IDX_FLOP_FOLD_DEALER))
     tensor = tensor.at[IDX_FLOP_FOLD_FREQ_BB].set(get_freq(FREQ_IDX_FLOP_FOLD_BB))
     tensor = tensor.at[IDX_FLOP_CALL_FREQ_DEALER].set(get_freq(FREQ_IDX_FLOP_CALL_DEALER))
@@ -486,14 +501,12 @@ def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
     tensor = tensor.at[IDX_FLOP_RAISE_FREQ_BB].set(get_freq(FREQ_IDX_FLOP_RAISE_BB))
     tensor = tensor.at[IDX_FLOP_BET_FREQ_DEALER].set(get_freq(FREQ_IDX_FLOP_BET_DEALER))
     tensor = tensor.at[IDX_FLOP_BET_FREQ_BB].set(get_freq(FREQ_IDX_FLOP_BET_BB))
-    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_FLOP_BET_SIZE_DEALER, 0.5))
-    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_FLOP_BET_SIZE_BB, 0.5))
+    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_FLOP_BET_SIZE_DEALER))
+    tensor = tensor.at[IDX_FLOP_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_FLOP_BET_SIZE_BB))
     tensor = tensor.at[IDX_FLOP_CHECK_RAISE_FREQ].set(get_freq(FREQ_IDX_FLOP_CHECK_RAISE))
     tensor = tensor.at[IDX_FLOP_CBET_FREQ_DEALER].set(get_freq(FREQ_IDX_FLOP_CBET_DEALER))
     tensor = tensor.at[IDX_FLOP_CBET_FREQ_BB].set(get_freq(FREQ_IDX_FLOP_CBET_BB))
     tensor = tensor.at[IDX_FLOP_DONK_BET_FREQ_BB].set(get_freq(FREQ_IDX_FLOP_DONK_BB))
-    
-    # === TURN ===
     tensor = tensor.at[IDX_TURN_FOLD_FREQ_DEALER].set(get_freq(FREQ_IDX_TURN_FOLD_DEALER))
     tensor = tensor.at[IDX_TURN_FOLD_FREQ_BB].set(get_freq(FREQ_IDX_TURN_FOLD_BB))
     tensor = tensor.at[IDX_TURN_CALL_FREQ_DEALER].set(get_freq(FREQ_IDX_TURN_CALL_DEALER))
@@ -502,12 +515,10 @@ def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
     tensor = tensor.at[IDX_TURN_RAISE_FREQ_BB].set(get_freq(FREQ_IDX_TURN_RAISE_BB))
     tensor = tensor.at[IDX_TURN_BET_FREQ_DEALER].set(get_freq(FREQ_IDX_TURN_BET_DEALER))
     tensor = tensor.at[IDX_TURN_BET_FREQ_BB].set(get_freq(FREQ_IDX_TURN_BET_BB))
-    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_TURN_BET_SIZE_DEALER, 0.5))
-    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_TURN_BET_SIZE_BB, 0.5))
+    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_TURN_BET_SIZE_DEALER))
+    tensor = tensor.at[IDX_TURN_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_TURN_BET_SIZE_BB))
     tensor = tensor.at[IDX_TURN_DOUBLE_BARREL_FREQ_DEALER].set(get_freq(FREQ_IDX_TURN_DOUBLE_BARREL_DEALER))
     tensor = tensor.at[IDX_TURN_DOUBLE_BARREL_FREQ_BB].set(get_freq(FREQ_IDX_TURN_DOUBLE_BARREL_BB))
-    
-    # === RIVER ===
     tensor = tensor.at[IDX_RIVER_FOLD_FREQ_DEALER].set(get_freq(FREQ_IDX_RIVER_FOLD_DEALER))
     tensor = tensor.at[IDX_RIVER_FOLD_FREQ_BB].set(get_freq(FREQ_IDX_RIVER_FOLD_BB))
     tensor = tensor.at[IDX_RIVER_CALL_FREQ_DEALER].set(get_freq(FREQ_IDX_RIVER_CALL_DEALER))
@@ -516,14 +527,12 @@ def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
     tensor = tensor.at[IDX_RIVER_RAISE_FREQ_BB].set(get_freq(FREQ_IDX_RIVER_RAISE_BB))
     tensor = tensor.at[IDX_RIVER_BET_FREQ_DEALER].set(get_freq(FREQ_IDX_RIVER_BET_DEALER))
     tensor = tensor.at[IDX_RIVER_BET_FREQ_BB].set(get_freq(FREQ_IDX_RIVER_BET_BB))
-    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_RIVER_BET_SIZE_DEALER, 0.5))
-    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_RIVER_BET_SIZE_BB, 0.5))
+    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_DEALER].set(get_avg(AVG_IDX_RIVER_BET_SIZE_DEALER))
+    tensor = tensor.at[IDX_RIVER_AVG_BET_SIZE_BB].set(get_avg(AVG_IDX_RIVER_BET_SIZE_BB))
     tensor = tensor.at[IDX_RIVER_TRIPLE_BARREL_FREQ_DEALER].set(get_freq(FREQ_IDX_RIVER_TRIPLE_BARREL_DEALER))
     tensor = tensor.at[IDX_RIVER_TRIPLE_BARREL_FREQ_BB].set(get_freq(FREQ_IDX_RIVER_TRIPLE_BARREL_BB))
     tensor = tensor.at[IDX_RIVER_OVERBET_FREQ_DEALER].set(get_freq(FREQ_IDX_RIVER_OVERBET_DEALER))
     tensor = tensor.at[IDX_RIVER_OVERBET_FREQ_BB].set(get_freq(FREQ_IDX_RIVER_OVERBET_BB))
-    
-    # === AGGREGATED ===
     tensor = tensor.at[IDX_AGG_SHOWDOWN_WINRATE].set(get_freq(FREQ_IDX_SHOWDOWN_WIN))
     tensor = tensor.at[IDX_AGG_ALLIN_SHOWDOWN_WINRATE].set(get_freq(FREQ_IDX_ALLIN_SHOWDOWN_WIN))
     tensor = tensor.at[IDX_AGG_AVG_STREETS_SEEN].set(get_avg(AVG_IDX_STREETS_SEEN, 2.0) / 4.0)
@@ -534,10 +543,17 @@ def _single_stats_to_tensor(freq_stats, avg_stats, rounds_observed):
     tensor = tensor.at[IDX_AGG_ALLIN_CALL_FREQ_BB].set(get_freq(FREQ_IDX_ALLIN_CALL_BB))
     tensor = tensor.at[IDX_AGG_WENT_TO_SHOWDOWN_DEALER].set(get_freq(FREQ_IDX_WENT_SHOWDOWN_DEALER))
     tensor = tensor.at[IDX_AGG_WENT_TO_SHOWDOWN_BB].set(get_freq(FREQ_IDX_WENT_SHOWDOWN_BB))
-    
-    # reraise_freq - need to add these
-    # For now, use placeholder indices
-    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_DEALER].set(0.5)  # placeholder
-    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_BB].set(0.5)  # placeholder
+    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_DEALER].set(0.5)
+    tensor = tensor.at[IDX_AGG_RERAISE_FREQ_BB].set(0.5)
+    tensor = tensor.at[IDX_AGG_RESERVED_1].set(0.5)
+    tensor = tensor.at[IDX_AGG_RESERVED_2].set(0.5)
     
     return tensor
+
+
+@jax.jit
+def vec_opponent_stats_to_tensor(stats: VecOpponentStats) -> chex.Array:
+    """Convert vectorized opponent stats to (E, 64) tensor for model input."""
+    return jax.vmap(lambda fs, avgs, ro: _single_stats_to_tensor(fs, avgs, ro))(
+        stats.freq_stats, stats.avg_stats, stats.rounds_observed
+    )

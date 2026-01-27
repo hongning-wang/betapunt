@@ -259,25 +259,14 @@ class CardEncoder(nn.Module):
     """Encodes card tensor using embeddings and small transformer.
 
     Input: (B, 9, 2) where each entry is [card_index, type_id].
-    - card_index: 0-51 (canonized suits), -1 for invalid
-    - type_id: 0-5, -1 for invalid
 
-    Position semantics (fixed, not learned):
-        0-2: Hero's private cards (sorted by rank, all type_id=0)
-        3-4: Flop (sorted by rank, all type_id=1)
-        5: Hero's discard (type_id=2)
-        6: Villain's discard (type_id=3)
-        7: Turn (type_id=4)
-        8: River (type_id=5)
-
-    Cards are sorted by rank within hero hand and flop groups.
-    Suits are canonized (first suit seen = 0, second = 1, etc.).
-
-    Architecture:
-    - Embed rank, suit, type independently
-    - Concatenate embeddings
-    - MLP to project to emb_dim
-    - Cross-attention (downstream) learns card relationships
+    Position semantics:
+        0-2: Hero's private cards
+        3-4: Flop (community)
+        5: Hero's discard
+        6: Villain's discard
+        7: Turn
+        8: River
 
     Output: (B, 9, emb_dim)
 
@@ -287,7 +276,7 @@ class CardEncoder(nn.Module):
     emb_dim: int = EMB_DIM
     rank_emb_dim: int = 48
     suit_emb_dim: int = 32
-    position_emb_dim: int = 48  # 48 + 32 + 48 = 128
+    # position_emb_dim computed to fill remainder: emb_dim - rank - suit
     num_heads: int = 2
     ffn_dim: int = 256
 
@@ -300,14 +289,14 @@ class CardEncoder(nn.Module):
         Args:
             card_tensor: (B, 9, 2) int32 tensor with [card_index, type_id]
 
-            card_index: 0-51 valid cards (canonized suits), -1 invalid/undealt
-            type_id: 0-5 valid types:
-                0 = heropriv (all 3 hero private cards)
-                1 = flop (both flop cards)
-                2 = herodiscard
-                3 = villaindiscard
-                4 = turn
-                5 = river
+            card_index: 0-51 valid cards, -1 invalid/undealt
+            type_id: 0-5 valid types (simplified scheme):
+                0 = hero_private (positions 0-2)
+                1 = flop (positions 3-4)
+                2 = hero_discard (position 5)
+                3 = villain_discard (position 6)
+                4 = turn (position 7)
+                5 = river (position 8)
                 -1 = invalid/unused
 
         Returns:
@@ -330,39 +319,38 @@ class CardEncoder(nn.Module):
         suit = (card_index_safe // 13).astype(jnp.int32)
 
         is_invalid = card_index < 0
-        rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)  # 0-12 + 13 invalid
-        suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)   # 0-3 + 4 invalid
-
-        # Type embedding: 0-5 + 6 invalid
+        rank_safe = jnp.where(is_invalid, 13, rank).astype(jnp.int32)
+        suit_safe = jnp.where(is_invalid, 4, suit).astype(jnp.int32)
         type_safe = jnp.where(type_id >= 0, type_id, NUM_CARD_TYPES).astype(jnp.int32)
 
         # -----------------------------
-        # Embeddings: CONCATENATE rank, suit, type
-        # Dimensions scaled by information content
+        # Embeddings: rank + suit + position = emb_dim
         # -----------------------------
+        position_emb_dim = self.emb_dim - self.rank_emb_dim - self.suit_emb_dim
+
         rank_emb = nn.Embed(
             num_embeddings=14,  # 13 ranks + invalid
             features=self.rank_emb_dim,
-            dtype=COMPUTE_DTYPE,
-            param_dtype=COMPUTE_DTYPE,
-        )(rank_safe)  # (B, 9, 64)
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+        )(rank_safe)
 
         suit_emb = nn.Embed(
             num_embeddings=5,   # 4 suits + invalid
             features=self.suit_emb_dim,
-            dtype=COMPUTE_DTYPE,
-            param_dtype=COMPUTE_DTYPE,
-        )(suit_safe)  # (B, 9, 16)
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+        )(suit_safe)
 
-        type_emb = nn.Embed(
+        position_emb = nn.Embed(
             num_embeddings=NUM_CARD_TYPES + 1,  # 6 types + invalid
-            features=self.type_emb_dim,
-            dtype=COMPUTE_DTYPE,
-            param_dtype=COMPUTE_DTYPE,
-        )(type_safe)  # (B, 9, 48)
+            features=position_emb_dim,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+        )(type_safe)
 
-            # Concatenate: (B, 9, emb_dim)
-        concat = jnp.concatenate([rank_emb, suit_emb, type_emb], axis=-1)
+        # Concatenate: (B, 9, emb_dim)
+        concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
 
         # -----------------------------
         # Small 1-layer transformer for card relationships
