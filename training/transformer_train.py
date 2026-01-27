@@ -804,12 +804,19 @@ def collect_rollout(main_params, pool, buf, vec, key):
         to_call = (opp_bet - cur_bet).astype(jnp.float32)
         pot_before = (s.pot + s.p0_bet + s.p1_bet).astype(jnp.float32)
         
-        # Record action and step environment FIRST
+        # Record current player's stack BEFORE stepping (for bet_amount calculation)
+        cur_stack_before = jnp.where(s.current_player == 0, s.p0_stack, s.p1_stack).astype(jnp.float32)
+        
+        # Record action and step environment
         aux2 = jax.vmap(aux_record_action)(aux, s, action)
         k_env = jax.vmap(lambda k, eid: _mk_key(k, eid, 131071))(base_keys, env_ids)
         s_next, s_cont, done, _ = jax.vmap(env_step_and_optional_reset)(s, k_env, action)
 
-        # Update opponent stats with actual bet amount
+        # Compute bet_amount from stack change (correct for any action)
+        cur_stack_after = jnp.where(s.current_player == 0, s_next.p0_stack, s_next.p1_stack).astype(jnp.float32)
+        bet_amount = cur_stack_before - cur_stack_after  # Chips committed this action
+        
+        # Update opponent stats with CORRECT bet amount
         opp_stats = vec_update_opp_stats(
             opp_stats,
             phase=s.phase,
@@ -818,7 +825,7 @@ def collect_rollout(main_params, pool, buf, vec, key):
             opp_is_dealer=opp_is_dealer,
             to_call=to_call,
             pot_before=pot_before,
-            bet_amount=s.p0_bet,
+            bet_amount=bet_amount,  # FIX: use actual chips committed by action-taker
         )
 
         # Rewards

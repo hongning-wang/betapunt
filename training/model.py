@@ -31,13 +31,13 @@ CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 8    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack, is_dealer]
 HISTORY_INPUT_DIM = 64  # 64 opponent history features
 
-EMB_DIM = 256
+EMB_DIM = 128           # Changed from 256 to 128
 NUM_HEADS = 2
-FFN_DIM = 512
+FFN_DIM = 256           # Changed from 512 to 256 (2x EMB_DIM)
 NUM_TRANSFORMER_LAYERS = 2
 NUM_CROSS_ATTENTION_LAYERS = 2
 NUM_QUERY_TOKENS = 4
-PROCESSING_DIM = 256
+PROCESSING_DIM = 128    # Changed from 256 to 128
 
 # Compute dtype - change this to jnp.float32 for full precision training
 COMPUTE_DTYPE = jnp.bfloat16
@@ -100,66 +100,55 @@ class MultiHeadAttention(nn.Module):
         k = k.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
         v = v.reshape(batch_size, kv_len, self.num_heads, self.head_dim)
 
-        # Convert boolean mask to bias: True (valid) -> 0, False (invalid) -> -1e9
-        # Shape: (B, kv_len) -> (B, 1, 1, kv_len) for broadcasting
-        bias = jnp.where(mask[:, None, None, :], 0.0, -1e9)
+        q = q.transpose(0, 2, 1, 3)
+        k = k.transpose(0, 2, 1, 3)
+        v = v.transpose(0, 2, 1, 3)
 
-        attn_output = jax.nn.dot_product_attention(q, k, v, bias=bias)
+        scale = jnp.sqrt(self.head_dim).astype(COMPUTE_DTYPE)
+        attn_weights = jnp.einsum('bhqd,bhkd->bhqk', q, k) / scale
 
+        if mask is not None:
+            mask_expanded = mask[:, None, None, :]
+            attn_weights = jnp.where(mask_expanded, attn_weights, COMPUTE_DTYPE(-1e9))
+
+        attn_weights = jax.nn.softmax(attn_weights.astype(jnp.float32), axis=-1).astype(COMPUTE_DTYPE)
+
+        attn_output = jnp.einsum('bhqk,bhkd->bhqd', attn_weights, v)
+        attn_output = attn_output.transpose(0, 2, 1, 3)
         attn_output = attn_output.reshape(batch_size, q_len, projection_dim)
-        output = nn.Dense(input_dim, use_bias=False, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(attn_output)
+
+        output = nn.Dense(input_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(attn_output)
 
         return output
 
 
-class TransformerBlock(nn.Module):
-    """Single transformer encoder block with pre-norm."""
-
-    emb_dim: int
-    num_heads: int
-    ffn_dim: int
+class FeedForward(nn.Module):
+    """SwiGLU-style feed forward network."""
+    hidden_dim: int
+    out_dim: int
 
     @nn.compact
-    def __call__(
-        self,
-        x: chex.Array,
-        mask: Optional[chex.Array] = None,
-    ) -> chex.Array:
-        """
-        Args:
-            x: (B, S, D)
-            mask: (B, S) boolean mask where True = valid
-
-        Returns:
-            output: (B, S, D)
-        """
+    def __call__(self, x: chex.Array) -> chex.Array:
         x = x.astype(COMPUTE_DTYPE)
-        head_dim = self.emb_dim // self.num_heads
-        
-        # Pre-norm self-attention
-        residual = x
-        x = RMSNorm()(x)
-        x = MultiHeadAttention(num_heads=self.num_heads, head_dim=head_dim)(x, x, x, mask)
-        x = residual + x
 
-        # Pre-norm FFN
-        residual = x
-        x = RMSNorm()(x)
-        x = nn.Dense(self.ffn_dim, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16)(x)
-        x = nn.gelu(x)
-        x = nn.Dense(self.emb_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
-        x = residual + x
+        gate = nn.Dense(self.hidden_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
+        gate = nn.silu(gate)
+
+        up = nn.Dense(self.hidden_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
+
+        x = gate * up
+
+        x = nn.Dense(self.out_dim, dtype=COMPUTE_DTYPE, param_dtype=COMPUTE_DTYPE)(x)
 
         return x
 
 
-class TransformerEncoder(nn.Module):
-    """Stack of transformer encoder blocks."""
-
+class TransformerBlock(nn.Module):
+    """Single transformer block with pre-norm architecture."""
     emb_dim: int
     num_heads: int
     ffn_dim: int
-    num_layers: int
+    dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(
@@ -167,92 +156,93 @@ class TransformerEncoder(nn.Module):
         x: chex.Array,
         mask: Optional[chex.Array] = None,
     ) -> chex.Array:
-        """
-        Args:
-            x: (B, S, D)
-            mask: (B, S) boolean mask where True = valid
+        head_dim = self.emb_dim // self.num_heads
 
-        Returns:
-            output: (B, S, D)
-        """
-        x = x.astype(COMPUTE_DTYPE)
-
-        # Use explicit layer names for better jittability
-        for layer_idx in range(self.num_layers):
-            x = TransformerBlock(
-                emb_dim=self.emb_dim,
-                num_heads=self.num_heads,
-                ffn_dim=self.ffn_dim,
-                name=f'layer_{layer_idx}',
-            )(x, mask)
-
-        # Final layer norm
+        residual = x
         x = RMSNorm()(x)
+        x = MultiHeadAttention(
+            num_heads=self.num_heads,
+            head_dim=head_dim,
+        )(x, x, x, mask)
+        x = residual + x
+
+        residual = x
+        x = RMSNorm()(x)
+        x = FeedForward(
+            hidden_dim=self.ffn_dim,
+            out_dim=self.emb_dim,
+        )(x)
+        x = residual + x
 
         return x
 
 
 class CrossAttentionBlock(nn.Module):
-    """Cross-attention block where queries attend to context, followed by FFN."""
-
+    """Cross-attention block where queries attend to key-value context."""
     emb_dim: int
     num_heads: int
     ffn_dim: int
+    dropout_rate: float = 0.0
 
     @nn.compact
     def __call__(
         self,
-        query_tokens: chex.Array,
+        query: chex.Array,
         context: chex.Array,
         context_mask: Optional[chex.Array] = None,
     ) -> chex.Array:
-        """
-        Args:
-            query_tokens: (B, Q, D) learnable query tokens
-            context: (B, C, D) concatenated card + action representations
-            context_mask: (B, C) boolean mask where True = valid
-
-        Returns:
-            output: (B, Q, D)
-        """
-        query_tokens = query_tokens.astype(COMPUTE_DTYPE)
-        context = context.astype(COMPUTE_DTYPE)
         head_dim = self.emb_dim // self.num_heads
 
-        # === Cross-Attention Sub-block ===
-        attn_input = RMSNorm()(query_tokens)
-        context_normed = RMSNorm()(context)
-
-        attn_output = MultiHeadAttention(
+        residual = query
+        query_norm = RMSNorm()(query)
+        context_norm = RMSNorm()(context)
+        cross_attn_out = MultiHeadAttention(
             num_heads=self.num_heads,
             head_dim=head_dim,
-        )(attn_input, context_normed, context_normed, context_mask)
+        )(query_norm, context_norm, context_norm, context_mask)
+        query = residual + cross_attn_out
 
-        post_attn = query_tokens + attn_output
+        residual = query
+        query = RMSNorm()(query)
+        query = FeedForward(
+            hidden_dim=self.ffn_dim,
+            out_dim=self.emb_dim,
+        )(query)
+        query = residual + query
 
-        # === FFN Sub-block ===
-        ffn_input = RMSNorm()(post_attn)
+        return query
 
-        ffn_hidden = nn.Dense(
-            self.ffn_dim,
-            dtype=COMPUTE_DTYPE,
-            param_dtype=COMPUTE_DTYPE,
-        )(ffn_input)
-        ffn_hidden = nn.gelu(ffn_hidden)
 
-        ffn_out = nn.Dense(
-            self.emb_dim,
-            dtype=COMPUTE_DTYPE,
-            param_dtype=COMPUTE_DTYPE,
-        )(ffn_hidden)
+class TransformerEncoder(nn.Module):
+    """Multi-layer transformer encoder."""
+    emb_dim: int
+    num_heads: int
+    ffn_dim: int
+    num_layers: int
+    dropout_rate: float = 0.0
 
-        output = post_attn + ffn_out
+    @nn.compact
+    def __call__(
+        self,
+        x: chex.Array,
+        mask: Optional[chex.Array] = None,
+    ) -> chex.Array:
+        for layer_idx in range(self.num_layers):
+            x = TransformerBlock(
+                emb_dim=self.emb_dim,
+                num_heads=self.num_heads,
+                ffn_dim=self.ffn_dim,
+                dropout_rate=self.dropout_rate,
+                name=f'layer_{layer_idx}',
+            )(x, mask)
 
-        return output
+        x = RMSNorm()(x)
+
+        return x
 
 
 # =============================================================================
-# Encoder Modules
+# Domain-Specific Encoders
 # =============================================================================
 
 class CardEncoder(nn.Module):
@@ -611,8 +601,8 @@ class TossHoldemModel(nn.Module):
         2. Action Encoder: (B, ACTION_SEQ_LEN, 8) -> (B, ACTION_SEQ_LEN, emb_dim) with embeddings (concatenated)
         3. History Encoder: (B, 64) -> (B, 1, emb_dim) opponent stats
         4. Concatenate: (B, CARD_SEQ_LEN + ACTION_SEQ_LEN + 1, emb_dim)
-        5. Multiple Cross-Attention Fusion layers with learnable queries: (B, 6, 128)
-        6. Processing MLP: Flatten -> Dense -> gelu -> Dense -> gelu -> Dense -> (B, 256)
+        5. Multiple Cross-Attention Fusion layers with learnable queries: (B, 4, 128)
+        6. Processing MLP: Flatten -> Dense -> gelu -> Dense -> gelu -> (B, 128)
         7. Separate Output Heads:
            - Policy: Independent MLP -> (B, 13)
            - Value: Independent MLP with stop_gradient -> (B,)
@@ -737,15 +727,15 @@ class TossHoldemModel(nn.Module):
         # Flatten: (B, 4, 128) -> (B, 512)
         flat = fused.reshape(batch_size, -1)
 
-        # Layer 1: (B, 512) -> (B, 512)
+        # Layer 1: (B, 512) -> (B, 256) - adjusted for EMB_DIM=128
         processed = nn.Dense(
-            512,
+            256,
             dtype=COMPUTE_DTYPE,
             param_dtype=COMPUTE_DTYPE,
         )(flat)
         processed = nn.gelu(processed)
 
-        # Layer 2: (B, 512) -> (B, 256)
+        # Layer 2: (B, 256) -> (B, 128)
         processed = nn.Dense(
             self.processing_dim,
             dtype=COMPUTE_DTYPE,
@@ -759,7 +749,7 @@ class TossHoldemModel(nn.Module):
 
         # --- Betting Policy head (actions 0-9) ---
         betting_hidden = nn.Dense(
-            128,
+            64,  # Adjusted from 128 for EMB_DIM=128
             dtype=COMPUTE_DTYPE,
             param_dtype=COMPUTE_DTYPE,
             name='betting_hidden',
@@ -774,7 +764,7 @@ class TossHoldemModel(nn.Module):
 
         # --- Discard Policy head (actions 10-12) ---
         discard_hidden = nn.Dense(
-            128,
+            64,  # Adjusted from 128 for EMB_DIM=128
             dtype=COMPUTE_DTYPE,
             param_dtype=COMPUTE_DTYPE,
             name='discard_hidden',
@@ -794,7 +784,7 @@ class TossHoldemModel(nn.Module):
         # Allow value gradients to flow into the shared representation
         value_input = processed
         value_hidden = nn.Dense(
-            128,
+            64,  # Adjusted from 128 for EMB_DIM=128
             dtype=COMPUTE_DTYPE,
             param_dtype=COMPUTE_DTYPE,
             name='value_hidden',
