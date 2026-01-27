@@ -568,9 +568,13 @@ def save_checkpoint(path: str, ts: TrainState, step: int = 0):
         ts: TrainState to save
         step: Current training step (for metadata)
     """
-    # Remove existing checkpoint directory if it exists (orbax doesn't overwrite)
+    print(f"DEBUG: Trying to save to {path}")
+    print(f"DEBUG: Path exists before delete? {os.path.exists(path)}")
+    
     if os.path.exists(path):
+        print(f"DEBUG: Deleting {path}")
         shutil.rmtree(path)
+        print(f"DEBUG: Path exists after delete? {os.path.exists(path)}")
     
     os.makedirs(path, exist_ok=True)
     
