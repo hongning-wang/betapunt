@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import partial
 import os
+import shutil
 import time
 from typing import Any, Dict, Tuple
 
@@ -35,8 +36,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from flax.training.train_state import TrainState
-import orbax.checkpoint
-from flax.training import orbax_utils
+import orbax.checkpoint as ocp
 
 from model import (
     TossHoldemModel,
@@ -560,6 +560,51 @@ def make_train_state(rng: chex.PRNGKey, total_updates: int) -> TrainState:
     return TrainState.create(apply_fn=model.apply, params=variables["params"], tx=tx)
 
 
+def save_checkpoint(path: str, ts: TrainState, step: int = 0):
+    """Save checkpoint to path (works with Google Drive on Colab).
+    
+    Args:
+        path: Directory path to save checkpoint (e.g., '/content/drive/MyDrive/checkpoints/step_1000')
+        ts: TrainState to save
+        step: Current training step (for metadata)
+    """
+    # Remove existing checkpoint directory if it exists (orbax doesn't overwrite)
+    if os.path.exists(path):
+        shutil.rmtree(path)
+    
+    os.makedirs(path, exist_ok=True)
+    
+    # Save only params (not optimizer state) for smaller checkpoints
+    ckpt = {'params': ts.params, 'step': step}
+    
+    checkpointer = ocp.PyTreeCheckpointer()
+    checkpointer.save(path, ckpt)
+    print(f"Checkpoint saved to {path}")
+
+
+def load_checkpoint(path: str, ts: TrainState) -> TrainState:
+    """Load checkpoint from path.
+    
+    Args:
+        path: Directory path containing checkpoint
+        ts: TrainState template (for structure)
+        
+    Returns:
+        TrainState with loaded params
+    """
+    checkpointer = ocp.PyTreeCheckpointer()
+    
+    # Restore with structure hint from current params
+    restored = checkpointer.restore(path, item={'params': ts.params, 'step': 0})
+    
+    # Handle both dict and direct params cases
+    if isinstance(restored, dict) and 'params' in restored:
+        return ts.replace(params=restored['params'])
+    else:
+        # Fallback: assume restored is the params directly
+        return ts.replace(params=restored)
+
+
 _FORWARD_MODEL = TossHoldemModel()
 
 
@@ -935,18 +980,22 @@ def eval_and_update_pool(pool, ts, main_elo, key):
     current_params = ts.params
 
     def eval_vs_agent(carry, i):
-        key = carry
+        key, current_main_elo = carry
         is_valid = i < pool.size
         agent_params = jax.tree_util.tree_map(lambda p: p[i], pool.params)
         delta, key = evaluate_pair(current_params, agent_params, CFG.eval_hands, key)
         score = jax.nn.sigmoid(delta / CFG.elo_tau)
-        new_main, new_agent = elo_update(main_elo, pool.elo[i], score, CFG.elo_k)
-        return key, (jnp.where(is_valid, new_main, main_elo), jnp.where(is_valid, new_agent, pool.elo[i]), is_valid)
+        new_main, new_agent = elo_update(current_main_elo, pool.elo[i], score, CFG.elo_k)
+        # Chain the main ELO forward only if valid
+        updated_main = jnp.where(is_valid, new_main, current_main_elo)
+        return (key, updated_main), (jnp.where(is_valid, new_agent, pool.elo[i]), is_valid)
 
-    key, (main_elos, agent_elos, valids) = jax.lax.scan(eval_vs_agent, key, jnp.arange(CFG.pool_max))
+    (key, final_main_elo), (agent_elos, valids) = jax.lax.scan(
+        eval_vs_agent, (key, main_elo), jnp.arange(CFG.pool_max)
+    )
     pool = pool.replace(elo=jnp.where(valids, agent_elos, pool.elo))
-    pool = pool_add(pool, current_params, main_elos[-1], jnp.array([0.3, 0.3, 0.4]))
-    return pool, main_elos[-1], key
+    pool = pool_add(pool, current_params, final_main_elo, jnp.array([0.3, 0.3, 0.4]))
+    return pool, final_main_elo, key
 
 
 # =============================================================================
@@ -992,14 +1041,12 @@ def main():
 
     if CFG.resume_weights_from:
         print(f"Loading weights from {CFG.resume_weights_from}...")
-        ts = ts.replace(params=orbax.checkpoint.PyTreeCheckpointer().restore(CFG.resume_weights_from).params)
+        ts = load_checkpoint(CFG.resume_weights_from, ts)
 
     buf = unroll_buffer_init(4, CFG.rollout_len, CFG.num_envs)
     print(f"Model parameters: {sum(x.size for x in jax.tree_util.tree_leaves(ts.params)):,}")
 
     os.makedirs(CFG.checkpoint_dir, exist_ok=True)
-    ckpter = orbax.checkpoint.PyTreeCheckpointer()
-    save_args = orbax_utils.save_args_from_target(ts)
 
     pool = pool_add(pool_init(ts.params), ts.params, jnp.float32(0.0), jnp.zeros(3))
     main_elo = jnp.float32(0.0)
@@ -1037,8 +1084,7 @@ def main():
                   f"Val: {m['value_loss']:.4f} | Ent: {m['entropy']:.4f} | rho: {m['rho_mean']:.2f}")
 
         if end_step % CFG.checkpoint_every == 0:
-            ckpter.save(f"{CFG.checkpoint_dir}/step_{end_step}", ts, save_args=save_args)
-            print(f"Saved checkpoint to {CFG.checkpoint_dir}/step_{end_step}")
+            save_checkpoint(f"{CFG.checkpoint_dir}/step_{end_step}", ts, step=end_step)
 
     print("Training complete!")
 
