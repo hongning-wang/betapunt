@@ -29,6 +29,9 @@ NUM_CARD_TYPES = 6      # Simplified: 0=hero_private, 1=flop, 2=hero_discard, 3=
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
+# Opponent history features
+OPP_HISTORY_DIM = 8     # [raise_rate, fold_rate, call_rate, vpip, pfr, af, wtsd, hands_played]
+
 EMB_DIM = 128
 NUM_HEADS = 2
 FFN_DIM = 512
@@ -36,6 +39,7 @@ NUM_TRANSFORMER_LAYERS = 2
 NUM_CROSS_ATTENTION_LAYERS = 2
 NUM_QUERY_TOKENS = 4
 PROCESSING_DIM = 256
+OPP_HISTORY_EMB_DIM = 32  # Embedding dimension for opponent history
 
 
 # =============================================================================
@@ -474,6 +478,58 @@ class ActionEncoder(nn.Module):
 
 
 # =============================================================================
+# Opponent History Encoder
+# =============================================================================
+
+class OpponentHistoryEncoder(nn.Module):
+    """Encodes opponent history statistics into an embedding.
+
+    Input: (B, OPP_HISTORY_DIM) where each entry contains:
+        [0]: raise_rate - fraction of actions that are raises
+        [1]: fold_rate - fraction of actions that are folds
+        [2]: call_rate - fraction of actions that are calls
+        [3]: vpip - voluntarily put in pot (preflop)
+        [4]: pfr - preflop raise rate
+        [5]: af - aggression factor (raises / calls)
+        [6]: wtsd - went to showdown rate
+        [7]: hands_played - log1p of number of hands played (for confidence)
+
+    Output: (B, opp_history_emb_dim)
+    """
+
+    opp_history_emb_dim: int = OPP_HISTORY_EMB_DIM
+
+    @nn.compact
+    def __call__(self, opp_history: chex.Array) -> chex.Array:
+        """
+        Args:
+            opp_history: (B, OPP_HISTORY_DIM) float32 opponent statistics
+
+        Returns:
+            opp_history_emb: (B, opp_history_emb_dim) opponent embedding
+        """
+        opp_history = opp_history.astype(jnp.bfloat16)
+
+        # Two-layer MLP to encode opponent history
+        x = nn.Dense(
+            64,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_history_fc1',
+        )(opp_history)
+        x = nn.relu(x)
+
+        x = nn.Dense(
+            self.opp_history_emb_dim,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_history_fc2',
+        )(x)
+
+        return x
+
+
+# =============================================================================
 # Main Model
 # =============================================================================
 
@@ -483,9 +539,11 @@ class TossHoldemModel(nn.Module):
     Architecture:
         1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings (concatenated)
         2. Action Encoder: (B, 32, 7) -> (B, 32, 128) with embeddings (concatenated)
+        3. (Optional) Opponent History Encoder: (B, 8) -> (B, 32) opponent tendencies
         3. Concatenate: (B, 39, 128)
         4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 4, 128)
         5. Processing MLP: Flatten -> Dense -> ReLU -> Dense -> ReLU -> Dense -> (B, 256)
+           (with opponent history embedding concatenated if provided)
         6. Separate Output Heads:
            - Policy: Independent MLP -> (B, 13)
            - Value: Independent MLP with stop_gradient -> (B,)
@@ -499,6 +557,7 @@ class TossHoldemModel(nn.Module):
     num_query_tokens: int = NUM_QUERY_TOKENS
     processing_dim: int = PROCESSING_DIM
     num_actions: int = NUM_ACTIONS
+    opp_history_emb_dim: int = OPP_HISTORY_EMB_DIM
 
     @nn.compact
     def __call__(
@@ -506,12 +565,15 @@ class TossHoldemModel(nn.Module):
         card_tensor: chex.Array,
         action_tensor: chex.Array,
         action_mask: chex.Array,
+        opp_history: Optional[chex.Array] = None,
     ) -> Tuple[chex.Array, chex.Array]:
         """
         Args:
             card_tensor: (B, 9, 2) int32 - [card_index, type_id]
             action_tensor: (B, 32, 7) float32 - action history features
             action_mask: (B, 32) boolean - True for valid actions, False for padding
+            opp_history: (B, OPP_HISTORY_DIM) float32 - opponent statistics (optional)
+                [raise_rate, fold_rate, call_rate, vpip, pfr, af, wtsd, hands_played]
 
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
@@ -586,13 +648,27 @@ class TossHoldemModel(nn.Module):
         fused = RMSNorm()(fused)
 
         # =================================================================
-        # 4. Processing MLP
+        # 4. Process opponent history (if provided)
+        # =================================================================
+
+        opp_history_emb = None
+        if opp_history is not None:
+            opp_history_emb = OpponentHistoryEncoder(
+                opp_history_emb_dim=self.opp_history_emb_dim,
+            )(opp_history)  # (B, 32)
+
+        # =================================================================
+        # 5. Processing MLP (with optional opponent history)
         # =================================================================
 
         # Flatten: (B, 4, 128) -> (B, 512)
         flat = fused.reshape(batch_size, -1)
 
-        # Layer 1: (B, 512) -> (B, 512)
+        # Concatenate opponent history embedding if available
+        if opp_history_emb is not None:
+            flat = jnp.concatenate([flat, opp_history_emb], axis=-1)  # (B, 512 + 32)
+
+        # Layer 1: (B, 512 or 544) -> (B, 512)
         processed = nn.Dense(
             512,
             dtype=jnp.bfloat16,
@@ -609,7 +685,7 @@ class TossHoldemModel(nn.Module):
         processed = nn.relu(processed)
 
         # =================================================================
-        # 5. SEPARATE Output heads (policy and value have independent MLPs)
+        # 6. SEPARATE Output heads (policy and value have independent MLPs)
         # =================================================================
 
         # --- Betting Policy head (actions 0-9) ---

@@ -431,7 +431,7 @@ class Player(Bot):
             logits, _ = self.model(card_tensor, action_tensor, action_mask)
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
-            action_idx = torch.multinomial(probs[0], num_samples=1).item()
+            action_idx = torch.argmax(probs[0]).item()
 
         # Debug logging
         print(f"[DISCARD] logits: {logits[0].tolist()}")
@@ -492,7 +492,7 @@ class Player(Bot):
             logits, _ = self.model(card_tensor, action_tensor, action_mask)
             masked_logits = apply_legal_action_mask(logits, legal_mask)
             probs = F.softmax(masked_logits, dim=-1)
-            action_idx = torch.multinomial(probs[0], num_samples=1).item()
+            action_idx = torch.argmax(probs[0]).item()
 
         # Debug logging
         action_names = ['FOLD', 'CHECK', 'CALL', 'RAISE_MIN', 'RAISE_33', 'RAISE_50', 'RAISE_75', 'RAISE_125', 'RAISE_200', 'ALLIN', 'DISC_0', 'DISC_1', 'DISC_2']

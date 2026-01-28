@@ -5,15 +5,12 @@ from typing import List, Tuple
 
 import jax.numpy as jnp
 import pkrbot
-import itertools
 
-# from training.game import evaluate_best_hand
-from training.hand_evaluator.two_plus_two_evaluator import load_hand_ranks_table, evaluate_7_cards_batch
+from game import evaluate_best_hand
 
 
 _RANKS = "23456789TJQKA"
 _SUITS = "cdhs" 
-HR = load_hand_ranks_table("training/HandRanks.dat")
 
 
 def _idx_to_card_str(idx: int) -> str:
@@ -48,6 +45,12 @@ def test_evaluate_best_hand_against_engine_evaluator(
     # Pre-build all 52 card objects once for speed.
     cards: List[pkrbot.Card] = [pkrbot.Card(_idx_to_card_str(i)) for i in range(52)]
 
+    # Warm-up JIT compile (evaluate_best_hand is jitted).
+    _ = evaluate_best_hand(
+        jnp.array([0, 1], dtype=jnp.int32),
+        jnp.array([2, 3, 4, 5, 6, 7], dtype=jnp.int32),
+    ).item()
+
     failures: List[Tuple[List[int], List[int], List[int], int, int]] = []
 
     for _t in range(num_trials):
@@ -61,25 +64,19 @@ def test_evaluate_best_hand_against_engine_evaluator(
         e1 = pkrbot.evaluate([cards[i] for i in (board + p1)])
         engine_outcome = _cmp(e0, e1)
 
-        COMBINATIONS_8_7 = jnp.array(list(itertools.combinations(range(8), 7)), dtype=jnp.int32)
+        # JAX evaluator — expects ints 0..51.
         j0 = int(
-            jnp.max(
-                evaluate_7_cards_batch(
-                    jnp.array(p0 + board)[COMBINATIONS_8_7],
-                    HR
-                )
-            )
+            evaluate_best_hand(
+                jnp.array(p0, dtype=jnp.int32),
+                jnp.array(board, dtype=jnp.int32),
+            ).item()
         )
-
         j1 = int(
-            jnp.max(
-                evaluate_7_cards_batch(
-                    jnp.array(p1 + board)[COMBINATIONS_8_7],
-                    HR
-                )
-            )
+            evaluate_best_hand(
+                jnp.array(p1, dtype=jnp.int32),
+                jnp.array(board, dtype=jnp.int32),
+            ).item()
         )
-
         jax_outcome = _cmp(j0, j1)
 
         if engine_outcome != jax_outcome:
