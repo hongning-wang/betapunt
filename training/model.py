@@ -1,9 +1,10 @@
 """Transformer-based AlphaHoldem model for Toss or Hold'em.
 
 Architecture:
-- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> 1-layer Transformer -> (B, 9, 128)
-- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> 2-layer Transformer -> (B, 32, 128)
-- Cross-Attention Fusion: 2 layers of learnable queries (4 tokens) attending to context
+- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Self-Attention (no FFN) -> (B, 9, 128)
+- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> 1-layer Transformer -> (B, 32, 128)
+- Context Self-Attention: 1-layer Transformer on concatenated cards+actions (B, 41, 128)
+- Cross-Attention Fusion: 2 layers of learnable queries (6 tokens) attending to context
 - Separate Output Heads: Policy (13), Value (1) with independent final layers
 
 Designed for JAX/Flax with JIT compilation.
@@ -35,9 +36,9 @@ OPP_HISTORY_DIM = 8     # [raise_rate, fold_rate, call_rate, vpip, pfr, af, wtsd
 EMB_DIM = 128
 NUM_HEADS = 2
 FFN_DIM = 512
-NUM_TRANSFORMER_LAYERS = 2
+NUM_TRANSFORMER_LAYERS = 1
 NUM_CROSS_ATTENTION_LAYERS = 2
-NUM_QUERY_TOKENS = 4
+NUM_QUERY_TOKENS = 6
 PROCESSING_DIM = 256
 OPP_HISTORY_EMB_DIM = 32  # Embedding dimension for opponent history
 
@@ -269,7 +270,8 @@ class CardEncoder(nn.Module):
 
     Output: (B, 9, emb_dim)
 
-    Uses 1-layer transformer to learn card relationships (flush/straight patterns).
+    Uses self-attention only (no FFN) to learn card relationships (flush/straight patterns).
+    FFN removed since it would wastefully process all 9 positions even when few cards are valid.
     """
 
     emb_dim: int = EMB_DIM
@@ -277,7 +279,6 @@ class CardEncoder(nn.Module):
     suit_emb_dim: int = 32
     # position_emb_dim computed to fill remainder: emb_dim - rank - suit
     num_heads: int = 2
-    ffn_dim: int = 256
 
     @nn.compact
     def __call__(
@@ -352,13 +353,18 @@ class CardEncoder(nn.Module):
         concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
 
         # -----------------------------
-        # Small 1-layer transformer for card relationships
+        # Self-attention only (no FFN) for card relationships
+        # FFN would wastefully process all 9 positions even when only 2-3 cards are valid
         # -----------------------------
-        card_repr = TransformerBlock(
-            emb_dim=self.emb_dim,
+        head_dim = self.emb_dim // self.num_heads
+
+        # Pre-norm self-attention
+        normed = RMSNorm()(concat)
+        attn_out = MultiHeadAttention(
             num_heads=self.num_heads,
-            ffn_dim=self.ffn_dim,
-        )(concat, valid_mask)  # (B, 9, 128)
+            head_dim=head_dim,
+        )(normed, normed, normed, valid_mask)
+        card_repr = concat + attn_out  # (B, 9, 128)
 
         return card_repr, valid_mask
     
@@ -609,7 +615,7 @@ class TossHoldemModel(nn.Module):
 
         # Build context mask: use card valid mask + action mask
         if action_mask is not None:
-            context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 39)
+            context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 41)
         else:
             context_mask = jnp.concatenate([
                 card_valid_mask,
@@ -617,7 +623,19 @@ class TossHoldemModel(nn.Module):
             ], axis=1)
 
         # =================================================================
-        # 3. Learnable query tokens + MULTIPLE Cross-attention fusion layers
+        # 3. Context self-attention (cards + actions attend to each other)
+        # =================================================================
+
+        # Let cards and actions attend to each other before cross-attention
+        context = TransformerBlock(
+            emb_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            ffn_dim=self.ffn_dim,
+            name='context_self_attn',
+        )(context, context_mask)  # (B, 41, 128)
+
+        # =================================================================
+        # 4. Learnable query tokens + MULTIPLE Cross-attention fusion layers
         # =================================================================
 
         # Initialize learnable query tokens (will be broadcast across batch)
@@ -648,7 +666,7 @@ class TossHoldemModel(nn.Module):
         fused = RMSNorm()(fused)
 
         # =================================================================
-        # 4. Process opponent history (if provided)
+        # 5. Process opponent history (if provided)
         # =================================================================
 
         opp_history_emb = None
@@ -658,17 +676,17 @@ class TossHoldemModel(nn.Module):
             )(opp_history)  # (B, 32)
 
         # =================================================================
-        # 5. Processing MLP (with optional opponent history)
+        # 6. Processing MLP (with optional opponent history)
         # =================================================================
 
-        # Flatten: (B, 4, 128) -> (B, 512)
+        # Flatten: (B, 6, 128) -> (B, 768)
         flat = fused.reshape(batch_size, -1)
 
         # Concatenate opponent history embedding if available
         if opp_history_emb is not None:
-            flat = jnp.concatenate([flat, opp_history_emb], axis=-1)  # (B, 512 + 32)
+            flat = jnp.concatenate([flat, opp_history_emb], axis=-1)  # (B, 768 + 32)
 
-        # Layer 1: (B, 512 or 544) -> (B, 512)
+        # Layer 1: (B, 768 or 800) -> (B, 512)
         processed = nn.Dense(
             512,
             dtype=jnp.bfloat16,
@@ -685,7 +703,7 @@ class TossHoldemModel(nn.Module):
         processed = nn.relu(processed)
 
         # =================================================================
-        # 6. SEPARATE Output heads (policy and value have independent MLPs)
+        # 7. SEPARATE Output heads (policy and value have independent MLPs)
         # =================================================================
 
         # --- Betting Policy head (actions 0-9) ---

@@ -64,6 +64,7 @@ from diversity_bots import (
     DiversityBots,
     load_diversity_bots,
     diversity_old_forward,
+    diversity_new_v1_forward,
 )
 
 
@@ -1435,7 +1436,7 @@ def collect_rollout(
                     diversity_bots.old_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
                 )[0]
             def _new_diversity():
-                return forward_apply(
+                return diversity_new_v1_forward(
                     diversity_bots.new_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
                 )[0]
             return jax.lax.cond(diversity_type == 0, _old_diversity, _new_diversity)

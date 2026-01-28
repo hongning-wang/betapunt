@@ -1,8 +1,8 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import train  # Assumes train.py is present
-from train import Config, AuxState, ReplayBuffer
+import training.tests.train as train  # Assumes train.py is present
+from training.tests.train import Config, AuxState, ReplayBuffer
 
 def run_test(name, func):
     """Helper to run a test and print status."""
