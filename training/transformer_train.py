@@ -45,6 +45,7 @@ from model import (
     TossHoldemModel,
     NUM_ACTIONS,
     NUM_BETTING_ACTIONS,
+    NUM_HAND_TIERS,
     CARD_SEQ_LEN,
     ACTION_SEQ_LEN,
     CARD_INPUT_DIM,
@@ -56,7 +57,9 @@ from game import (
     TossHoldemEnv,
     State,
     STACK_SIZE,
-    PHASE_PREFLOP,
+    PHASE_SHOWDOWN,
+    get_opponent_hand_tier,
+    get_both_hand_tiers,
 )
 
 # --- Diversity Bots (pre-trained neural opponents) ---
@@ -64,7 +67,7 @@ from diversity_bots import (
     DiversityBots,
     load_diversity_bots,
     diversity_old_forward,
-    diversity_new_v1_forward,
+    diversity_new_v2_forward,
 )
 
 
@@ -95,12 +98,16 @@ class Config:
     vf_coef: float = 0.25
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.001
-    ent_coef_final: float = 0.0001
+    ent_coef_init: float = 0.01
+    ent_coef_final: float = 0.001
     ent_decay_steps: int = 20_000
 
     # Illegal action penalty - penalizes high logits for illegal actions
     illegal_action_coef: float = 0.1
+
+    # Opponent hand tier prediction (auxiliary task)
+    # Only trained at showdown - predicts opponent's hand strength tier
+    opp_tier_coef: float = 0.01
 
     # Optimization with schedule
     lr_init: float = 1e-4
@@ -144,8 +151,8 @@ class Config:
     # Diversity bots (pre-trained neural opponents with distinct strategies)
     # These replace archetype opponents with more nuanced play styles
     diversity_bot_prob: float = 0.20  # 20% diversity bots (split between old/new)
-    diversity_old_checkpoint: str = str(Path(__file__).parent / "step_40000")  # Tight/precise strategy
-    diversity_new_checkpoint: str = str(Path(__file__).parent / "step_34000")  # Aggressive strategy
+    diversity_old_checkpoint: str = str(Path(__file__).parent / "model_orbax")  # PyTorch model converted to Orbax
+    diversity_new_checkpoint: str = str(Path(__file__).parent / "step_37000")  # Current arch, policy-only
 
 
 CFG = Config()
@@ -485,6 +492,7 @@ class Unroll:
     contrib_self: chex.Array   # (T, E) int32 - chips contributed by self
     contrib_opp: chex.Array    # (T, E) int32 - chips contributed by opponent
     valid: chex.Array       # (T, E) bool - is this a learner turn
+    opp_tier: chex.Array    # (T, E) int32 - opponent hand tier at showdown (-1 if not showdown)
     # Bootstrap data for V-trace: observation of state AFTER last transition
     bootstrap_card: chex.Array        # (E, 9, 2) - card tensor for s_T
     bootstrap_action_hist: chex.Array # (E, 32, 7) - action history for s_T
@@ -510,6 +518,7 @@ class UnrollBuffer:
     contrib_self: chex.Array # (cap, T, E)
     contrib_opp: chex.Array  # (cap, T, E)
     valid: chex.Array       # (cap, T, E)
+    opp_tier: chex.Array    # (cap, T, E) - opponent hand tier at showdown
     # Bootstrap data for V-trace
     bootstrap_card: chex.Array        # (cap, E, 9, 2)
     bootstrap_action_hist: chex.Array # (cap, E, 32, 7)
@@ -534,6 +543,7 @@ def unroll_buffer_init(capacity: int, rollout_len: int, num_envs: int) -> Unroll
         contrib_self=jnp.zeros((capacity, T, E), dtype=jnp.int32),
         contrib_opp=jnp.zeros((capacity, T, E), dtype=jnp.int32),
         valid=jnp.zeros((capacity, T, E), dtype=jnp.bool_),
+        opp_tier=jnp.full((capacity, T, E), -1, dtype=jnp.int32),  # -1 = not at showdown
         # Bootstrap data
         bootstrap_card=jnp.zeros((capacity, E, CARD_SEQ_LEN, CARD_INPUT_DIM), dtype=jnp.int32),
         bootstrap_action_hist=jnp.zeros((capacity, E, ACTION_SEQ_LEN, ACTION_INPUT_DIM), dtype=jnp.float32),
@@ -562,6 +572,7 @@ def unroll_buffer_add(buf: UnrollBuffer, unroll: Unroll) -> UnrollBuffer:
         contrib_self=buf.contrib_self.at[idx].set(unroll.contrib_self),
         contrib_opp=buf.contrib_opp.at[idx].set(unroll.contrib_opp),
         valid=buf.valid.at[idx].set(unroll.valid),
+        opp_tier=buf.opp_tier.at[idx].set(unroll.opp_tier),
         bootstrap_card=buf.bootstrap_card.at[idx].set(unroll.bootstrap_card),
         bootstrap_action_hist=buf.bootstrap_action_hist.at[idx].set(unroll.bootstrap_action_hist),
         bootstrap_action_mask=buf.bootstrap_action_mask.at[idx].set(unroll.bootstrap_action_mask),
@@ -625,6 +636,7 @@ def unroll_buffer_sample(
         contrib_self=buf.contrib_self[idx],
         contrib_opp=buf.contrib_opp[idx],
         valid=buf.valid[idx],
+        opp_tier=buf.opp_tier[idx],
         bootstrap_card=buf.bootstrap_card[idx],
         bootstrap_action_hist=buf.bootstrap_action_hist[idx],
         bootstrap_action_mask=buf.bootstrap_action_mask[idx],
@@ -879,7 +891,7 @@ def forward_apply(
     card: chex.Array,
     action_hist: chex.Array,
     action_mask: chex.Array,
-) -> Tuple[chex.Array, chex.Array]:
+) -> Tuple[chex.Array, chex.Array, chex.Array]:
     """Forward pass through the model.
 
     Uses the module-level _FORWARD_MODEL instance to avoid reinstantiating
@@ -894,21 +906,22 @@ def forward_apply(
     Returns:
         logits: (B, NUM_ACTIONS) action logits
         value: (B,) value estimates
+        opp_tier_logits: (B, NUM_HAND_TIERS) opponent hand tier prediction
     """
-    logits, value = _FORWARD_MODEL.apply(
+    logits, value, opp_tier_logits = _FORWARD_MODEL.apply(
         {"params": params},
         card,
         action_hist,
         action_mask,
     )
-    return logits, value
+    return logits, value, opp_tier_logits
 
 
 @jax.jit
 def compute_vtrace_on_unroll(
     params: Any,
     unroll: Unroll,
-) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
+) -> Tuple[chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array, chex.Array]:
     """Compute V-trace targets and advantages on a single unroll at training time.
 
     This is the key function for proper IMPALA-style V-trace:
@@ -933,6 +946,7 @@ def compute_vtrace_on_unroll(
         masked_logits: (T*E, NUM_ACTIONS) masked logits for entropy computation
         flat_legal: (T*E, NUM_ACTIONS) legal action mask
         raw_logits: (T*E, NUM_ACTIONS) raw logits for illegal action penalty
+        opp_tier_logits: (T*E, NUM_HAND_TIERS) opponent tier prediction logits
     """
     T, E = unroll.card.shape[:2]
 
@@ -950,11 +964,12 @@ def compute_vtrace_on_unroll(
     all_action_mask = jnp.concatenate([flat_action_mask, unroll.bootstrap_action_mask], axis=0)
 
     # Single forward pass for all samples
-    all_logits, all_values = forward_apply(params, all_card, all_action_hist, all_action_mask)
+    all_logits, all_values, all_opp_tier_logits = forward_apply(params, all_card, all_action_hist, all_action_mask)
 
     # Split outputs back into main and bootstrap
     logits = all_logits[:T * E]
     values_flat = all_values[:T * E]
+    opp_tier_logits = all_opp_tier_logits[:T * E]  # Only need main batch for opp tier loss
     bootstrap_values = all_values[T * E:]  # (E,)
 
     # Compute current policy log probs
@@ -997,8 +1012,8 @@ def compute_vtrace_on_unroll(
     pg_rhos = jax.lax.stop_gradient(pg_rhos)
 
     # Return flat versions for loss computation, plus masked_logits for entropy
-    # Also return raw logits for illegal action penalty
-    return logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, logits
+    # Also return raw logits for illegal action penalty and opp tier logits
+    return logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, logits, opp_tier_logits
 
 
 @jax.jit
@@ -1022,7 +1037,7 @@ def vtrace_loss_on_unroll(
         metrics: Dict of training metrics
     """
     # Compute V-trace targets, advantages, and get logits for entropy (single forward pass)
-    logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, raw_logits = compute_vtrace_on_unroll(params, unroll)
+    logp_pi_flat, values_flat, vs, advantages, pg_rhos, masked_logits, flat_legal, raw_logits, opp_tier_logits = compute_vtrace_on_unroll(params, unroll)
 
     # Flatten V-trace outputs for loss computation
     vs_flat = vs.reshape(-1)
@@ -1031,6 +1046,7 @@ def vtrace_loss_on_unroll(
     valid_flat = unroll.valid.reshape(-1)
     contrib_self_flat = unroll.contrib_self.reshape(-1)
     contrib_opp_flat = unroll.contrib_opp.reshape(-1)
+    opp_tier_flat = unroll.opp_tier.reshape(-1)
 
     valid_f = valid_flat.astype(jnp.float32)
     denom = jnp.maximum(1.0, jnp.sum(valid_f))
@@ -1078,8 +1094,29 @@ def vtrace_loss_on_unroll(
     illegal_penalty_per_sample = jnp.sum(illegal_logits, axis=-1)  # Sum over actions
     illegal_penalty = jnp.sum(illegal_penalty_per_sample * valid_f) / denom
 
+    # ==========================================================================
+    # OPPONENT HAND TIER PREDICTION (Auxiliary Task)
+    # ==========================================================================
+    # Only train on showdown transitions where we know opponent's actual hand tier
+    # opp_tier_flat: -1 = not showdown, 0-8 = hand tier at showdown
+    is_showdown = opp_tier_flat >= 0
+    showdown_f = is_showdown.astype(jnp.float32)
+    showdown_denom = jnp.maximum(1.0, jnp.sum(showdown_f))
+
+    # Cross-entropy loss for opponent tier prediction
+    # CE is correct here: opponent ranges can be polarized (bluffs + value)
+    # MSE would collapse to predicting the mean tier, missing bimodal structure
+    opp_tier_safe = jnp.clip(opp_tier_flat, 0, NUM_HAND_TIERS - 1)
+    opp_tier_logp = jax.nn.log_softmax(opp_tier_logits, axis=-1)
+    opp_tier_ce = -jnp.take_along_axis(opp_tier_logp, opp_tier_safe[:, None], axis=-1)[:, 0]
+    opp_tier_loss = jnp.sum(opp_tier_ce * showdown_f) / showdown_denom
+
     # Total loss
-    total = policy_loss + CFG.vf_coef * value_loss - ent_coef * entropy + CFG.illegal_action_coef * illegal_penalty
+    total = (policy_loss
+             + CFG.vf_coef * value_loss
+             - ent_coef * entropy
+             + CFG.illegal_action_coef * illegal_penalty
+             + CFG.opp_tier_coef * opp_tier_loss)
 
     # Metrics
     def _masked_mean(x, w):
@@ -1092,12 +1129,20 @@ def vtrace_loss_on_unroll(
     rho_exp = jnp.where(valid_flat, jnp.exp(logp_pi_flat - logp_mu_flat), 1.0)
     rho_valid = jnp.where(valid_flat, rho_exp, 0.0)
 
+    # Opponent tier prediction accuracy (at showdown)
+    opp_tier_pred = jnp.argmax(opp_tier_logits, axis=-1)
+    opp_tier_correct = (opp_tier_pred == opp_tier_flat) & is_showdown
+    opp_tier_acc = jnp.sum(opp_tier_correct.astype(jnp.float32)) / showdown_denom
+
     metrics = {
         "loss": total,
         "policy_loss": policy_loss,
         "value_loss": value_loss,
         "entropy": entropy,
         "illegal_penalty": illegal_penalty,
+        "opp_tier_loss": opp_tier_loss,
+        "opp_tier_acc": opp_tier_acc,
+        "showdown_frac": jnp.sum(showdown_f) / jnp.maximum(1.0, jnp.float32(opp_tier_flat.shape[0])),
         "value_mean": _masked_mean(values_flat, valid_f),
         "adv_mean": _masked_mean(advantages_flat, valid_f),
         "ret_mean": _masked_mean(vs_flat, valid_f),
@@ -1196,7 +1241,7 @@ def policy_act(
     action_hist_b = action_hist[None, ...]
     action_mask_b = action_mask[None, ...]
 
-    logits_b, value_b = forward_apply(params, card_b, action_hist_b, action_mask_b)
+    logits_b, value_b, _ = forward_apply(params, card_b, action_hist_b, action_mask_b)
     logits = logits_b[0]
     value = value_b[0]
 
@@ -1420,7 +1465,7 @@ def collect_rollout(
         )
 
         # Forward pass for main agent (learner)
-        logits_main_b, _ = forward_apply(
+        logits_main_b, _, _ = forward_apply(
             main_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
         )
 
@@ -1436,7 +1481,7 @@ def collect_rollout(
                     diversity_bots.old_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
                 )[0]
             def _new_diversity():
-                return diversity_new_v1_forward(
+                return diversity_new_v2_forward(
                     diversity_bots.new_params, card_cur_b, action_hist_cur_b, action_mask_cur_b
                 )[0]
             return jax.lax.cond(diversity_type == 0, _old_diversity, _new_diversity)
@@ -1444,7 +1489,8 @@ def collect_rollout(
         def compute_nn_opp_logits():
             # Use neural network from pool (or self-play if pool.size <= 1)
             def _pool_forward():
-                return forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b)[0]
+                logits, _, _ = forward_apply(opp_params, card_cur_b, action_hist_cur_b, action_mask_cur_b)
+                return logits
             def _self_play():
                 return logits_main_b
             return jax.lax.cond(has_opponent, _pool_forward, _self_play)
@@ -1506,6 +1552,12 @@ def collect_rollout(
         contrib_self = jnp.where(done, contrib_self_post, contrib_self_pre)
         contrib_opp = jnp.where(done, contrib_opp_post, contrib_opp_pre)
 
+        # Compute opponent hand tier at showdown for auxiliary loss
+        # Only valid when done AND the game ended in showdown (not fold)
+        is_showdown = done & (s_next.phase == PHASE_SHOWDOWN)
+        opp_tier_at_showdown = jax.vmap(get_opponent_hand_tier)(s_next, learner_pid)
+        opp_tier = jnp.where(is_showdown, opp_tier_at_showdown, jnp.int32(-1))
+
         # Store learner's observation (with private cards)
         tmp = {
             "card": card_b,
@@ -1519,6 +1571,7 @@ def collect_rollout(
             "contrib_self": contrib_self,
             "contrib_opp": contrib_opp,
             "valid": is_learner_turn,
+            "opp_tier": opp_tier,
         }
 
         # Reset aux for completed episodes
@@ -1566,6 +1619,7 @@ def collect_rollout(
         contrib_self=traj["contrib_self"],
         contrib_opp=traj["contrib_opp"],
         valid=traj["valid"],
+        opp_tier=traj["opp_tier"],
         bootstrap_card=bootstrap_card,
         bootstrap_action_hist=bootstrap_action_hist,
         bootstrap_action_mask=bootstrap_action_mask,
@@ -2002,6 +2056,7 @@ def main() -> None:
                 f"Val: {m['value_loss']:.4f} | "
                 f"Ent: {m['entropy']:.4f} | "
                 f"Ill: {m['illegal_penalty']:.4f} | "
+                f"OppTier: {m['opp_tier_loss']:.4f} ({m['opp_tier_acc']:.1%}) | "
                 f"Adv: {m['adv_mean']:.4f} | "
                 f"Ret: {m['ret_mean']:.4f}"
             )

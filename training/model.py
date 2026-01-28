@@ -31,7 +31,10 @@ CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
 # Opponent history features
-OPP_HISTORY_DIM = 8     # [raise_rate, fold_rate, call_rate, vpip, pfr, af, wtsd, hands_played]
+OPP_HISTORY_DIM = 4     # [fold_rate, aggression, wtsd, hands_played]
+
+# Opponent hand tier prediction (auxiliary task)
+NUM_HAND_TIERS = 9      # 0=high card, 1=pair, 2=two pair, 3=trips, 4=straight, 5=flush, 6=full house, 7=quads, 8=straight flush
 
 EMB_DIM = 128
 NUM_HEADS = 2
@@ -572,7 +575,7 @@ class TossHoldemModel(nn.Module):
         action_tensor: chex.Array,
         action_mask: chex.Array,
         opp_history: Optional[chex.Array] = None,
-    ) -> Tuple[chex.Array, chex.Array]:
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
         Args:
             card_tensor: (B, 9, 2) int32 - [card_index, type_id]
@@ -584,6 +587,7 @@ class TossHoldemModel(nn.Module):
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
             value: (B,) - estimated state value
+            opp_tier_logits: (B, 9) - opponent hand tier prediction (auxiliary task)
         """
         batch_size = card_tensor.shape[0]
         action_tensor = action_tensor.astype(jnp.bfloat16)
@@ -757,11 +761,30 @@ class TossHoldemModel(nn.Module):
         )(value_hidden)
         value = value.squeeze(-1)
 
+        # --- Opponent Hand Tier Prediction head (auxiliary task) ---
+        # Predicts opponent's hand strength tier (0-8) based on board + action history
+        # This forces the model to reason about what opponent likely holds
+        # Only trained at showdown when we see opponent's actual hand
+        opp_tier_hidden = nn.Dense(
+            128,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_tier_hidden',
+        )(processed)
+        opp_tier_hidden = nn.relu(opp_tier_hidden)
+        opp_tier_logits = nn.Dense(
+            NUM_HAND_TIERS,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_tier_out',
+        )(opp_tier_hidden)
+
         # Cast outputs to float32 for loss computation
         policy_logits = policy_logits.astype(jnp.float32)
         value = value.astype(jnp.float32)
+        opp_tier_logits = opp_tier_logits.astype(jnp.float32)
 
-        return policy_logits, value
+        return policy_logits, value, opp_tier_logits
 
 
 # =============================================================================
