@@ -143,8 +143,8 @@ class Config:
     # Diversity bots (pre-trained neural opponents with distinct strategies)
     # These replace archetype opponents with more nuanced play styles
     diversity_bot_prob: float = 0.20  # 20% diversity bots (split between old/new)
-    diversity_old_checkpoint: str = str(_PROJECT_ROOT / "step_40000")  # Tight/precise strategy
-    diversity_new_checkpoint: str = str(_PROJECT_ROOT / "step_34000")  # Aggressive strategy
+    diversity_old_checkpoint: str = str(Path(__file__).parent / "step_40000")  # Tight/precise strategy
+    diversity_new_checkpoint: str = str(Path(__file__).parent / "step_34000")  # Aggressive strategy
 
 
 CFG = Config()
