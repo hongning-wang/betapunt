@@ -38,6 +38,11 @@ import optax
 from flax.training.train_state import TrainState
 import orbax.checkpoint as ocp
 
+import google
+from google.colab import drive
+drive.mount('/content/drive', force_remount=False)
+
+
 from model import (
     TossHoldemModel,
     NUM_ACTIONS,
@@ -116,7 +121,7 @@ class Config:
     total_updates: int = 40_000
     block_size: int = 100
 
-    checkpoint_dir: str = "./drive/MyDrive/checkpoints"
+    checkpoint_dir: str = "/content/drive/MyDrive/checkpoints"
     checkpoint_every: int = 1000
     log_every: int = 50
     resume_weights_from: str = ""
@@ -568,15 +573,9 @@ def save_checkpoint(path: str, ts: TrainState, step: int = 0):
         ts: TrainState to save
         step: Current training step (for metadata)
     """
-    print(f"DEBUG: Trying to save to {path}")
-    print(f"DEBUG: Path exists before delete? {os.path.exists(path)}")
     
     if os.path.exists(path):
-        print(f"DEBUG: Deleting {path}")
         shutil.rmtree(path)
-        print(f"DEBUG: Path exists after delete? {os.path.exists(path)}")
-    
-    os.makedirs(path, exist_ok=True)
     
     # Save only params (not optimizer state) for smaller checkpoints
     ckpt = {'params': ts.params, 'step': step}
