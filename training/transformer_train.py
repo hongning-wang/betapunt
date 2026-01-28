@@ -95,15 +95,15 @@ class Config:
     rho_bar: float = 1.0   # Importance weight clip for value target (ρ̂)
     c_bar: float = 1.0     # Trace cutting coefficient (c)
     pg_rho_bar: float = 1.0  # Policy gradient importance weight clip
-    vf_coef: float = 0.25
+    vf_coef: float = 0.4
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.01
-    ent_coef_final: float = 0.001
-    ent_decay_steps: int = 20_000
+    ent_coef_init: float = 0.008
+    ent_coef_final: float = 0.0008
+    ent_decay_steps: int = 15_000
 
     # Illegal action penalty - penalizes high logits for illegal actions
-    illegal_action_coef: float = 0.1
+    illegal_action_coef: float = 0.075
 
     # Opponent hand tier prediction (auxiliary task)
     # Only trained at showdown - predicts opponent's hand strength tier
@@ -150,7 +150,7 @@ class Config:
 
     # Diversity bots (pre-trained neural opponents with distinct strategies)
     # These replace archetype opponents with more nuanced play styles
-    diversity_bot_prob: float = 0.20  # 20% diversity bots (split between old/new)
+    diversity_bot_prob: float = 0.25  # 25% diversity bots (split between old/new)
     diversity_old_checkpoint: str = str(Path(__file__).parent / "model_orbax")  # PyTorch model converted to Orbax
     diversity_new_checkpoint: str = str(Path(__file__).parent / "step_37000")  # Current arch, policy-only
 
