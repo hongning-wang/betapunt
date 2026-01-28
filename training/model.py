@@ -1,9 +1,10 @@
 """Transformer-based AlphaHoldem model for Toss or Hold'em.
 
 Architecture:
-- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> 1-layer Transformer -> (B, 9, 128)
-- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> 2-layer Transformer -> (B, 32, 128)
-- Cross-Attention Fusion: 2 layers of learnable queries (4 tokens) attending to context
+- Card Encoder: (B, 9, 2) -> Embeddings (concat) -> Self-Attention (no FFN) -> (B, 9, 128)
+- Action Encoder: (B, 32, 7) -> Embeddings (concat) -> Projection -> 1-layer Transformer -> (B, 32, 128)
+- Context Self-Attention: 1-layer Transformer on concatenated cards+actions (B, 41, 128)
+- Cross-Attention Fusion: 2 layers of learnable queries (6 tokens) attending to context
 - Separate Output Heads: Policy (13), Value (1) with independent final layers
 
 Designed for JAX/Flax with JIT compilation.
@@ -29,13 +30,20 @@ NUM_CARD_TYPES = 6      # Simplified: 0=hero_private, 1=flop, 2=hero_discard, 3=
 CARD_INPUT_DIM = 2      # [card_index, type_id]
 ACTION_INPUT_DIM = 7    # [actor_id, event_type, street_id, time_id, to_call, pot_base, effective_stack]
 
+# Opponent history features
+OPP_HISTORY_DIM = 4     # [fold_rate, aggression, wtsd, hands_played]
+
+# Opponent hand tier prediction (auxiliary task)
+NUM_HAND_TIERS = 9      # 0=high card, 1=pair, 2=two pair, 3=trips, 4=straight, 5=flush, 6=full house, 7=quads, 8=straight flush
+
 EMB_DIM = 128
 NUM_HEADS = 2
 FFN_DIM = 512
-NUM_TRANSFORMER_LAYERS = 2
+NUM_TRANSFORMER_LAYERS = 1
 NUM_CROSS_ATTENTION_LAYERS = 2
-NUM_QUERY_TOKENS = 4
+NUM_QUERY_TOKENS = 6
 PROCESSING_DIM = 256
+OPP_HISTORY_EMB_DIM = 32  # Embedding dimension for opponent history
 
 
 # =============================================================================
@@ -265,7 +273,8 @@ class CardEncoder(nn.Module):
 
     Output: (B, 9, emb_dim)
 
-    Uses 1-layer transformer to learn card relationships (flush/straight patterns).
+    Uses self-attention only (no FFN) to learn card relationships (flush/straight patterns).
+    FFN removed since it would wastefully process all 9 positions even when few cards are valid.
     """
 
     emb_dim: int = EMB_DIM
@@ -273,7 +282,6 @@ class CardEncoder(nn.Module):
     suit_emb_dim: int = 32
     # position_emb_dim computed to fill remainder: emb_dim - rank - suit
     num_heads: int = 2
-    ffn_dim: int = 256
 
     @nn.compact
     def __call__(
@@ -348,13 +356,18 @@ class CardEncoder(nn.Module):
         concat = jnp.concatenate([rank_emb, suit_emb, position_emb], axis=-1)
 
         # -----------------------------
-        # Small 1-layer transformer for card relationships
+        # Self-attention only (no FFN) for card relationships
+        # FFN would wastefully process all 9 positions even when only 2-3 cards are valid
         # -----------------------------
-        card_repr = TransformerBlock(
-            emb_dim=self.emb_dim,
+        head_dim = self.emb_dim // self.num_heads
+
+        # Pre-norm self-attention
+        normed = RMSNorm()(concat)
+        attn_out = MultiHeadAttention(
             num_heads=self.num_heads,
-            ffn_dim=self.ffn_dim,
-        )(concat, valid_mask)  # (B, 9, 128)
+            head_dim=head_dim,
+        )(normed, normed, normed, valid_mask)
+        card_repr = concat + attn_out  # (B, 9, 128)
 
         return card_repr, valid_mask
     
@@ -474,6 +487,58 @@ class ActionEncoder(nn.Module):
 
 
 # =============================================================================
+# Opponent History Encoder
+# =============================================================================
+
+class OpponentHistoryEncoder(nn.Module):
+    """Encodes opponent history statistics into an embedding.
+
+    Input: (B, OPP_HISTORY_DIM) where each entry contains:
+        [0]: raise_rate - fraction of actions that are raises
+        [1]: fold_rate - fraction of actions that are folds
+        [2]: call_rate - fraction of actions that are calls
+        [3]: vpip - voluntarily put in pot (preflop)
+        [4]: pfr - preflop raise rate
+        [5]: af - aggression factor (raises / calls)
+        [6]: wtsd - went to showdown rate
+        [7]: hands_played - log1p of number of hands played (for confidence)
+
+    Output: (B, opp_history_emb_dim)
+    """
+
+    opp_history_emb_dim: int = OPP_HISTORY_EMB_DIM
+
+    @nn.compact
+    def __call__(self, opp_history: chex.Array) -> chex.Array:
+        """
+        Args:
+            opp_history: (B, OPP_HISTORY_DIM) float32 opponent statistics
+
+        Returns:
+            opp_history_emb: (B, opp_history_emb_dim) opponent embedding
+        """
+        opp_history = opp_history.astype(jnp.bfloat16)
+
+        # Two-layer MLP to encode opponent history
+        x = nn.Dense(
+            64,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_history_fc1',
+        )(opp_history)
+        x = nn.relu(x)
+
+        x = nn.Dense(
+            self.opp_history_emb_dim,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_history_fc2',
+        )(x)
+
+        return x
+
+
+# =============================================================================
 # Main Model
 # =============================================================================
 
@@ -483,9 +548,11 @@ class TossHoldemModel(nn.Module):
     Architecture:
         1. Card Encoder: (B, 9, 2) -> (B, 9, 128) with embeddings (concatenated)
         2. Action Encoder: (B, 32, 7) -> (B, 32, 128) with embeddings (concatenated)
+        3. (Optional) Opponent History Encoder: (B, 8) -> (B, 32) opponent tendencies
         3. Concatenate: (B, 39, 128)
         4. Multiple Cross-Attention Fusion layers with learnable queries: (B, 4, 128)
         5. Processing MLP: Flatten -> Dense -> ReLU -> Dense -> ReLU -> Dense -> (B, 256)
+           (with opponent history embedding concatenated if provided)
         6. Separate Output Heads:
            - Policy: Independent MLP -> (B, 13)
            - Value: Independent MLP with stop_gradient -> (B,)
@@ -499,6 +566,7 @@ class TossHoldemModel(nn.Module):
     num_query_tokens: int = NUM_QUERY_TOKENS
     processing_dim: int = PROCESSING_DIM
     num_actions: int = NUM_ACTIONS
+    opp_history_emb_dim: int = OPP_HISTORY_EMB_DIM
 
     @nn.compact
     def __call__(
@@ -506,16 +574,20 @@ class TossHoldemModel(nn.Module):
         card_tensor: chex.Array,
         action_tensor: chex.Array,
         action_mask: chex.Array,
-    ) -> Tuple[chex.Array, chex.Array]:
+        opp_history: Optional[chex.Array] = None,
+    ) -> Tuple[chex.Array, chex.Array, chex.Array]:
         """
         Args:
             card_tensor: (B, 9, 2) int32 - [card_index, type_id]
             action_tensor: (B, 32, 7) float32 - action history features
             action_mask: (B, 32) boolean - True for valid actions, False for padding
+            opp_history: (B, OPP_HISTORY_DIM) float32 - opponent statistics (optional)
+                [raise_rate, fold_rate, call_rate, vpip, pfr, af, wtsd, hands_played]
 
         Returns:
             policy_logits: (B, 13) - raw logits for action distribution
             value: (B,) - estimated state value
+            opp_tier_logits: (B, 9) - opponent hand tier prediction (auxiliary task)
         """
         batch_size = card_tensor.shape[0]
         action_tensor = action_tensor.astype(jnp.bfloat16)
@@ -547,7 +619,7 @@ class TossHoldemModel(nn.Module):
 
         # Build context mask: use card valid mask + action mask
         if action_mask is not None:
-            context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 39)
+            context_mask = jnp.concatenate([card_valid_mask, action_mask], axis=1)  # (B, 41)
         else:
             context_mask = jnp.concatenate([
                 card_valid_mask,
@@ -555,7 +627,19 @@ class TossHoldemModel(nn.Module):
             ], axis=1)
 
         # =================================================================
-        # 3. Learnable query tokens + MULTIPLE Cross-attention fusion layers
+        # 3. Context self-attention (cards + actions attend to each other)
+        # =================================================================
+
+        # Let cards and actions attend to each other before cross-attention
+        context = TransformerBlock(
+            emb_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            ffn_dim=self.ffn_dim,
+            name='context_self_attn',
+        )(context, context_mask)  # (B, 41, 128)
+
+        # =================================================================
+        # 4. Learnable query tokens + MULTIPLE Cross-attention fusion layers
         # =================================================================
 
         # Initialize learnable query tokens (will be broadcast across batch)
@@ -586,13 +670,27 @@ class TossHoldemModel(nn.Module):
         fused = RMSNorm()(fused)
 
         # =================================================================
-        # 4. Processing MLP
+        # 5. Process opponent history (if provided)
         # =================================================================
 
-        # Flatten: (B, 4, 128) -> (B, 512)
+        opp_history_emb = None
+        if opp_history is not None:
+            opp_history_emb = OpponentHistoryEncoder(
+                opp_history_emb_dim=self.opp_history_emb_dim,
+            )(opp_history)  # (B, 32)
+
+        # =================================================================
+        # 6. Processing MLP (with optional opponent history)
+        # =================================================================
+
+        # Flatten: (B, 6, 128) -> (B, 768)
         flat = fused.reshape(batch_size, -1)
 
-        # Layer 1: (B, 512) -> (B, 512)
+        # Concatenate opponent history embedding if available
+        if opp_history_emb is not None:
+            flat = jnp.concatenate([flat, opp_history_emb], axis=-1)  # (B, 768 + 32)
+
+        # Layer 1: (B, 768 or 800) -> (B, 512)
         processed = nn.Dense(
             512,
             dtype=jnp.bfloat16,
@@ -609,7 +707,7 @@ class TossHoldemModel(nn.Module):
         processed = nn.relu(processed)
 
         # =================================================================
-        # 5. SEPARATE Output heads (policy and value have independent MLPs)
+        # 7. SEPARATE Output heads (policy and value have independent MLPs)
         # =================================================================
 
         # --- Betting Policy head (actions 0-9) ---
@@ -663,11 +761,30 @@ class TossHoldemModel(nn.Module):
         )(value_hidden)
         value = value.squeeze(-1)
 
+        # --- Opponent Hand Tier Prediction head (auxiliary task) ---
+        # Predicts opponent's hand strength tier (0-8) based on board + action history
+        # This forces the model to reason about what opponent likely holds
+        # Only trained at showdown when we see opponent's actual hand
+        opp_tier_hidden = nn.Dense(
+            128,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_tier_hidden',
+        )(processed)
+        opp_tier_hidden = nn.relu(opp_tier_hidden)
+        opp_tier_logits = nn.Dense(
+            NUM_HAND_TIERS,
+            dtype=jnp.bfloat16,
+            param_dtype=jnp.bfloat16,
+            name='opp_tier_out',
+        )(opp_tier_hidden)
+
         # Cast outputs to float32 for loss computation
         policy_logits = policy_logits.astype(jnp.float32)
         value = value.astype(jnp.float32)
+        opp_tier_logits = opp_tier_logits.astype(jnp.float32)
 
-        return policy_logits, value
+        return policy_logits, value, opp_tier_logits
 
 
 # =============================================================================

@@ -98,6 +98,13 @@ def load_flax_params_into_torch(
 ) -> None:
     """Load Flax/JAX params into PyTorch model."""
 
+    def _get_norm_key(container: Dict[str, Any], idx: int) -> str:
+        """Return LayerNorm/RMSNorm key for a given index."""
+        ln_key = f"LayerNorm_{idx}"
+        if ln_key in container:
+            return ln_key
+        return f"RMSNorm_{idx}"
+
     def put_linear_no_bias_dict(param_dict: Dict, torch_linear: torch.nn.Linear) -> None:
         """Load a linear layer without bias from a param dict."""
         k = _as_numpy(param_dict["kernel"])  # (in, out)
@@ -110,18 +117,46 @@ def load_flax_params_into_torch(
         torch_linear.weight.data.copy_(torch.from_numpy(k.T).to(torch_linear.weight.dtype))
         torch_linear.bias.data.copy_(torch.from_numpy(b).to(torch_linear.bias.dtype))
 
-    def put_layer_norm_dict(param_dict: Dict, torch_ln: torch.nn.LayerNorm) -> None:
-        """Load a LayerNorm from a param dict."""
+    def put_norm_dict(param_dict: Dict, torch_norm: torch.nn.Module) -> None:
+        """Load a LayerNorm/RMSNorm from a param dict."""
         scale = _as_numpy(param_dict["scale"])
-        bias = _as_numpy(param_dict["bias"])
-        torch_ln.weight.data.copy_(torch.from_numpy(scale).to(torch_ln.weight.dtype))
-        torch_ln.bias.data.copy_(torch.from_numpy(bias).to(torch_ln.bias.dtype))
+
+        if hasattr(torch_norm, "weight"):
+            torch_norm.weight.data.copy_(torch.from_numpy(scale).to(torch_norm.weight.dtype))
+        elif hasattr(torch_norm, "scale"):
+            torch_norm.scale.data.copy_(torch.from_numpy(scale).to(torch_norm.scale.dtype))
+        else:
+            raise AttributeError("Unsupported norm module: missing weight/scale")
+
+        if hasattr(torch_norm, "bias"):
+            if "bias" in param_dict:
+                bias = _as_numpy(param_dict["bias"])
+                torch_norm.bias.data.copy_(torch.from_numpy(bias).to(torch_norm.bias.dtype))
+            else:
+                torch_norm.bias.data.zero_()
+
+    def put_transformer_block(flax_block: Dict[str, Any], torch_block: torch.nn.Module) -> None:
+        """Load a TransformerBlock (pre-norm) from Flax params."""
+        norm1_key = _get_norm_key(flax_block, 0)
+        norm2_key = _get_norm_key(flax_block, 1)
+
+        put_norm_dict(flax_block[norm1_key], torch_block.norm1)
+        put_norm_dict(flax_block[norm2_key], torch_block.norm2)
+
+        mha = flax_block["MultiHeadAttention_0"]
+        put_linear_no_bias_dict(mha["Dense_0"], torch_block.attn.q_proj)
+        put_linear_no_bias_dict(mha["Dense_1"], torch_block.attn.k_proj)
+        put_linear_no_bias_dict(mha["Dense_2"], torch_block.attn.v_proj)
+        put_linear_no_bias_dict(mha["Dense_3"], torch_block.attn.out_proj)
+
+        put_linear_dict(flax_block["Dense_0"], torch_block.ffn[0])
+        put_linear_dict(flax_block["Dense_1"], torch_block.ffn[2])
 
     # =========================================================================
-    # CardEncoder
+    # CardEncoder (transformer-based)
     # =========================================================================
     card_enc = flax_params["CardEncoder_0"]
-    
+
     # Card encoder embeddings
     model.card_encoder.rank_emb.weight.data.copy_(
         torch.from_numpy(_as_numpy(card_enc["Embed_0"]["embedding"])).to(model.card_encoder.rank_emb.weight.dtype)
@@ -133,11 +168,22 @@ def load_flax_params_into_torch(
         torch.from_numpy(_as_numpy(card_enc["Embed_2"]["embedding"])).to(model.card_encoder.type_emb.weight.dtype)
     )
 
-    # Card encoder projection
-    put_linear_dict(card_enc["Dense_0"], model.card_encoder.projection)
+    # Optional transformer block for card encoding (new model)
+    if "TransformerBlock_0" in card_enc:
+        flax_block = card_enc["TransformerBlock_0"]
+        if hasattr(model.card_encoder, "transformer"):
+            if hasattr(model.card_encoder.transformer, "layers"):
+                put_transformer_block(flax_block, model.card_encoder.transformer.layers[0])
+            else:
+                put_transformer_block(flax_block, model.card_encoder.transformer)
+        elif hasattr(model.card_encoder, "transformer_block"):
+            put_transformer_block(flax_block, model.card_encoder.transformer_block)
+    elif "Dense_0" in card_enc and hasattr(model.card_encoder, "projection"):
+        # Legacy projection-based card encoder
+        put_linear_dict(card_enc["Dense_0"], model.card_encoder.projection)
 
     # =========================================================================
-    # ActionEncoder
+    # ActionEncoder (actor/event/street/time + continuous)
     # =========================================================================
     act_enc = flax_params["ActionEncoder_0"]
 
@@ -167,24 +213,11 @@ def load_flax_params_into_torch(
         layer_key = f"layer_{layer_idx}"
         flax_layer = trans_enc[layer_key]
         torch_layer = model.action_encoder.transformer.layers[layer_idx]
-
-        # LayerNorm_0, LayerNorm_1
-        put_layer_norm_dict(flax_layer["LayerNorm_0"], torch_layer.norm1)
-        put_layer_norm_dict(flax_layer["LayerNorm_1"], torch_layer.norm2)
-
-        # MultiHeadAttention_0
-        mha = flax_layer["MultiHeadAttention_0"]
-        put_linear_no_bias_dict(mha["Dense_0"], torch_layer.attn.q_proj)
-        put_linear_no_bias_dict(mha["Dense_1"], torch_layer.attn.k_proj)
-        put_linear_no_bias_dict(mha["Dense_2"], torch_layer.attn.v_proj)
-        put_linear_no_bias_dict(mha["Dense_3"], torch_layer.attn.out_proj)
-
-        # FFN: Dense_0, Dense_1
-        put_linear_dict(flax_layer["Dense_0"], torch_layer.ffn[0])
-        put_linear_dict(flax_layer["Dense_1"], torch_layer.ffn[2])
+        put_transformer_block(flax_layer, torch_layer)
 
     # Transformer encoder final norm
-    put_layer_norm_dict(trans_enc["LayerNorm_0"], model.action_encoder.transformer.final_norm)
+    final_norm_key = "LayerNorm_0" if "LayerNorm_0" in trans_enc else "RMSNorm_0"
+    put_norm_dict(trans_enc[final_norm_key], model.action_encoder.transformer.final_norm)
 
     # =========================================================================
     # Query tokens
@@ -200,10 +233,13 @@ def load_flax_params_into_torch(
         flax_cross = flax_params[layer_key]
         torch_cross = model.cross_attention_layers[layer_idx]
 
-        # LayerNorms
-        put_layer_norm_dict(flax_cross["LayerNorm_0"], torch_cross.query_norm)
-        put_layer_norm_dict(flax_cross["LayerNorm_1"], torch_cross.context_norm)
-        put_layer_norm_dict(flax_cross["LayerNorm_2"], torch_cross.ffn_norm)
+        # Norms
+        norm0_key = _get_norm_key(flax_cross, 0)
+        norm1_key = _get_norm_key(flax_cross, 1)
+        norm2_key = _get_norm_key(flax_cross, 2)
+        put_norm_dict(flax_cross[norm0_key], torch_cross.query_norm)
+        put_norm_dict(flax_cross[norm1_key], torch_cross.context_norm)
+        put_norm_dict(flax_cross[norm2_key], torch_cross.ffn_norm)
 
         # MultiHeadAttention_0
         mha = flax_cross["MultiHeadAttention_0"]
@@ -217,7 +253,16 @@ def load_flax_params_into_torch(
         put_linear_dict(flax_cross["Dense_1"], torch_cross.ffn[2])
 
     # Final cross-attention norm
-    put_layer_norm_dict(flax_params["LayerNorm_0"], model.cross_attn_final_norm)
+    if "LayerNorm_0" in flax_params:
+        put_norm_dict(flax_params["LayerNorm_0"], model.cross_attn_final_norm)
+    elif "RMSNorm_0" in flax_params:
+        put_norm_dict(flax_params["RMSNorm_0"], model.cross_attn_final_norm)
+
+    # Optional top-level norms
+    if hasattr(model, "card_norm") and "card_norm" in flax_params:
+        put_norm_dict(flax_params["card_norm"], model.card_norm)
+    if hasattr(model, "action_norm") and "action_norm" in flax_params:
+        put_norm_dict(flax_params["action_norm"], model.action_norm)
 
     # =========================================================================
     # Processing MLP

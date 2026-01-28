@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import jax
 import jax.numpy as jnp
 import chex
@@ -253,6 +255,82 @@ def get_showdown_result(state):
     score_p1 = evaluate_best_hand(p1_final, state.board)
 
     return jnp.sign(score_p0 - score_p1).astype(jnp.float32)
+
+
+@jax.jit
+def get_hand_tier(score: jnp.ndarray) -> jnp.ndarray:
+    """Extract hand tier from packed score.
+
+    Args:
+        score: Packed hand score from evaluate_best_hand
+
+    Returns:
+        tier: Hand tier (0-8)
+            0 = high card
+            1 = pair
+            2 = two pair
+            3 = trips
+            4 = straight
+            5 = flush
+            6 = full house
+            7 = quads
+            8 = straight flush
+    """
+    return (score >> 20) & 0xF
+
+
+@jax.jit
+def get_opponent_hand_tier(state: State, hero_player_id: jnp.ndarray) -> jnp.ndarray:
+    """Get opponent's hand tier at showdown.
+
+    Args:
+        state: Game state (should be at showdown)
+        hero_player_id: The hero's player ID (0 or 1)
+
+    Returns:
+        opp_tier: Opponent's hand tier (0-8), or -1 if not at showdown
+    """
+    is_showdown = state.phase == PHASE_SHOWDOWN
+
+    # Get opponent's hole cards
+    is_hero_p0 = hero_player_id == 0
+    opp_hole = jnp.where(is_hero_p0, state.p1_hole, state.p0_hole)
+    opp_active = jnp.where(is_hero_p0, state.p1_active_mask, state.p0_active_mask)
+
+    # Pick the 2 active cards
+    _, opp_idx = jax.lax.top_k(opp_active.astype(jnp.int32), k=2)
+    opp_final = opp_hole[opp_idx]
+
+    # Evaluate opponent's hand
+    opp_score = evaluate_best_hand(opp_final, state.board)
+    opp_tier = get_hand_tier(opp_score)
+
+    # Return -1 if not at showdown
+    return jnp.where(is_showdown, opp_tier, -1)
+
+
+@jax.jit
+def get_both_hand_tiers(state: State) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Get both players' hand tiers at showdown.
+
+    Args:
+        state: Game state (should be at showdown)
+
+    Returns:
+        (p0_tier, p1_tier): Both players' hand tiers (0-8 each)
+    """
+    # Pick active cards for both players
+    _, p0_idx = jax.lax.top_k(state.p0_active_mask.astype(jnp.int32), k=2)
+    _, p1_idx = jax.lax.top_k(state.p1_active_mask.astype(jnp.int32), k=2)
+
+    p0_final = state.p0_hole[p0_idx]
+    p1_final = state.p1_hole[p1_idx]
+
+    score_p0 = evaluate_best_hand(p0_final, state.board)
+    score_p1 = evaluate_best_hand(p1_final, state.board)
+
+    return get_hand_tier(score_p0), get_hand_tier(score_p1)
+
 
 # --- 3. ENVIRONMENT CLASS ---
 
