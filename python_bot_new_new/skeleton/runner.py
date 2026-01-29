@@ -124,11 +124,11 @@ class Runner():
                 self.send(CheckAction())
             else:
                 assert active == round_state.button % 2
-                #if self.should_autofold(game_state):
-                #    self.send(FoldAction())
-                #else:
-                action = self.pokerbot.get_action(game_state, round_state, active)
-                self.send(action)
+                if self.should_autofold(game_state):
+                    self.send(FoldAction())
+                else:
+                    action = self.pokerbot.get_action(game_state, round_state, active)
+                    self.send(action)
 
 
 def parse_args():

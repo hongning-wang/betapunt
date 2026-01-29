@@ -95,11 +95,11 @@ class Config:
     rho_bar: float = 1.0   # Importance weight clip for value target (ρ̂)
     c_bar: float = 1.0     # Trace cutting coefficient (c)
     pg_rho_bar: float = 1.0  # Policy gradient importance weight clip
-    vf_coef: float = 0.25
+    vf_coef: float = 0.15
 
     # Entropy coefficient with schedule
-    ent_coef_init: float = 0.01
-    ent_coef_final: float = 0.001
+    ent_coef_init: float = 0.007
+    ent_coef_final: float = 0.0007
     ent_decay_steps: int = 20_000
 
     # Illegal action penalty - penalizes high logits for illegal actions
@@ -107,7 +107,7 @@ class Config:
 
     # Opponent hand tier prediction (auxiliary task)
     # Only trained at showdown - predicts opponent's hand strength tier
-    opp_tier_coef: float = 0.01
+    opp_tier_coef: float = 0.003
 
     # Optimization with schedule
     lr_init: float = 1e-4

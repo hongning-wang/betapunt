@@ -53,7 +53,7 @@ NUM_ACTIONS = 13
 # Paths
 BOT_DIR = os.path.dirname(__file__)
 DEFAULT_MODEL_PATH = os.path.join(BOT_DIR, "model.pt")
-DEFAULT_CHECKPOINT_DIR = os.path.join(BOT_DIR, "step_14000")
+DEFAULT_CHECKPOINT_DIR = os.path.join(BOT_DIR, "step_40000")
 
 # Street IDs for action history
 STREET_PREFLOP = 0
